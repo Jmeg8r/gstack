@@ -13,6 +13,9 @@ function runProbe(opts: {
   snippet: string;
   env?: Record<string, string | undefined>;
   home?: string;
+  // Only the hang-learning integration test needs more than the default: it
+  // spawns the bun-backed learnings writer twice plus the reader once.
+  timeoutMs?: number;
 }): { stdout: string; stderr: string; status: number } {
   const env: Record<string, string> = {
     // Start from a clean env so test-env vars from the parent don't leak in.
@@ -34,7 +37,7 @@ function runProbe(opts: {
   const result = spawnSync('bash', ['-c', script], {
     env,
     stdio: ['pipe', 'pipe', 'pipe'],
-    timeout: 5000,
+    timeout: opts.timeoutMs ?? 5000,
   });
   return {
     stdout: (result.stdout ?? '').toString(),
@@ -574,4 +577,120 @@ describe('codex SKILL.md.tmpl: review sandbox + fail-closed gate + timeout order
       expect(inspected.length).toBeGreaterThanOrEqual(3);
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Hang learning: telemetry, not a rule.
+//
+// _gstack_codex_log_hang fires on a codex timeout (exit 124). Before this
+// block existed the handler had no coverage, and shipped a record that (a)
+// minted a NEW key per invocation (codex-hang-<unix-ts>), so latest-winner
+// dedup never collapsed repeats -- N hangs = N rows; (b) carried confidence 8,
+// which cleared every "high-confidence" export downstream (CLAUDE.md digests
+// at conf >= 7, the top-3 preamble list at skill start), so a one-off timeout
+// read as durable project guidance; and (c) listed gstack's own .tmpl files
+// under `files`, which do not exist in the consuming repo, so /learn prune
+// flagged it STALE everywhere. Each property is pinned below.
+// ---------------------------------------------------------------------------
+describe('gstack-codex-probe: hang learning is telemetry, not a rule', () => {
+  function hangRecord(mode: string, size: string): Record<string, unknown> {
+    const r = runProbe({ snippet: `_gstack_codex_hang_learning_json "${mode}" "${size}"` });
+    expect(r.status).toBe(0);
+    return JSON.parse(r.stdout.trim());
+  }
+
+  test('key is stable per mode -- no epoch suffix, so repeats dedupe instead of accumulating', () => {
+    const rec = hangRecord('review', '143689');
+    expect(rec.key).toBe('codex-hang-review');
+    // The old shape was codex-hang-<10-digit unix ts>; a stable key has no such run.
+    expect(String(rec.key)).not.toMatch(/\d{9,}/);
+    expect(rec.type).toBe('operational');
+    expect(rec.source).toBe('observed');
+    expect(String(rec.insight)).toContain('[review]');
+    expect(String(rec.insight)).toContain('143689');
+  });
+
+  test('confidence sits below the high-confidence exports (< 7) yet inside the writer range (1-10)', () => {
+    const conf = Number(hangRecord('review', '0').confidence);
+    expect(Number.isInteger(conf)).toBe(true);
+    expect(conf).toBeGreaterThanOrEqual(1);
+    expect(conf).toBeLessThan(7);
+  });
+
+  test('no `files` array -- gstack-internal template paths do not exist in the consuming repo', () => {
+    expect(hangRecord('autoplan', '0').files).toBeUndefined();
+  });
+
+  test('same mode -> identical key; different mode -> different key', () => {
+    const a = hangRecord('review', '10');
+    const b = hangRecord('review', '20');
+    const c = hangRecord('autoplan', '0');
+    expect(a.key).toBe(b.key);
+    expect(c.key).toBe('codex-hang-autoplan');
+    expect(c.key).not.toBe(a.key);
+  });
+
+  test('mode is sanitized into the writer key alphabet; empty mode falls back to "unknown"', () => {
+    // gstack-learnings-log rejects any key outside ^[a-zA-Z0-9_-]+$ silently
+    // (the handler swallows errors), so a stray char would drop the record.
+    expect(hangRecord('weird mode!/x', '0').key).toBe('codex-hang-weirdmodex');
+    expect(hangRecord('', '0').key).toBe('codex-hang-unknown');
+  });
+
+  test('every record passes the shared injection filter the writer enforces', () => {
+    // Round-trip through the real validator: hasInjection() is the same
+    // function gstack-learnings-log runs before appending.
+    const rec = hangRecord('consult-resume', '999');
+    const check = spawnSync(
+      'bun',
+      ['-e', `import { hasInjection } from '${path.join(ROOT, 'lib/jsonl-store.ts')}'; process.stdout.write(hasInjection(process.argv[1]) ? 'REJECT' : 'OK');`, String(rec.insight)],
+      { stdio: ['pipe', 'pipe', 'pipe'], timeout: 15000 },
+    );
+    expect((check.stdout ?? '').toString()).toBe('OK');
+  });
+
+  test('integration: two hangs in one mode append two lines but resolve to ONE learning', () => {
+    // Real writer + real reader, isolated: HOME points at a temp dir whose
+    // ~/.claude/skills/gstack is a symlink back to this repo (that is the path
+    // _gstack_codex_log_hang resolves the writer through), GSTACK_HOME is a
+    // temp store, and GSTACK_PROJECT_SLUG pins the slug so no git lookup runs.
+    const home = tempHome();
+    try {
+      fs.mkdirSync(path.join(home, '.claude', 'skills'), { recursive: true });
+      fs.symlinkSync(ROOT, path.join(home, '.claude', 'skills', 'gstack'));
+      const gstackHome = path.join(home, '.gstack');
+      const store = path.join(gstackHome, 'projects', 'hang-test', 'learnings.jsonl');
+      const r = runProbe({
+        home,
+        env: { GSTACK_HOME: gstackHome, GSTACK_PROJECT_SLUG: 'hang-test' },
+        timeoutMs: 30000,
+        snippet: [
+          '_gstack_codex_log_hang review 100',
+          'sleep 0.05',
+          '_gstack_codex_log_hang review 200',
+          `cat "${store}"`,
+          'printf "\\n---SEARCH---\\n"',
+          '"$HOME/.claude/skills/gstack/bin/gstack-learnings-search" --limit 10',
+        ].join('\n'),
+      });
+      expect(r.status).toBe(0);
+      const [rawStore, rawSearch] = r.stdout.split('---SEARCH---');
+      const lines = rawStore.trim().split('\n').filter(Boolean);
+      // Append-only store keeps BOTH raw records ...
+      expect(lines.length).toBe(2);
+      const recs = lines.map((l) => JSON.parse(l));
+      expect(recs[0].key).toBe('codex-hang-review');
+      expect(recs[1].key).toBe('codex-hang-review');
+      expect(recs.every((x) => x.trusted === false)).toBe(true);
+      // ... but the reader's latest-winner dedup surfaces exactly ONE learning
+      // for the key -- the property the epoch-suffixed key used to break.
+      const hits = (rawSearch.match(/\[codex-hang-review\]/g) ?? []).length;
+      expect(hits).toBe(1);
+      // And the surviving record is the LATEST hang (prompt size 200), so an
+      // investigator sees the most recent event, not the first.
+      expect(rawSearch).toContain('prompt size 200 bytes');
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
 });

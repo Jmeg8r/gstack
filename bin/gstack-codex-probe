@@ -197,15 +197,49 @@ _gstack_codex_log_event() {
 
 # --- Learnings log on hang --------------------------------------------------
 
+# A hang record is telemetry, not a rule, so it must not accumulate or outrank
+# real learnings. Three properties keep it in its lane:
+#   - Key is stable PER MODE (codex-hang-review, codex-hang-autoplan, ...), not
+#     per invocation. The old epoch-suffixed key (codex-hang-<unix-ts>) minted a
+#     NEW learning on every timeout, so latest-winner dedup never collapsed
+#     them: N hangs = N rows, forever. Now the store's own dedup keeps only the
+#     most recent hang per mode; the older lines stay in the append-only file
+#     for anyone digging.
+#   - Confidence is low (see _GSTACK_CODEX_HANG_CONFIDENCE). At 8 it cleared
+#     every "high-confidence" filter downstream -- CLAUDE.md digests that
+#     export conf >= 7, the top-3 preamble list at every skill start -- and a
+#     one-off timeout was being read as durable operating guidance. With
+#     observed-source decay (1pt / 30 days) a low value also self-expires.
+#   - No `files` array. It used to point at codex/SKILL.md.tmpl and
+#     autoplan/SKILL.md.tmpl, which are gstack's OWN files and do not exist in
+#     the consuming project, so /learn prune flagged the entry STALE in every
+#     repo it landed in.
+# The JSON is built by a pure helper so tests can assert the record's shape
+# without a writable learnings store.
+_GSTACK_CODEX_HANG_CONFIDENCE=4
+
+_gstack_codex_hang_learning_json() {
+  local _mode="${1:-unknown}"
+  local _prompt_size="${2:-0}"
+  # Sanitize into the key alphabet gstack-learnings-log enforces
+  # (^[a-zA-Z0-9_-]+$); mode is an internal constant but a stray char would
+  # make the writer reject the whole record silently.
+  local _mode_key
+  _mode_key=$(printf '%s' "$_mode" | tr -cd 'a-zA-Z0-9_-')
+  [ -n "$_mode_key" ] || _mode_key="unknown"
+  printf '{"skill":"codex","type":"operational","key":"codex-hang-%s","insight":"Codex timed out (exit 124) during [%s] invocation; prompt size %s bytes. A one-off timeout is usually a model API stall, a network blip, or an oversized prompt: retry, split the prompt, or check ~/.codex/logs/. Telemetry keyed per mode (latest hang wins), not a durable rule.","confidence":%s,"source":"observed"}' \
+    "$_mode_key" "$_mode" "$_prompt_size" "$_GSTACK_CODEX_HANG_CONFIDENCE"
+}
+
 _gstack_codex_log_hang() {
-  # Invoked when a codex invocation times out (exit 124). Records an
-  # operational learning so future /investigate sessions surface the pattern.
+  # Invoked when a codex invocation times out (exit 124). Records a low-
+  # confidence, per-mode operational learning so a later /investigate can see
+  # the most recent hang without it masquerading as project guidance.
   # Best-effort: errors swallowed.
   local _mode="${1:-unknown}"
   local _prompt_size="${2:-0}"
   local _log_bin="$HOME/.claude/skills/gstack/bin/gstack-learnings-log"
   [ -x "$_log_bin" ] || return 0
-  local _key="codex-hang-$(date +%s 2>/dev/null || echo unknown)"
-  "$_log_bin" "$(printf '{"skill":"codex","type":"operational","key":"%s","insight":"Codex timed out after 600s during [%s] invocation. Prompt size: %s. Consider splitting prompt or checking network.","confidence":8,"source":"observed","files":["codex/SKILL.md.tmpl","autoplan/SKILL.md.tmpl"]}' "$_key" "$_mode" "$_prompt_size")" \
+  "$_log_bin" "$(_gstack_codex_hang_learning_json "$_mode" "$_prompt_size")" \
     >/dev/null 2>&1 || true
 }
