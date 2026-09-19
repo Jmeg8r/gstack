@@ -1,0 +1,63 @@
+# WHAT: The Sovereign Forge's CI gate for this repo — sync invariants only.
+# WHY:  This repo's upstream workflows (.github/workflows) target Ubicloud,
+#       windows-latest and macos-latest. The forge runner registers exactly
+#       arm64 / ubuntu-latest / docker, so NOT ONE of those jobs could ever be
+#       assigned: all 41 runs in this repo's history were cancelled without
+#       starting (started_at null, zero successes, back to run #285).
+#       Creating .forgejo/workflows/ shadows .github/workflows/ on the forge
+#       entirely. That is deliberate here, and is what stops the 25 phantom
+#       cancelled checks on every PR.
+#       Scope is deliberately narrow: this repo mirrors an upstream fork, so the
+#       gate guards what a SYNC can break, not what upstream already tests. A
+#       gate broad enough to fail every upstream sync would just get routed
+#       around, which enforces less than a narrow one that holds.
+name: forge-gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+
+jobs:
+  sync-invariants:
+    runs-on: arm64
+    steps:
+      - name: Check out the revision under test
+        uses: actions/checkout@v4
+
+      - name: "Version parity — VERSION agrees with package.json"
+        run: |
+          set -eu
+          test -s VERSION || { echo "FAIL: VERSION is missing or empty"; exit 1; }
+          v=$(tr -d '[:space:]' < VERSION)
+          case "$v" in
+            *.*.*.*) ;;
+            *) echo "FAIL: VERSION '$v' is not four dot-separated components"; exit 1 ;;
+          esac
+          pkg=$(node -p "require('./package.json').version")
+          base=${v%.*}
+          echo "VERSION=$v (first three: $base)   package.json=$pkg"
+          if [ "$base" != "$pkg" ]; then
+            echo "FAIL: VERSION '$v' reduces to '$base', which does not match package.json '$pkg'"
+            exit 1
+          fi
+          echo "OK: version parity"
+
+      - name: "No conflict markers survived the sync"
+        run: |
+          set -eu
+          scanned=$(git ls-files | wc -l | tr -d '[:space:]')
+          echo "scanned $scanned tracked files"
+          # A sweep whose EMPTY result is the conclusion needs its input proven
+          # non-empty: zero scanned is UNKNOWN, never clean.
+          if [ "$scanned" -eq 0 ]; then
+            echo "FAIL: zero files scanned - UNKNOWN, refusing to report clean"
+            exit 1
+          fi
+          # Markers are matched by repeat-count so this file never matches itself.
+          if git grep -nE '^(<{7}|>{7}) ' -- .; then
+            echo "FAIL: unresolved conflict markers above"
+            exit 1
+          fi
+          echo "OK: no conflict markers (scanned $scanned)"
