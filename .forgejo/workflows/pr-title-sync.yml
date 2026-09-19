@@ -1,0 +1,35 @@
+# WHAT: A deliberate no-op that shadows upstream's .github/workflows/pr-title-sync.yml
+#       on the forge. It is NOT a check and verifies nothing.
+# WHY:  forge-gate.yml shadowed every upstream `pull_request` workflow, but
+#       shadowing is scoped BY TRIGGER, not by directory alone: upstream's title
+#       sync uses `pull_request_target`, so it kept firing from .github/ and sat
+#       `waiting` forever on runs-on ubicloud-standard-2 — a label this forge's
+#       runner does not have. A check that can never resolve blocks forge-pr,
+#       which is fail-closed on CI.
+#       Shadowing it from here, rather than editing .github/, is deliberate: this
+#       repo re-syncs from upstream constantly, and any local edit under .github/
+#       would re-conflict on every future sync. Nothing here changes GitHub — the
+#       Jmeg8r/gstack mirror still runs upstream's real title sync from .github/,
+#       because GitHub ignores .forgejo/ entirely.
+#       The trigger block mirrors upstream's exactly so the shadow lands on the
+#       same events.
+# NOTE: no checkout and no PR data is interpolated, so this executes no repo code
+#       and reads no attacker-controllable field, despite pull_request_target.
+name: PR Title Sync
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, edited]
+    paths:
+      - 'VERSION'
+
+jobs:
+  sync:
+    name: Sync PR title to VERSION
+    runs-on: arm64
+    steps:
+      - name: "Explain why this is a no-op on the forge"
+        run: |
+          echo "no-op: upstream's PR Title Sync is GitHub-only (gh CLI + ubicloud runner)."
+          echo "It is shadowed here so it cannot sit unassignable and block forge-pr."
+          echo "The real title sync still runs on the Jmeg8r/gstack GitHub mirror."
