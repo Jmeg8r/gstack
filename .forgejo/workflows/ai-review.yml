@@ -1,0 +1,60 @@
+# WHAT: The forge's PR gate — local AI review of the change and its blast radius.
+# WHY:  Advisory only; merge-side enforcement is forge-pr's fail-closed policy (a
+#       verdict must EXIST at head; a FAIL needs --acknowledge-findings). The scripts
+#       it runs, bin/review-pr.sh and bin/blast-radius.py, are DEPLOYED COPIES from
+#       sovereign-forge bin/ — byte-identical on purpose so `cmp` can verify them.
+#       Change them THERE and re-copy; never edit the copies here.
+#
+# KNOWN LIMIT — upstream sync PRs: this repo mirrors garrytan/gstack, and a version
+#       sync is far past what the gate can review (PR #2 was 37,273,703 diff bytes
+#       against the broker's 400,000-byte budget, with 16 files over the
+#       100,000-byte per-file cap). The gate will die with "split the PR" on those,
+#       by design — it refuses to review less than it claims. That is deliberately
+#       NOT special-cased here: a sync that cannot be reviewed should say so loudly
+#       and take an explicit decision, rather than be waved through by a branch-name
+#       exemption nobody sees.
+name: ai-review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  review:
+    runs-on: arm64
+    steps:
+      - name: Check out the PR with full history
+        uses: actions/checkout@v4
+        with:
+          # The gate diffs against the base branch, so a shallow clone would leave it
+          # with nothing to compare and it would (correctly) refuse to review.
+          fetch-depth: 0
+
+      - name: Install the gate's dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq jq python3 curl git >/dev/null
+          echo "jq $(jq --version), python3 $(python3 --version)"
+
+      - name: Run the review
+        env:
+          # Forgejo mints a repo-scoped, per-run token automatically — deliberately not
+          # a personal token, since CI runs untrusted dependency code.
+          FORGE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BROKER_TOKEN: ${{ secrets.BROKER_TOKEN }}
+          FORGE_API: http://100.88.14.2:3300/api/v1
+          BROKER_URL: http://100.88.14.2:3401
+          REVIEW_REPO: ${{ github.repository }}
+          # gstack's CLAUDE.md is prose-headed, not numbered like sovereign-forge's, so
+          # the default markers (^## 3\. / ^## 4\.) extract ZERO standards here — which
+          # is a hard die(). Measured before shipping: these markers span the whole file
+          # and yield 19 standards (4,753 bytes). The bold bullets that carry gstack's
+          # rules are spread across four non-adjacent sections, so no single section
+          # heading works as a BEGIN marker.
+          STANDARDS_BEGIN: '^# gstack development'
+          STANDARDS_END: '^ZZZ_NEVER_MATCHES'
+        run: |
+          git fetch origin "${{ github.base_ref }}:${{ github.base_ref }}" || true
+          bin/review-pr.sh \
+            --pr "${{ github.event.number }}" \
+            --base "${{ github.base_ref }}"
