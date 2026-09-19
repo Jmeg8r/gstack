@@ -1469,7 +1469,9 @@ function emergencyCleanup() {
 
   // Clean Chromium profile locks via the shared helper (defensive guard
   // refuses to operate on unrecognized profile dirs).
-  cleanSingletonLocks(resolveChromiumProfile());
+  if (activeBrowserManager.getConnectionMode() === 'headed' || process.env.BROWSE_HEADED === '1') {
+    cleanSingletonLocks(resolveChromiumProfile());
+  }
   safeUnlinkQuiet(config.stateFile);
 }
 // Same import.meta.main gate as SIGINT/SIGTERM — embedders register their
@@ -1704,7 +1706,9 @@ export function buildFetchHandler(cfg: ServerConfig): ServerHandle {
 
     await cfgBrowserManager.close();
 
-    cleanSingletonLocks(resolveChromiumProfile());
+    if (cfgBrowserManager.getConnectionMode() === 'headed') {
+      cleanSingletonLocks(resolveChromiumProfile());
+    }
     safeUnlinkQuiet(config.stateFile);
     process.exit(exitCode);
   }
@@ -3188,6 +3192,14 @@ export async function start() {
     // daemon launch on this state file) can validate-then-cleanup orphans
     // without clobbering a recycled PID.
     ...(xvfb ? { xvfbPid: xvfb.pid, xvfbStartTime: xvfb.startTime, xvfbDisplay: xvfb.display } : {}),
+    // #2709: launched-Chromium identity (pid + start time) so `browse stop`
+    // can reap a survivor — the headless launch has no SingletonLock for
+    // killOrphanChromium to walk, and on macOS 26 the orphaned GPU process
+    // kept spinning at ~800% CPU after the daemon exited.
+    ...(() => {
+      const info = browserManager.getChromiumProcInfo();
+      return info ? { chromiumPid: info.pid, chromiumStartTime: info.startTime } : {};
+    })(),
   };
   const tmpFile = tmpStatePath();
   fs.writeFileSync(tmpFile, JSON.stringify(state, null, 2), { mode: 0o600 });

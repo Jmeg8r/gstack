@@ -36,6 +36,28 @@ two gate-tier canaries in `test/skill-e2e-hermetic-canary.test.ts`, and the
 seeding tripwires in `test/hermetic-skills-seeding.test.ts` /
 `test/pty-skill-seeding-wiring.test.ts`.
 
+Seeded planning sessions also receive an isolated runtime home through
+`test/helpers/hermetic-skill-runtime.ts`, so absolute lazy-section paths resolve
+to the working tree under test. Explicit per-test home overrides remain intact.
+Autoplan resolves each review skill from its own installed host registry.
+
+**Interactive planning evidence.** Finding-count and autoplan-chain drivers use
+`observeScreen: true` and await `currentScreen()` before choosing an input. The
+existing xterm dependency interprets cursor moves and erases; old menus in the
+raw stream cannot establish a current prompt. Snapshots preserve
+`terminal.raw.log`, `terminal.visible.log`, and `terminal.screen.log` separately.
+Completed native transcript calls establish question counts and phase coverage.
+Report-aware count tests also require a fresh, complete report and native
+completion evidence before accepting a completion heading.
+
+The engineering and DX finding fixtures check coverage of their seeded issues
+rather than cap the total number of review questions. Each decision needs a
+distinct, completed native question with an offered answer; accepting, rejecting,
+or deferring a recommendation all count as reviewing it. Engineering's mandatory
+legacy regression tests also need affirmative plan or public-narration evidence.
+Additional useful questions are allowed within the existing time limits. Generic
+question counts remain diagnostic, and a fresh final review report is required.
+
 E2E tests stream progress in real-time (tool-by-tool via `--output-format stream-json
 --verbose`). Results are persisted to `~/.gstack/projects/<slug>/evals/` (legacy
 fallback `~/.gstack-dev/evals/`) with auto-comparison
@@ -43,6 +65,55 @@ against the previous finalized run (in-flight `_partial` files are never used as
 a baseline, so a run can't compare against itself).
 
 ## Runners: how the suites execute (2026-08 overhaul)
+
+**Aside-only E2E tests self-skip without a live Aside; browser-driving tests
+run on either engine.** Every skill that opens a web page drives the Aside AI
+browser first (`scripts/resolvers/aside.ts`) and falls back to gstack's own
+browse engine when Aside is absent (and Chromium bootstrapped). The cases that
+need Aside itself (`test/skill-e2e-aside.test.ts`, `design-review-fix` in
+`test/skill-e2e-design.test.ts`) call `asideAvailable()` from
+`test/helpers/aside-available.ts` (the same probe the skills run in BROWSER
+SETUP) and skip when the `aside` CLI or the Aside app is absent. CI runners have
+no Aside, so those run only on macOS dev machines and sit in the periodic tier;
+set `GSTACK_SKIP_ASIDE=1` to force the skip locally (which also exercises the
+fallback hand-off). The qa E2E files (`test/skill-e2e-qa-workflow.test.ts`,
+`test/skill-e2e-qa-bugs.test.ts`) gate on `asideAvailable() ||
+fs.existsSync(browseBin)`: the skill's own BROWSER SETUP picks the engine, so
+on a Mac they drive Aside and on Linux CI they drive the built browse binary,
+skipping only when neither exists. The `$B`-driven E2E cases and `browse/test/`
+run on every platform as before, so Linux CI proves the fallback engine live.
+
+**The renderer picks the same way, so the render gates are engine-agnostic.**
+`/make-pdf`, `/diagram`, and design previews print and screenshot their local
+HTML through `lib/aside-render.ts` / `bin/gstack-render.ts`, which render in
+Aside when `probeAside()` says `READY` and through the browse engine otherwise.
+make-pdf's `*-gate.test.ts` and `test/skill-e2e-diagram.test.ts` (periodic,
+paid) gate on `browserAvailable()` (`make-pdf/test/e2e/browser-available.ts`:
+`asideAvailable() || resolveBrowseBin() !== null`) — on a Mac they print
+through Aside, on Linux CI through the browse binary `bun run build:gates`
+compiles, and they skip only when neither exists. Only
+`test/aside-render.test.ts`'s two live Aside cases (a full round-trip and a
+late-readiness `--wait-expr` poll) are Aside-only: its option
+mapping and generated-script pins run everywhere, and its fake-executable cases
+drive both engines hermetically (fake `aside` / `browse` scripts on PATH pin
+probe classification, the stdout contract, loopback-server policy, the timeout
+kill, engine choice and the mid-run fallback). `test/gstack-render-cli.test.ts`
+does the same for `bin/gstack-render.ts` with `GSTACK_SKIP_ASIDE=1` and
+`GSTACK_BROWSE_BIN` pointed at a fake daemon that logs every argv line. A green
+gate on Linux proves the fallback engine, not Aside; the Mac run is the Aside
+evidence.
+The browse-binary leg presumes Chromium bootstrapped: `resolveBrowseBin()`
+only checks that the binary (or the `find-browse` shim) exists, never that
+Chromium can launch, so on an install where the best-effort Chromium step
+was skipped (`GSTACK_SKIP_PLAYWRIGHT=1`) or failed, these gates run and fail
+at browser launch instead of skipping. Fix the bootstrap (or move the binary
+aside) before running them locally; CI always installs Chromium first.
+`test/dom-dump-hygiene.test.ts` is the one free-suite case on the same leg: it
+runs `lib/dom-dump.js` (the rendered-DOM dump `/design-review` hands the design
+detector) inside a real Chromium page through the built browse binary, so it
+self-skips when the binary is absent and, because a cold Chromium launch is
+load-sensitive on a busy dev box, runs only in CI or on explicit opt-in
+(`GSTACK_DOM_DUMP_HYGIENE=1`).
 
 **Free suite (`bun run test:free`).** `scripts/test-free-shards.ts` runs N
 concurrent shard processes (serial within each) with strict-output
@@ -110,6 +181,43 @@ archaeology.
 `test/helpers/eval-budgets.ts` (JUDGE/CAPTURE/CAPTURE_LONG/PTY/PTY_LONG);
 `test/eval-budgets-policy.test.ts` pins that every tier fits the shard wall
 minus overhead and ratchets raw literals. Budget above the wall is fiction.
+The sole registered exception is `AUTOPLAN_CHAIN_BUDGET` for
+`test/skill-e2e-autoplan-chain.test.ts`: 80 minutes of work (four `PTY_LONG`
+allocations), an 84-minute session watchdog, an 85-minute Bun test deadline,
+and a 172-minute supervised shard wall. The unchanged retry count of one
+permits two 85-minute attempts plus two minutes for cleanup. This is a
+**specified allocation for the stronger four-phase contract**, not a measured
+calibration or statistical upper bound. The historical 900-second failures
+remain failures. Models, fixtures, phase assertions and production review
+caller timeouts are unchanged; this explicitly changes eval latency/cost policy.
+
+The Autoplan chain explicitly enables native `PreToolUse` approval for edits to
+its owned temporary review artifacts. Approval starts with the `/autoplan`
+command and requires the exact parent session, prior successful file history,
+and a current request digest. Other recorder callers remain observational.
+A rejected artifact edit fails the test instead of falling through to terminal
+permission input. Approval itself supplies no edit success or phase credit:
+the native tool result and all four completed review phases are still required.
+
+`resolvePaidShardBudget(files, overrideMs?)` is the canonical per-job resolver.
+Only the exact Autoplan file gets the exception, in its own shard. An explicit
+CLI `--timeout`, `EVALS_SHARD_TIMEOUT_MS`, or API `timeoutMs` still wins, including
+a lower cap. Planner entries and execution results record the effective wall,
+its source and policy identifier. Custom drivers must resolve each job instead
+of passing their ordinary 1800-second default as an explicit Autoplan cap;
+their outer controller/detach wall must also cover the allocated work and cleanup.
+`eval:bg:periodic` already has a 37800-second outer cap. Legacy monolithic
+`eval:bg`/`eval:bg:all` retain their shorter 5400/7200-second caps and do not
+promise two complete Autoplan attempts; use the sharded periodic path for this policy.
+
+Periodic CI plans `--slices 7 --autoplan-slice`: six ordinary slices retain their
+existing limits, while the seventh runs only Autoplan. Its unchanged 200-minute
+job cap leaves 28 minutes around the 172-minute shard for setup and artifacts.
+Reconciliation rejects missing, duplicated or misplaced Autoplan work and absent
+budget records. This does not claim that the growing ordinary census has a
+200-minute worst-case bound. Ordinary paid tiers and their 1800-second shard
+wall remain unchanged; unregistered over-ceiling tests still fail policy checks.
+
 Session timeouts are two-phase: a silent API dies at the startup grace (90s
 local / 300s CI floor, distinct exit reason `timeout_startup`) and the work
 budget arms on the first byte — the total wall never grows
@@ -121,6 +229,34 @@ wedge a shard: every `spawnSync`/`execSync`/`execFileSync`/`Bun.spawnSync`
 in the test trees must carry a `timeout`, enforced by
 `test/spawnsync-timeout-tripwire.test.ts` with a shrink-only exemption
 ratchet.
+
+**Anchor-sliced `setup` harnesses.** `setup` is one large bash script, so the
+free tests that pin its linker, cleanup, retired-skill prune, browser hint,
+rebuild decision, and Chromium-bootstrap behavior never run the whole thing.
+They slice the source by anchor (`extractFn(name)` takes
+`name() {` through the next `\n}\n`; `test/setup-playwright-best-effort.test.ts`
+slices the `# 2. Ensure Playwright's Chromium is available` block up to
+`# 2b.`), join the extracted functions with stubbed collaborators, and execute
+the REAL bash under a temp `HOME` with stubbed probes and installers. Two rules
+keep the harness honest: renaming a function or anchor comment in `setup` fails
+the test with `function not found` / `anchor not found` instead of silently
+testing nothing, and `test/setup-link-ownership.test.ts` and
+`test/setup-playwright-best-effort.test.ts` throw on any `command not found` on
+stderr as harness drift (a helper the test forgot to extract) rather than
+letting it degrade into a pass. Files: `test/setup-link-ownership.test.ts`,
+`test/setup-cleanup-orphans.test.ts`, `test/setup-playwright-best-effort.test.ts`,
+`test/setup-prune-stale-generated.test.ts` (`_prune_stale_generated` against a
+temp render tree plus host dirs: host cleanup after the generator already
+pruned, symlink targets survive, frontmatter-renamed skills, foreign links),
+`test/setup-browser-hint.test.ts` (`_browser_hint` and the bootstrap summary
+across Aside present/absent, bootstrap ok/failed/skipped, `GSTACK_SKIP_ASIDE`),
+and `test/setup-needs-build.test.ts` (the `NEEDS_BUILD` block sliced between
+two anchors: every binary and source set flips it, Windows `.exe` suffixes).
+`test/relink.test.ts` shells out to a copy of the real `bin/gstack-relink`
+against a temp `GSTACK_INSTALL_DIR` / `GSTACK_SKILLS_DIR`, and
+`test/hook-scripts.test.ts` runs the real `careful/bin/check-careful.sh` and
+`freeze/bin/check-freeze.sh` with JSON payloads on stdin (including the
+`GSTACK_HOME` state-root parity against `bin/gstack-paths`).
 
 ## Cloud sandboxes (Vercel / Conductor cloud workspaces)
 

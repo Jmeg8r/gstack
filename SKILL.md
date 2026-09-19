@@ -158,6 +158,12 @@ This is the gstack router. Its one job is to send the request to the right skill
 
 1. If the request is about a browser, QA, dogfooding, screenshots, or inspecting a page
    (open a site, test a deploy, take a screenshot, check a flow visually) → invoke `/browse`.
+   Every gstack browser skill (`/browse`, `/qa`, `/qa-only`, `/design-review`, `/canary`,
+   `/benchmark`, `/scrape`) drives the Aside browser first — the user's real browser with
+   their real logged-in sessions — and falls back to gstack's own browser when Aside is not
+   installed or not running. Route "open the browser" / "import cookies" requests to the
+   fallback-browser skills below only when the user is clearly on that path (Linux,
+   Windows, or Aside closed); on Aside there is nothing to open or import.
 2. Otherwise, route by the rules below. If nothing matches, answer directly.
 
 Best-effort, record which way you routed (never block on it). Set `ROUTE_OUTCOME` to
@@ -198,7 +204,7 @@ quality gates that produce better results than answering inline.
 - User asks to update docs after shipping → invoke `/document-release`
 - User asks to write docs from scratch, generate documentation, "document this feature/module" → invoke `/document-generate`
 - User asks for a weekly retro, what did we ship, "how'd we do" → invoke `/retro`
-- User asks for a second opinion, codex review → invoke `/codex`
+Generic “second opinion”, “outside review”, or “cross-model review” requests use `/codex` (namespaced: `/gstack-codex`). This selection follows the **claude harness**, independently of model configuration. Explicit provider requests take precedence: Codex means `/codex`; Claude Code means `/claude-code`. Never silently substitute another provider. If that provider is the current harness, report that no outside invocation ran and suggest the other wrapper only as a separate user choice. Wrapper availability: Claude Code installs only /codex; Codex installs only /claude-code; other harnesses install both. Repair stale installations with `setup --host claude`. There is no /claude compatibility alias.
 - User asks for safety mode, careful mode → invoke `/careful` or `/guard`
 - User asks to restrict edits to a directory → invoke `/freeze` or `/unfreeze`
 - User asks to upgrade gstack → invoke `/gstack-upgrade`
@@ -206,8 +212,11 @@ quality gates that produce better results than answering inline.
 - User asks to resume, restore, "where was I" → invoke `/context-restore`
 - User asks about security, OWASP, vulnerabilities, "is this secure" → invoke `/cso`
 - User asks to make a PDF, document, publication → invoke `/make-pdf`
-- User asks to launch a real browser for QA, "open the browser" → invoke `/open-gstack-browser`
-- User asks to import cookies for authenticated testing → invoke `/setup-browser-cookies`
+- User asks to pull data off a web page, "grab the table from", "extract the prices" → invoke `/scrape`
+- User asks to launch a real browser for QA, "open the browser" → invoke `/open-gstack-browser` (fallback browser; on Aside the tabs are already visible)
+- User asks to import cookies for authenticated testing → invoke `/setup-browser-cookies` (fallback browser; Aside already has the sessions)
+- User asks to share the browser with another agent, "pair OpenClaw/Codex with my browser" → invoke `/pair-agent` (fallback browser)
+- User asks to codify or save the last `/scrape` as a reusable skill → invoke `/skillify` (fallback browser)
 - User asks about page speed, performance regression, benchmarks → invoke `/benchmark`
 - User asks what gstack has learned, "show learnings" → invoke `/learn`
 - User asks to tune question sensitivity, "stop asking me that" → invoke `/plan-tune`

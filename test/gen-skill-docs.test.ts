@@ -28,6 +28,16 @@ function readShipUnion(): string {
   return readSkillUnion('ship');
 }
 
+function readExternalSkillUnion(output: string, hostSubdir: string, skill: string): string {
+  const dir = path.join(output, hostSubdir, 'skills', `gstack-${skill}`);
+  const sections = path.join(dir, 'sections');
+  return fs.readFileSync(path.join(dir, 'SKILL.md'), 'utf-8')
+    + (fs.existsSync(sections) ? fs.readdirSync(sections).sort()
+      .filter(file => file.endsWith('.md'))
+      .map(file => '\n' + fs.readFileSync(path.join(sections, file), 'utf-8')).join('') : '');
+}
+
+
 // Token-reduction Phase 1: the preamble's inline bash (session bookkeeping,
 // config echoes, telemetry producers, artifacts sync) moved into
 // bin/gstack-skill-start / bin/gstack-skill-end. The render carries a one-line
@@ -114,10 +124,8 @@ const ALL_SKILLS = (() => {
   return skills;
 })();
 
-// hosts/claude.ts generation.skipSkills entries would filter here; the set is
-// currently empty (the /claude outside-voice template was removed).
 // The claude host deliberately skips some skills (skipSkills — e.g. the
-// /claude outside-voice skill exists only for non-Claude hosts), so those
+// /claude-code outside-voice skill exists only for non-Claude hosts), so those
 // dirs have a SKILL.md.tmpl but no generated claude-host SKILL.md on a fresh
 // checkout. Every generated-file assertion must exclude them or it is red on
 // every clean clone (it was, invisibly, until the free suite ran in CI).
@@ -356,6 +364,12 @@ describe('gen-skill-docs', () => {
       path.join(ROOT, 'browse', 'sections', 'command-list.md.tmpl'), 'utf-8');
     expect(browseSectionTmpl).toContain('{{COMMAND_REFERENCE}}');
     expect(browseSectionTmpl).toContain('{{SNAPSHOT_FLAGS}}');
+
+    // Aside is the primary browser: every browsing skill renders the Aside
+    // contract ({{ASIDE_SETUP}}); the browse binary is its fallback.
+    const qaTmpl = fs.readFileSync(path.join(ROOT, 'qa', 'SKILL.md.tmpl'), 'utf-8');
+    expect(qaTmpl).toContain('{{ASIDE_SETUP}}');
+    expect(browseTmpl).toContain('{{ASIDE_SETUP}}');
   });
 
   test('generated SKILL.md contains operational self-improvement (replaced contributor mode)', () => {
@@ -416,9 +430,10 @@ describe('gen-skill-docs', () => {
   });
 
   test('tier 2+ skills contain ELI10 simplification rules (AskUserQuestion format)', () => {
-    // Root SKILL.md is tier 1 (no AskUserQuestion format). Check a tier 2+ skill instead.
+    // Root SKILL.md is tier 1 and CSO intentionally uses a private startup with
+    // no shared PREAMBLE. Check a regular tier 2+ PREAMBLE consumer instead.
     // v1.7.0.0 Pros/Cons format uses "ELI10 (ALWAYS)" rather than "Simplify (ELI10".
-    const content = fs.readFileSync(path.join(ROOT, 'cso', 'SKILL.md'), 'utf-8');
+    const content = fs.readFileSync(path.join(ROOT, 'review', 'SKILL.md'), 'utf-8');
     expect(content).toContain('ELI10');
     expect(content).toContain('plain English');
     expect(content).toContain('not function names');
@@ -770,7 +785,9 @@ describe('description quality evals', () => {
     // browse/SKILL.md. Guard arrow style on the browse body (sliced from its
     // H1 so the auto-generated `-->` header comments are excluded).
     const content = fs.readFileSync(path.join(ROOT, 'browse', 'SKILL.md'), 'utf-8');
-    const body = content.slice(content.indexOf('# browse: QA Testing'));
+    const h1 = content.search(/^# browse: /m);
+    expect(h1).toBeGreaterThan(-1);
+    const body = content.slice(h1);
     expect(body).toContain('→');
     expect(body).not.toContain('->');
   });
@@ -1381,12 +1398,12 @@ describe('DESIGN_SKETCH resolver', () => {
     expect(content).toMatch(/wireframe|sketch/i);
   });
 
-  test('references browse binary for rendering', () => {
-    expect(content).toContain('$B goto');
+  test('wireframes render through gstack-render (Aside first)', () => {
+    expect(content).toContain('gstack-render.ts');
   });
 
   test('references screenshot capture', () => {
-    expect(content).toContain('$B screenshot');
+    expect(content).toContain('--screenshot');
   });
 
   test('specifies rough aesthetic', () => {
@@ -1402,7 +1419,7 @@ describe('DESIGN_SKETCH resolver', () => {
 
 describe('CODEX_SECOND_OPINION resolver', () => {
   const content = readSkillUnion('office-hours'); // carved: Phase 5/6 prose moved to section
-  const codexContent = fs.readFileSync(path.join(EXTERNAL_OUT, '.agents', 'skills', 'gstack-office-hours', 'SKILL.md'), 'utf-8');
+  const codexContent = readExternalSkillUnion(EXTERNAL_OUT, '.agents', 'office-hours');
 
   test('Phase 3.5 section appears in office-hours SKILL.md', () => {
     expect(content).toContain('Phase 3.5: Cross-Model Second Opinion');
@@ -1422,7 +1439,8 @@ describe('CODEX_SECOND_OPINION resolver', () => {
   });
 
   test('contains Claude subagent fallback', () => {
-    expect(content).toContain('CODEX_NOT_AVAILABLE');
+    expect(content).toContain('CODEX_MODE: not_installed');
+    expect(content).toContain('If preflight is not ready');
     expect(content).toContain('Agent tool');
     expect(content).toContain('SECOND OPINION (Claude subagent)');
   });
@@ -1437,14 +1455,11 @@ describe('CODEX_SECOND_OPINION resolver', () => {
     expect(content).toMatch(/[Ee]mpty response/);
   });
 
-  test('Codex host variant does NOT contain the Phase 3.5 resolver output', () => {
-    // The resolver returns '' for codex host, so the interactive section is stripped.
-    // Static template references to "Phase 3.5" in prose/conditionals are fine.
-    // Other resolvers (design review lite) may contain CODEX_NOT_AVAILABLE, so we
-    // check for Phase 3.5-specific markers only.
-    expect(codexContent).not.toContain('Phase 3.5: Cross-Model Second Opinion');
-    expect(codexContent).not.toContain('TMPERR_OH');
-    expect(codexContent).not.toContain('gstack-codex-oh-');
+  test('Codex host runs Phase 3.5 through Claude Code', () => {
+    expect(codexContent).toContain('Phase 3.5: Cross-Model Second Opinion');
+    expect(codexContent).toContain('gstack-claude-code');
+    expect(codexContent).toContain('Claude Code');
+    expect(codexContent).not.toMatch(/codex\s+(?:exec|review)\s/);
   });
 });
 
@@ -1732,7 +1747,7 @@ describe('DESIGN_OUTSIDE_VOICES resolver', () => {
   test('plan-design-review contains outside voices section', () => {
     const content = readSkillUnion('plan-design-review');
     expect(content).toContain('Design Outside Voices');
-    expect(content).toContain('CODEX_AVAILABLE');
+    expect(content).toContain('CODEX_MODE: ready');
     expect(content).toContain('LITMUS SCORECARD');
   });
 
@@ -1781,6 +1796,71 @@ describe('DESIGN_HARD_RULES resolver', () => {
     expect(content).toContain('Universal rules');
   });
 
+  test('classifier names the four visitor modes and keeps the legacy aliases', () => {
+    const content = readSkillUnion('plan-design-review');
+    for (const mode of ['PERSUADE', 'OPERATE', 'READ', 'EXPERIENCE', 'HYBRID']) expect(content).toContain(`**${mode}**`);
+    expect(content).toContain('Read rules');
+    expect(content).toContain('Experience rules');
+    expect(content).toContain('classify per section, not per page');
+  });
+
+  test('carries the craft-floor reflexes and the three-looks calibration', () => {
+    const content = readSkillUnion('plan-design-review');
+    expect(content).toContain('Reflexes no detector catches');
+    expect(content).toContain('Browser surfaces carry the design');
+    expect(content).toContain('One authored motion moment');
+    expect(content).toContain('Depth has an offset');
+    expect(content).toContain('Light or dark comes from the use scene');
+    expect(content).toContain('Calibration: the three looks');
+  });
+
+  test('slop section lists detector rule ids and judgment tells outside design-review', () => {
+    const content = readSkillUnion('plan-design-review');
+    expect(content).toContain('Detector rule ids for the rest of the catalog');
+    expect(content).toContain('nested-cards: Nested cards');
+    expect(content).toContain('Judgment tells with no detector rule');
+    // Never a bracketed gstack-only id.
+    expect(content).not.toContain('[hero-metrics]');
+  });
+
+  test('design-consultation carries the font procedure, role-scoped lists, color strategies, and catalog bullets', () => {
+    const content = readSkillUnion('design-consultation');
+    expect(content).toContain('Choosing faces: a procedure, not a menu');
+    expect(content).toContain('**Overused as display**');
+    expect(content).toContain('Fine as body/UI on an Operate or Read surface');
+    expect(content).toContain('**Banned in any role:** Papyrus');
+    expect(content).toContain('Restrained (1 accent + neutrals');
+    expect(content).toContain('Drenched (color as the primary design tool');
+    expect(content).toContain('Light vs dark is not one of the dials');
+    expect(content).toContain('Calibration: the three looks');
+    // Bullets are prose only: never a bracketed rule id in the proposal skill.
+    expect(content).toContain('- A card inside a card is always wrong.');
+    expect(content).not.toMatch(/^- \[[a-z-]+\] /m);
+    // The old menu is gone.
+    expect(content).not.toContain('Font recommendations by purpose');
+  });
+
+  test('design-html blacklist lines carry catalog ids', () => {
+    const content = fs.readFileSync(path.join(ROOT, 'design-html', 'SKILL.md'), 'utf-8');
+    expect(content).toContain('**Never include by default (AI slop blacklist):**');
+    expect(content).toContain('Purple/blue gradients as default <!-- ai-color-palette -->');
+    expect(content).toContain('lib/design-catalog.ts');
+  });
+
+  test('design-review renders the catalog once: Methodology category 9 carries it, Hard Rules points at it', () => {
+    const content = fs.readFileSync(path.join(ROOT, 'design-review', 'SKILL.md'), 'utf-8');
+    expect(content.split('### Design Hard Rules').length - 1).toBe(1);
+    // Category 9 lists the rule once (ids only); Typography points at the same id from its overused-face item.
+    expect(content.split('[overused-font]').length - 1).toBe(2);
+    expect(content).toContain('are Methodology category 9');
+    expect(content).toContain('**9. AI Slop Detection**');
+    expect(content).toContain('Detector rules (ids only;');
+    expect(content).toContain('[nested-cards] nested cards');
+    expect(content).toContain('Judgment tells (no detector rule');
+    // The legacy blacklist is not repeated as a numbered list in design-review.
+    expect(content).not.toMatch(/^1\. Purple\/violet\/indigo/m);
+  });
+
   test('references shared AI slop blacklist items', () => {
     const content = readSkillUnion('plan-design-review');
     expect(content).toContain('3-column feature grid');
@@ -1800,6 +1880,283 @@ describe('DESIGN_HARD_RULES resolver', () => {
   });
 });
 
+describe('Design approval reconciliation', () => {
+  test('token alignment reuses the approved outcome while preserving first decisions and new tradeoffs', () => {
+    const section = fs.readFileSync(path.join(ROOT, 'plan-design-review/sections/review-sections.md'), 'utf8');
+    const pass = extractMarkdownSection(section, '### Pass 5: Design System Alignment');
+    const stop = pass.indexOf('**STOP.**');
+    expect(stop).toBeGreaterThan(0);
+    const beforeQuestion = pass.slice(0, stop);
+    expect(beforeQuestion).toContain('check whether an earlier pass already approved that outcome');
+    expect(beforeQuestion).toContain('apply the established tokens and update every stale gap/reference under that decision');
+    expect(beforeQuestion).toContain('changing the plan location or spelling out the same fix is not a new issue');
+    expect(beforeQuestion).toContain('Ask again only if new evidence exposes an unresolved requirement or tradeoff, and name it');
+    expect(beforeQuestion).toContain('An unapproved violation still needs its first individual decision');
+    expect(pass.slice(stop)).toContain('AskUserQuestion once per issue. Do NOT batch. Recommend + WHY.');
+  });
+
+  test('loaded review section distinguishes individual issue decisions from navigation', () => {
+    const section = fs.readFileSync(path.join(ROOT, 'plan-design-review/sections/review-sections.md'), 'utf8');
+    expect(section).toContain('Complete one decision cycle per unresolved finding');
+    expect(section).toContain('Scope, focus, setup, and next-step choices approve no remedies.');
+    expect(section).toContain('Never use the final next-step AskUserQuestion to satisfy the issue-approval loop.');
+    expect(section).toContain('With no unresolved findings, no issue question is required.');
+  });
+
+  test('Design blocking Exit checklist reconciles approvals and refreshes stale output after a decision', () => {
+    const main = fs.readFileSync(path.join(ROOT, 'plan-design-review/SKILL.md'), 'utf8');
+    const check = extractMarkdownSection(main, '## Section self-check');
+    expect(check).toContain('Before summaries, review logs or next-step menus, run approval check 0 below.');
+    const gate = extractMarkdownSection(main, '## EXIT PLAN MODE GATE (BLOCKING)');
+    expect(gate.indexOf('0. Approvals:')).toBeGreaterThanOrEqual(0);
+    expect(gate.indexOf('0. Approvals:')).toBeLessThan(gate.indexOf('1. Read the plan file'));
+    expect(gate).toContain("each issue's remedy needs its own AskUserQuestion call and answer.");
+    expect(gate).toContain("Never group distinct issues.");
+    expect(gate).toContain('Never group distinct issues. DESIGN.md tokens and navigation are not approval.');
+    expect(gate).toContain('Honor prior exact decisions and preamble-authorized per-issue auto-decisions;');
+    expect(gate).toContain('preamble-authorized');
+    expect(gate).toContain('record why. Deferrals remain unresolved.');
+    expect(gate).toContain('If missing, reset drafts to pending, ask and wait.');
+    expect(gate).toContain('refresh the plan, report and review log; rerun this gate.');
+    expect(gate).toContain('after your most recent write to it');
+  });
+
+  test('CEO blocking Exit checklist rejects setup and approach as issue approval', () => {
+    const main = fs.readFileSync(path.join(ROOT, 'plan-ceo-review/SKILL.md'), 'utf8');
+    const check = extractMarkdownSection(main, '## Section self-check');
+    expect(check).toContain('Before summaries, review logs or next-step menus, run approval check 0 below.');
+    const gate = extractMarkdownSection(main, '## EXIT PLAN MODE GATE (BLOCKING)');
+    expect(gate.indexOf('0. Approvals:')).toBeGreaterThanOrEqual(0);
+    expect(gate.indexOf('0. Approvals:')).toBeLessThan(gate.indexOf('1. Read the plan file'));
+    expect(gate).toContain("each issue's remedy needs its own AskUserQuestion call and answer.");
+    expect(gate).toContain("Never group distinct issues.");
+    expect(gate).toContain('Never group distinct issues. Setup, mode, approach and navigation are not approval.');
+    expect(gate).toContain('Honor prior exact decisions and preamble-authorized per-issue auto-decisions;');
+    expect(gate).toContain('preamble-authorized');
+    expect(gate).toContain('record why. Deferrals remain unresolved.');
+    expect(gate).toContain('If missing, reset drafts to pending, ask and wait.');
+    expect(gate).toContain('refresh the plan, report and review log; rerun this gate.');
+    expect(check).toContain('Read and execute every section and output');
+    expect(check).toContain('STOP, Read it and redo the review');
+    expect(main).toContain('one tool_use per issue, no batching');
+    expect(main).toContain('even obvious fixes');
+    expect(main).toContain('wait for approval before changing the plan');
+    expect(main).toContain('Zero findings: state "No issues, moving on"');
+  });
+
+  test('Eng cannot exit with unasked findings listed only in an unresolved-decisions report', () => {
+    const main = fs.readFileSync(path.join(ROOT, 'plan-eng-review/SKILL.md'), 'utf8');
+    const check = extractMarkdownSection(main, '## Section self-check');
+    expect(check).toContain('Before summaries, review logs or next-step menus, run approval check 0 below.');
+    const gate = extractMarkdownSection(main, '## EXIT PLAN MODE GATE (BLOCKING)');
+    expect(gate.indexOf('0. Approvals:')).toBeGreaterThanOrEqual(0);
+    expect(gate.indexOf('0. Approvals:')).toBeLessThan(gate.indexOf('1. Read the plan file'));
+    expect(gate).toContain("each issue's remedy needs its own AskUserQuestion call and answer.");
+    expect(gate).toContain('Never group distinct issues. Setup, mode, approach and navigation are not approval.');
+    expect(gate).toContain('Honor prior exact decisions and preamble-authorized per-issue auto-decisions;');
+    expect(gate).toContain('record why. Deferrals remain unresolved.');
+    expect(gate).toContain('The coverage-audit REGRESSION test is already authorized; cite that rule.');
+    expect(gate).toContain('This exception covers only the regression test, not other findings.');
+    expect(gate).toContain('If missing, reset drafts to pending, ask and wait.');
+    expect(gate).toContain('refresh the plan, report and review log; rerun this gate.');
+  });
+
+  test('approval entry does not alter other review Exit checklists', () => {
+    for (const skill of ['plan-devex-review']) {
+      const gate = extractMarkdownSection(readSkillUnion(skill), '## EXIT PLAN MODE GATE (BLOCKING)');
+      expect(gate).not.toContain('0. Approvals:');
+      expect(gate).toContain('1. Read the plan file');
+      expect(gate).toContain('5. If a plan file is in context');
+    }
+  });
+
+  test('task and decision reporting require approval while preserving unanswered findings', () => {
+    const section = fs.readFileSync(path.join(ROOT, 'plan-design-review/sections/review-sections.md'), 'utf8');
+    const reconcile = section.indexOf('Before synthesizing tasks or the completion summary');
+    expect(reconcile).toBeGreaterThan(0);
+    expect(reconcile).toBeLessThan(section.indexOf('## Implementation Tasks'));
+    expect(section).toContain('Export only agreed implementation work; retain unapproved remedies as pending findings.');
+    expect(section).toContain('Count only individually approved new decisions');
+    expect(section).toContain('including a finding not yet asked');
+  });
+});
+
+// --- {{DESIGN_DETECTOR}} resolver tests ---
+
+describe('DESIGN_DETECTOR resolver', () => {
+  const designReview = () => fs.readFileSync(path.join(ROOT, 'design-review', 'SKILL.md'), 'utf-8');
+  const designHtml = () => fs.readFileSync(path.join(ROOT, 'design-html', 'SKILL.md'), 'utf-8');
+  const bashBlocksOf = (content: string) => [...content.matchAll(/```bash\n([\s\S]*?)```/g)].map(m => m[1]);
+
+  test('design-review carries the probe, Phase 0, the DOM dump, and the run id', () => {
+    const c = designReview();
+    expect(c).toContain('gstack-design-detect.ts probe --host claude');
+    expect(c).toContain('IMPECCABLE_READY');
+    // the consent-gated install: offered once, only on the probe's say-so, never in spawned sessions, never via npx
+    expect(c).toContain('DESIGN_DETECTOR_INSTALL_OFFER');
+    expect(c).toContain('gstack-design-detect.ts install --host claude');
+    expect(c).toContain("Install impeccable's design detector engine?");
+    expect(c).toContain('gstack-config set design_detector_install_prompted true');
+    expect(c).toContain('`SESSION_KIND: spawned` or a headless run, never install and never ask');
+    expect(c).toContain('**Phase 0: mechanical scan**');
+    expect(c).toContain('scan --changed <base> --format gstack --host claude');
+    expect(c).toContain('### DOM dump (DOM mode only');
+    expect(c).toContain('data-gstack-dom-css');
+    expect(c).toContain(`$B js '('"$_DUMP"')()' --out "$_TMP/{page}.dom.html" --raw`);
+    expect(c).toContain('DOM_DUMP_OK');
+    expect(c).toContain('DOM_DUMP_REDACTION_BLOCKED');
+    expect(c).toContain('DOM_DUMP_TOO_LARGE');
+    expect(c).toContain('REPORT_DIR="${GSTACK_HOME:-$HOME/.gstack}/projects/$SLUG/designs/design-audit-$(date +%Y%m%d)"');
+    expect(c).toContain('RUN_ID="$(date +%H%M%S)-$$"');
+    expect(c).toContain('"schemaVersion": 2');
+    expect(c).toContain('engine changed X → Y; rule set may differ');
+    expect(c).toContain('Detector: N → M');
+    expect(c).toContain('/impeccable typeset');
+  });
+
+  test('the DOM-dump script is loaded from lib/dom-dump.js, never inlined in the prose', () => {
+    const c = designReview();
+    expect(c).not.toMatch(/```js\n/);
+    expect(c).not.toContain('document.documentElement.cloneNode');
+    expect(c).toContain('_DUMP=$(cat "$HOME/.claude/skills/gstack/lib/dom-dump.js")');
+    expect(c).toContain(`const html = await pg.evaluate('"$_DUMP"');`);
+    expect(c).toContain('_TMP=$(mktemp -d); _DUMP=$(cat "$HOME/.claude/skills/gstack/lib/dom-dump.js")');
+  });
+
+  test('every rendered Aside script is single-quoted: a page-controlled <url> is never inside a double-quoted bash string', () => {
+    const files = [...fs.readdirSync(ROOT).filter(d => fs.existsSync(path.join(ROOT, d, 'SKILL.md'))).map(d => path.join(ROOT, d, 'SKILL.md')),
+      ...fs.readdirSync(ROOT).flatMap(d => fs.existsSync(path.join(ROOT, d, 'sections')) ? fs.readdirSync(path.join(ROOT, d, 'sections')).filter(f => f.endsWith('.md')).map(f => path.join(ROOT, d, 'sections', f)) : [])];
+    expect(files.length).toBeGreaterThan(10);
+    for (const f of files) {
+      const c = fs.readFileSync(f, 'utf-8');
+      expect(c, path.relative(ROOT, f)).not.toMatch(/^aside repl "/m);
+    }
+  });
+
+  test('the E2E fixture slice markers exist in the rendered design skills (a template rename fails here, not in paid CI)', () => {
+    const dr = designReview();
+    const dh = fs.readFileSync(path.join(ROOT, 'design-html', 'SKILL.md'), 'utf-8');
+    for (const [a, b] of [['**Design detector (optional, deterministic):**', '**Create output directories:**'], ['**Phase 0: mechanical scan**', '## Phases 1-6'], ['### DOM dump (DOM mode only', '### Auth Detection']]) {
+      expect(sliceBetween(dr, a, b).length, `${a} .. ${b}`).toBeGreaterThan(100);
+    }
+    for (const [a, b] of [['**Design detector (optional, deterministic):**', '## Step 0: Input Detection'], ['### Slop Gate (bounded, never a loop)', '### Verification Screenshots']]) {
+      expect(sliceBetween(dh, a, b).length, `${a} .. ${b}`).toBeGreaterThan(100);
+    }
+  });
+
+  test('design-html carries the probe and the bounded slop gate', () => {
+    const c = designHtml();
+    expect(c).toContain('gstack-design-detect.ts probe --host claude');
+    expect(c).toContain('### Slop Gate (bounded, never a loop)');
+    expect(c).toContain('One pass, not a loop.');
+    expect(c).toContain('impeccable-disable <rule>: <reason>');
+  });
+
+  test('ship and review unions reach the detector through review-lite and the checklist', () => {
+    const ship = readSkillUnion('ship');
+    expect(ship).toContain('**Mechanical pass first.**');
+    expect(ship).toContain('scan --changed <base> --format gstack --host claude');
+    expect(ship).toContain('"detector":D');
+    expect(ship).toContain('Detector: "clean" | "N findings');
+    const review = readSkillUnion('review');
+    expect(review).toContain('run the mechanical pass at the top of that checklist');
+    const checklist = fs.readFileSync(path.join(ROOT, 'review', 'design-checklist.md'), 'utf-8');
+    expect(checklist).toContain('**0. Mechanical pass first.**');
+    expect(checklist).toContain('IMPECCABLE_READY');
+  });
+
+  test('every rendered invocation uses bun --no-env-file and ends a scan with the exit echo; no bash block runs npx impeccable', () => {
+    for (const content of [designReview(), designHtml(), readSkillUnion('ship'), readSkillUnion('review'), fs.readFileSync(path.join(ROOT, 'review', 'design-checklist.md'), 'utf-8')]) {
+      for (const block of bashBlocksOf(content)) {
+        expect(block).not.toContain('npx impeccable');
+        for (const line of block.split('\n')) {
+          if (!line.includes('gstack-design-detect.ts')) continue;
+          expect(line).toContain('bun --no-env-file run ');
+          if (/gstack-design-detect\.ts scan /.test(line)) expect(line).toContain('echo "DETECT_EXIT_CODE=$?"');
+        }
+      }
+    }
+  });
+
+  test('--host is rendered per host', () => {
+    // Fresh codex render into a temp out-dir: the tracked tree is Claude-only and
+    // the gitignored .agents/ copy may be stale.
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-detector-host-'));
+    try {
+      const r = Bun.spawnSync(['bun', 'run', 'scripts/gen-skill-docs.ts', '--host', 'codex', '--out-dir', out], { cwd: ROOT, timeout: 120_000 });
+      expect(r.exitCode).toBe(0);
+      const codex = fs.readFileSync(path.join(out, '.agents', 'skills', 'gstack-design-review', 'SKILL.md'), 'utf-8');
+      expect(codex).toContain('gstack-design-detect.ts probe --host codex');
+      expect(codex).not.toContain('probe --host claude');
+      expect(codex).toContain('$GSTACK_ROOT/lib/dom-dump.js');
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true });
+    }
+  });
+});
+
+// --- {{DESIGN_MD_CHECK}} resolver + open DESIGN.md adoption ---
+
+describe('DESIGN_MD_CHECK resolver and open DESIGN.md adoption', () => {
+  test('design-consultation asks the conversion question once and writes the spec form', () => {
+    const c = readSkillUnion('design-consultation');
+    expect(c).toContain('gstack-design-md.ts check DESIGN.md');
+    expect(c).toContain('DESIGN_MD_FORMAT: spec');
+    expect(c).toContain('mark legacy-keep');
+    expect(c).toContain('convert --write');
+    expect(c).toContain('# gstack: design-md-format=spec');
+    expect(c).toContain("## Do's and Don'ts");
+    expect(c).toContain('## Elevation & Depth');
+    expect(c).toContain('fontFeature: tnum');
+    expect(c).toContain('"{colors.primary}"');
+    // the legacy template is gone
+    expect(c).not.toContain('## Product Context\n- **What this is:**');
+  });
+
+  test('design-review calibrates against tokens and never re-offers conversion; design-html writes the spec form', () => {
+    const dr = fs.readFileSync(path.join(ROOT, 'design-review', 'SKILL.md'), 'utf-8');
+    expect(dr).toContain('gstack-design-md.ts check DESIGN.md');
+    expect(dr).toContain('gstack-design-md.ts tokens DESIGN.md');
+    expect(dr).toContain('never offer a conversion here');
+    expect(dr).not.toContain('mark legacy-keep');
+    const dh = fs.readFileSync(path.join(ROOT, 'design-html', 'SKILL.md'), 'utf-8');
+    expect(dh).toContain('# gstack: design-md-format=spec');
+    const pdr = readSkillUnion('plan-design-review');
+    expect(pdr).toContain('{colors.primary}');
+    const checklist = fs.readFileSync(path.join(ROOT, 'review', 'design-checklist.md'), 'utf-8');
+    expect(checklist).toContain('gstack-design-md.ts tokens DESIGN.md');
+    expect(readSkillUnion('ship')).toContain('gstack-design-md.ts tokens DESIGN.md');
+  });
+
+  test('every rendered gstack-design-md invocation uses bun --no-env-file', () => {
+    for (const content of [readSkillUnion('design-consultation'), fs.readFileSync(path.join(ROOT, 'design-review', 'SKILL.md'), 'utf-8'), readSkillUnion('ship')]) {
+      for (const line of content.split('\n')) {
+        if (line.includes('gstack-design-md.ts')) expect(line).toContain('bun --no-env-file run ');
+      }
+    }
+  });
+});
+
+// --- PRODUCT.md prefill + /impeccable handoffs ---
+
+describe('PRODUCT.md prefill and /impeccable handoffs', () => {
+  test('design-consultation and design-shotgun read PRODUCT.md and never open the impeccable skill', () => {
+    for (const skill of ['design-consultation', 'design-shotgun']) {
+      const c = readSkillUnion(skill);
+      expect(c).toContain('cat PRODUCT.md 2>/dev/null | head -120 || echo "NO_PRODUCT_MD"');
+      expect(c).toContain('do not re-ask');
+      expect(c).toContain('Never open `.claude/skills/impeccable/**`');
+    }
+  });
+
+  test('handoffs are gated on IMPECCABLE_SKILL: present in review-lite and design-review', () => {
+    expect(readSkillUnion('ship')).toContain('IMPECCABLE_SKILL: present`, end each NEEDS INPUT detector row with the `handoff=` command');
+    const dr = fs.readFileSync(path.join(ROOT, 'design-review', 'SKILL.md'), 'utf-8');
+    expect(dr).toContain('a deferred one ends with its `handoff=` command when `IMPECCABLE_SKILL: present`');
+    expect(dr).toContain('skip every detector step, including `/impeccable` handoff lines');
+  });
+});
+
 // --- Extended DESIGN_SKETCH resolver tests ---
 
 describe('DESIGN_SKETCH extended with outside voices', () => {
@@ -1815,7 +2172,7 @@ describe('DESIGN_SKETCH extended with outside voices', () => {
 
   test('still contains original wireframe steps', () => {
     expect(content).toContain('wireframe');
-    expect(content).toContain('$B goto');
+    expect(content).toContain('gstack-render.ts');
   });
 });
 
@@ -1832,6 +2189,16 @@ describe('DESIGN_REVIEW_LITE extended with Codex', () => {
   test('still contains original checklist steps', () => {
     expect(content).toContain('design-checklist.md');
     expect(content).toContain('SCOPE_FRONTEND');
+  });
+
+  test('design-checklist path uses installed gstack/review root (#2694)', () => {
+    // #2694: generateDesignReviewLite used to emit
+    // `.claude/skills/review/design-checklist.md` (missing the gstack/ segment).
+    // After install the file lives at ~/.claude/skills/gstack/review/design-checklist.md.
+    // The bad relative form must not appear — the good path does not contain it
+    // as a substring because `gstack/` sits between `skills/` and `review/`.
+    expect(content).toContain('~/.claude/skills/gstack/review/design-checklist.md');
+    expect(content).not.toContain('.claude/skills/review/design-checklist.md');
   });
 
 });
@@ -1925,10 +2292,13 @@ describe('Codex generation (--host codex)', () => {
     }
   });
 
-  test('no ~/.claude/ paths in Codex output', () => {
+  test('no ~/.claude/ runtime paths in Codex output', () => {
     for (const skill of CODEX_SKILLS) {
       const content = fs.readFileSync(path.join(AGENTS_DIR, skill.codexName, 'SKILL.md'), 'utf-8');
-      expect(content).not.toContain('~/.claude/');
+      // Outside prompts may explicitly forbid reading Claude's skill directory.
+      // Every executable/runtime path must still use the selected host root.
+      const withoutBoundary = content.replace(/^.*IMPORTANT: Do NOT read or execute[^\n]*$/gm, '');
+      expect(withoutBoundary).not.toContain('~/.claude/');
     }
   });
 
@@ -1937,51 +2307,26 @@ describe('Codex generation (--host codex)', () => {
     expect(fs.existsSync(path.join(AGENTS_DIR, 'gstack-codex'))).toBe(false);
   });
 
-  test('Codex output includes Claude outside-voice skill with read-only boundary', () => {
-    const content = fs.readFileSync(path.join(AGENTS_DIR, 'gstack-claude', 'SKILL.md'), 'utf-8');
-    expect(content).toContain('claude -p');
-    expect(content).toContain('mktemp /tmp/gstack-claude-prompt-');
-    expect(content).toContain('mktemp /tmp/gstack-claude-response-XXXXXX');
-    expect(content).toContain('mktemp /tmp/gstack-claude-error-XXXXXX');
-    expect(content).toContain('mktemp /tmp/gstack-claude-diff-');
-    expect(content).not.toMatch(/gstack-claude-(?:prompt|response|error|diff)-X{6,}\.\w+/);
-    expect(content).not.toContain('/tmp/gstack-claude-diff-$$');
-    expect(content).toContain('cat "$PROMPT_FILE" | "$CLAUDE_BIN" -p');
-    expect(content).toContain('Resolve the binary and invoke it in the same host execution context');
-    expect(content).toContain('--disable-slash-commands');
-    expect(content).toContain('--tools ""');
-    expect(content).toContain('--allowedTools Read,Grep,Glob');
-    expect(content).toContain('--disallowedTools Bash,Edit,Write');
-    expect(content).toContain('Do not infer authentication state from credential files');
-    expect(content).toContain('run the actual `claude -p`');
-    expect(content).not.toContain('AUTH_MISSING');
+  test('Codex output includes the renamed Claude Code skill and restricted runner', () => {
+    const content = readExternalSkillUnion(EXTERNAL_OUT, '.agents', 'claude-code');
+    expect(content).toContain('name: claude-code');
+    expect(content).toContain('gstack-claude-code');
+    expect(content).toContain('--access none');
+    expect(content).toContain('--access read-only');
+    expect(content).toContain('--timeout-ms');
+    expect(content).toContain('claude-session-id');
     expect(content).not.toContain('$HOME/.claude/.credentials.json');
-    expect(content).toContain('is_error');
+    expect(fs.existsSync(path.join(AGENTS_DIR, 'gstack-claude'))).toBe(false);
   });
 
-  test('Claude temp file templates are accepted by host mktemp', () => {
-    for (const template of [
-      '/tmp/gstack-claude-prompt-XXXXXX',
-      '/tmp/gstack-claude-response-XXXXXX',
-      '/tmp/gstack-claude-error-XXXXXX',
-      '/tmp/gstack-claude-diff-XXXXXX',
-    ]) {
-      const result = spawnSync('mktemp', [template], { encoding: 'utf-8', timeout: 30_000 });
-      expect(result.status).toBe(0);
-      const created = result.stdout.trim();
-      expect(created.startsWith(template.replace('XXXXXX', ''))).toBe(true);
-      fs.unlinkSync(created);
+  test('Codex ship and review preserve outside review through Claude Code', () => {
+    for (const skill of ['ship', 'review']) {
+      const content = readExternalSkillUnion(EXTERNAL_OUT, '.agents', skill);
+      expect(content).not.toMatch(/codex\s+(?:exec|review)\s/);
+      expect(content).toContain('gstack-claude-code');
+      expect(content).toContain('codex_reviews');
+      expect(content).toContain('adversarial-review');
     }
-  });
-
-  test('Codex review step stripped from Codex-host ship and review', () => {
-    const shipContent = fs.readFileSync(path.join(AGENTS_DIR, 'gstack-ship', 'SKILL.md'), 'utf-8');
-    expect(shipContent).not.toContain('codex review --base');
-    expect(shipContent).not.toContain('CODEX_REVIEWS');
-
-    const reviewContent = fs.readFileSync(path.join(AGENTS_DIR, 'gstack-review', 'SKILL.md'), 'utf-8');
-    expect(reviewContent).not.toContain('codex review --base');
-    expect(reviewContent).not.toContain('CODEX_REVIEWS');
   });
 
   test('--host codex --dry-run freshness', () => {
@@ -2205,9 +2550,10 @@ describe('Codex generation (--host codex)', () => {
 
   // ─── Design outside voices: Codex host guard ─────────────────
 
-  test('codex host produces empty outside voices in design-review', () => {
-    const codexContent = fs.readFileSync(path.join(AGENTS_DIR, 'gstack-design-review', 'SKILL.md'), 'utf-8');
-    expect(codexContent).not.toContain('Design Outside Voices');
+  test('codex host retains design outside voices through Claude Code', () => {
+    const codexContent = readExternalSkillUnion(EXTERNAL_OUT, '.agents', 'design-review');
+    expect(codexContent).toContain('Design Outside Voices');
+    expect(codexContent).toContain('gstack-claude-code');
   });
 
   test('codex host does not include Codex design block in ship', () => {
@@ -2327,9 +2673,10 @@ describe('Factory generation (--host factory)', () => {
     }
   });
 
-  test('/codex skill excluded from Factory output', () => {
-    expect(fs.existsSync(path.join(FACTORY_DIR, 'gstack-codex', 'SKILL.md'))).toBe(false);
-    expect(fs.existsSync(path.join(FACTORY_DIR, 'gstack-codex'))).toBe(false);
+  test('Factory installs both outside-review wrapper skills', () => {
+    for (const skill of ['gstack-codex', 'gstack-claude-code']) {
+      expect(fs.existsSync(path.join(FACTORY_DIR, skill, 'SKILL.md'))).toBe(true);
+    }
   });
 
   test('Factory keeps Codex integration blocks', () => {
@@ -2380,6 +2727,7 @@ describe('Factory generation (--host factory)', () => {
 // ─── Parameterized host smoke tests (config-driven) ─────────
 
 import { ALL_HOST_CONFIGS, getExternalHosts } from '../hosts/index';
+import { sliceBetween } from './helpers/skill-fixture';
 
 describe('Parameterized host smoke tests', () => {
   // Every external host was rendered up front by the module-level
@@ -2636,11 +2984,13 @@ describe('setup script validation', () => {
     expect(content).toContain('$GSTACK_BIN/');
   });
 
-  test('setup supports --host kiro with install section and sed rewrites', () => {
+  test('setup installs Kiro-native output and runtime assets', () => {
     expect(setupContent).toContain('INSTALL_KIRO=');
     expect(setupContent).toContain('kiro-cli');
     expect(setupContent).toContain('KIRO_SKILLS=');
-    expect(setupContent).toContain('~/.kiro/skills/gstack');
+    expect(setupContent).toContain('KIRO_SKILLS="$HOME/.kiro/skills"');
+    expect(setupContent).toContain('KIRO_DIR="$SOURCE_GSTACK_DIR/.kiro/skills"');
+    expect(setupContent).toContain('gen:skill-docs --host kiro');
     expect(setupContent).toContain('$KIRO_GSTACK/lib');
   });
 
@@ -3267,7 +3617,9 @@ describe('LEARNINGS_LOG resolver', () => {
 });
 
 describe('CONFIDENCE_CALIBRATION resolver', () => {
-  const CONFIDENCE_SKILLS = ['review', 'ship', 'plan-eng-review', 'cso'];
+  // CSO owns a distinct evidence rubric; the shared numerical confidence
+  // resolver would conflict with that contract and its private startup.
+  const CONFIDENCE_SKILLS = ['review', 'ship', 'plan-eng-review'];
 
   for (const skill of CONFIDENCE_SKILLS) {
     test(`${skill} generated SKILL.md contains confidence calibration`, () => {
@@ -3410,6 +3762,29 @@ describe('voice-triggers processing', () => {
     expect(frontmatter).not.toContain('voice-triggers:');
   });
 
+  test('generated Claude CSO skill preauthorizes only the trusted launcher', () => {
+    const expected = [
+      'Bash(~/.claude/skills/gstack/bin/gstack-cso-launcher *)',
+      'Bash(~/.claude/skills/gstack/bin/gstack-cso-launcher.exe *)',
+    ];
+    for (const file of ['cso/SKILL.md.tmpl', 'cso/SKILL.md']) {
+      const content = fs.readFileSync(path.join(ROOT, file), 'utf-8');
+      const fmEnd = content.indexOf('\n---', 4);
+      const frontmatter = Bun.YAML.parse(content.slice(4, fmEnd)) as Record<string, unknown>;
+      expect(frontmatter['allowed-tools'], file).toEqual(expected);
+    }
+  });
+
+  test('generated CSO host variants retain challenge fallback and host-containment disclosure', () => {
+    const claude = fs.readFileSync(path.join(ROOT, 'cso', 'SKILL.md'), 'utf-8');
+    const codex = fs.readFileSync(path.join(EXTERNAL_OUT, '.agents', 'skills', 'gstack-cso', 'SKILL.md'), 'utf-8');
+    for (const content of [claude, codex]) {
+      expect(content).toContain('sequential challenge; independent agent unavailable');
+      expect(content).toContain('Containment does not sandbox the host agent or kernel.');
+      expect(content).toContain('Do not request broader tool access solely to obtain an independent reviewer.');
+    }
+  });
+
   // Gen-time-only keys: interactive + benefits-from are read from the .tmpl by
   // buildContext; the generated copy has no reader (the host reads name/
   // description/allowed-tools/hooks; gbrain: is runtime-read and NOT stripped).
@@ -3431,6 +3806,26 @@ describe('voice-triggers processing', () => {
     const invFm = investigate.slice(0, investigate.indexOf('\n---', 4));
     expect(invFm).toContain('hooks:');
     expect(invFm).toContain('gbrain:');
+  });
+});
+
+describe('CEO accepted requirement preservation', () => {
+  test('HOLD SCOPE includes implementation work needed to meet accepted requirements', () => {
+    const main = fs.readFileSync(path.join(ROOT, 'plan-ceo-review/SKILL.md'), 'utf8');
+    const hold = main.slice(main.indexOf('**For HOLD SCOPE**'), main.indexOf('**For SCOPE REDUCTION**'));
+    expect(hold).toContain('Keep stated invariants and acceptance criteria; repairs needed to meet them are in scope.');
+  });
+
+  test('loaded sections keep requirement conflicts unresolved until an authorized decision', () => {
+    const section = fs.readFileSync(path.join(ROOT, 'plan-ceo-review/sections/review-sections.md'), 'utf8');
+    const policy = section.slice(section.indexOf('**Preserve accepted requirements.**'), section.indexOf('### Section 1:'));
+    expect(policy).toContain('report an implementation\ngap and propose a remedy that meets the requirement');
+    expect(policy).toContain('it does not authorize weakening the required behavior');
+    expect(policy).toContain('changing a test to expect the prohibited result');
+    expect(policy).toContain('keep that proposal pending and the original gap unresolved');
+    expect(policy).toContain('Earlier explicitly approved requirement changes and explicit authority to change\nthat scope remain valid');
+    expect(policy).toContain('Routine auto-decide permission alone cannot override an\nexplicit user constraint or non-goal');
+    expect(policy).toContain('Preserve the distinction in findings, tasks,\nand the completion report');
   });
 });
 

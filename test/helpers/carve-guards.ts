@@ -150,7 +150,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     },
     behavioral: 'external',
     externalTest: 'test/skill-e2e-ship-section-loading.test.ts',
-    maxSkeletonBytes: 76_800, // + v1.76 AUQ proactive SESSION_KIND=spawned rule (#2733); measured 76_375
+    maxSkeletonBytes: 79_300, // + v2.0 {{ASIDE_RESEARCH}} (Aside first, WebSearch fallback); measured 78_275
     minUnionBytes: 181_000, // token-reduction Phases 1-2 (v1.69.x branch); measured union 201,464
     mustContain: ['VERSION', 'CHANGELOG', 'review', 'merge', 'PR'],
     // v1.58.5.0: pre-push-guard install (#2077) stacks on the shared first-run-guidance preamble.
@@ -163,7 +163,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     // wave's headline capability) grows the union to 1.195x. Deliberate:
     // the section is on-demand (loads only for Apple store targets), so
     // per-invocation cost for non-iOS ships is one manifest line.
-    maxSizeRatio: 1.22,
+    maxSizeRatio: 1.28, // Harness-aware dispatch adds validated commands and per-pass provenance (~1.25x).
   },
   'plan-ceo-review': {
     skill: 'plan-ceo-review',
@@ -181,7 +181,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     // v1.65 merge: provisional larger-of-both-waves budget; re-measured below.
         // Fork port wave 2 (#703): the repo-doc-preference block in the design
     // check grew every plan-review skeleton ~0.7KB. Measured values noted.
-    maxSkeletonBytes: 75_450, // + v1.76 AUQ proactive SESSION_KIND=spawned rule (#2733); measured 75_029
+    maxSkeletonBytes: 79_744, // Exact 744-byte anti-shortcut move: main 79,739 + section 75,559 = unchanged 155,298-byte union; retains 5-byte slack.
     minUnionBytes: 123_600, // token-reduction Phases 1-2 (v1.69.x branch): preamble bash -> bin/gstack-skill-start, onboarding -> gated emission; measured union 137,346
     mustContain: ['SCOPE EXPANSION', 'SELECTIVE EXPANSION', 'HOLD SCOPE', 'SCOPE REDUCTION'],
     // Default-on Codex outside-voice (codexPreflight block + CODEX_MODE branch
@@ -207,7 +207,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     // check grew every plan-review skeleton ~0.7KB. Measured values noted.
     // #2499 project-scope MCP jq in the brain-sync block grew every tier-2+
     // skeleton ~1.5KB (entry resolution emitted once per SKILL.md).
-    maxSkeletonBytes: 53_350, // + v1.76 AUQ proactive SESSION_KIND=spawned rule (#2733); measured 52_912
+    maxSkeletonBytes: 57_200, // Eng per-issue approval exit check, including regression-test authority; measured 57,113 bytes.
     minUnionBytes: 99_800, // token-reduction Phases 1-2 (v1.69.x branch); measured union 110,910
     mustContain: ['Architecture', 'Code Quality', 'Test', 'Performance'],
     // Cross-cutting preamble growth (v1.57.2.0 AUQ-failure prose fallback + the
@@ -240,7 +240,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     // tier-2+ skeleton (measured 89,184). Main's v1.64.0.0 adds ~340 B more
     // (telemetry --error-message/--failed-step preamble prose, PR #769).
     // Budget covers the sum of both waves.
-    maxSkeletonBytes: 73_300, // + v1.76 AUQ proactive SESSION_KIND=spawned rule (#2733); measured 72_890
+    maxSkeletonBytes: 79_500, // Harness-aware outside voice: validated dispatch and provenance.
     minUnionBytes: 99_200, // token-reduction Phases 1-2 (v1.69.x branch); measured union 110,293
     mustContain: ['design', 'visual'],
     maxSizeRatio: 1.12, // D1 1.104 + main's ~0.008
@@ -264,7 +264,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     // check grew every plan-review skeleton ~0.7KB. Measured values noted.
     // #2499 project-scope MCP jq in the brain-sync block grew every tier-2+
     // skeleton ~1.5KB (entry resolution emitted once per SKILL.md).
-    maxSkeletonBytes: 65_050, // + v1.76 AUQ proactive SESSION_KIND=spawned rule (#2733); measured 64_625
+    maxSkeletonBytes: 68_500, // + v2.0 {{ASIDE_RESEARCH}} (Aside first, WebSearch fallback); measured 67_129
     minUnionBytes: 99_700, // token-reduction Phases 1-2 (v1.69.x branch); measured union 110,833
     mustContain: ['developer experience', 'Getting Started'],
     // Default-on Codex outside-voice (codexPreflight block + CODEX_MODE branch
@@ -295,7 +295,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     // the #538 opt-out + D1 evidence directive — ratio 1.104 measured.
     // #2499 project-scope MCP jq in the brain-sync block grew every tier-2+
     // skeleton ~1.5KB (entry resolution emitted once per SKILL.md).
-    maxSkeletonBytes: 72_700, // + v1.76 AUQ proactive SESSION_KIND=spawned rule (#2733); measured 72_294
+    maxSkeletonBytes: 87_500, // Office-hours + sketch outside voices include host guards and completion checks.
     minUnionBytes: 115_800, // Phase 4 wave 4; measured union 118,175
     mustContain: ['design doc', 'problem statement'],
     maxSizeRatio: 1.12,
@@ -316,7 +316,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     // +Conductor AUQ-default-prose rule + one-way/continuation safety in the
     // always-loaded AskUserQuestion Format section.
     // v1.2.0 activation lift: first-run-guidance section in the shared preamble.
-    maxSkeletonBytes: 38_900, // + v1.76 AUQ proactive SESSION_KIND=spawned rule (#2733); measured 38_464
+    maxSkeletonBytes: 41_000, // + v1.78 AUQ objectivity + v1.79 spawned contract incl. echo-failure tie-breaker; measured 40_575
     minUnionBytes: 56_700, // token-reduction Phases 1-2 (v1.69.x branch): preamble bash -> bin/gstack-skill-start, onboarding -> gated emission; measured union 63,018
     mustContain: ['CHANGELOG', 'Diataxis', 'coverage'],
     // Two intentional additions stack on this small skill: the AUQ-failure prose
@@ -347,7 +347,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     // v1.65 merge: provisional larger-of-both-waves budget; re-measured below.
     // v1.64.1.0: shared-preamble prose from the two parallel v1.64 waves lands
     // the skeleton at 69,022 B; +~1 KB headroom.
-    maxSkeletonBytes: 53_250, // + v1.76 AUQ proactive SESSION_KIND=spawned rule (#2733); measured 52_834
+    maxSkeletonBytes: 72_500, // Outside review + upstream DESIGN.md format check; merged render 72,175 bytes.
     minUnionBytes: 65_000, // token-reduction Phases 1-2 (v1.69.x branch): preamble bash -> bin/gstack-skill-start, onboarding -> gated emission; measured union 72,252
     mustContain: ['Typography', 'Color', 'Aesthetic Direction'],
     // Cross-cutting preamble growth (v1.57.2.0 AUQ-failure prose fallback ~2KB +
@@ -363,7 +363,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     scenario:
       'Run a security audit on this repository in --owasp mode (OWASP Top 10 only). Resolve the mode, do the Phase 0 stack detection and Phase 1 attack-surface census, then run the scoped audit phases and produce the findings report. Skip any step that needs network access.',
     staticInvariants: {
-      // Dispatch + always-run + FP-filtering phases are ALWAYS loaded (security).
+      // Dispatch, trusted execution, evidence/proof, reporting and recovery stay always loaded.
       mustStayInSkeleton: [
         '## Arguments',
         '## Mode Resolution',
@@ -372,6 +372,9 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
         '### Phase 12',
         '### Phase 13',
         '### Phase 14',
+        '**Private startup.**',
+        'CSO evidence rubric',
+        'identical security assertion',
       ],
       // Earliest-use: mode must be resolvable before any section is read (codex #6).
       mustPrecedeStop: ['## Arguments', '## Mode Resolution'],
@@ -383,17 +386,15 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
       ],
       gateAfterStop: undefined,
     },
-    behavioral: 'prompt',
-    // +Conductor AUQ-default-prose rule + one-way/continuation safety in the
-    // always-loaded AskUserQuestion Format section.
-    // v1.2.0 activation lift: first-run-guidance section in the shared preamble.
-    maxSkeletonBytes: 58_200, // + v1.76 AUQ proactive SESSION_KIND=spawned rule (#2733); measured 57_784
-    minUnionBytes: 64_200, // token-reduction Phases 1-2 (v1.69.x branch); measured union 71,379
+    // v3 requires a trusted helper and private state, absent from generic prompt fixtures.
+    // The full-audit E2E asserts actual section loading alongside report/proof behavior.
+    behavioral: 'external',
+    externalTest: 'test/skill-e2e-cso.test.ts',
+    maxSkeletonBytes: 18_000,
+    minUnionBytes: 30_000, // v3 deliberately removes the shared export/startup preamble.
     mustContain: ['OWASP', 'STRIDE', 'daily', 'comprehensive', 'verif'],
-    // cso keeps its mode-dispatch + FP-filtering phases always-loaded, so the
-    // cross-cutting preamble growth (v1.57.2.0 AUQ-failure prose fallback ~2KB + the
-    // decision-memory nudge) lands it just over 1.05; headroom for the shared additions.
-    // v1.64+v1.65 merge sums both waves' preamble growth; measured 1.073.
+    // Existing baseline comparison remains an upper bound; absolute limits above
+    // preserve the compact controller and its complete domain reference.
     maxSizeRatio: 1.08,
   },
   // ── Token-reduction Phase 4 wave 1 (v1.69.x branch) ──────────────────────
@@ -424,7 +425,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
       gateAfterStop: undefined, // operational multi-STOP skill, like ship
     },
     behavioral: 'plan',
-    maxSkeletonBytes: 58_300, // + v1.76 AUQ proactive SESSION_KIND=spawned rule (#2733); measured 57_861
+    maxSkeletonBytes: 61_500, // + v2.0 {{ASIDE_RESEARCH}} (Aside first, WebSearch fallback); measured 60_309
     minUnionBytes: 89_000, // Phase 4 wave 1; measured union 93,357
     mustContain: ['confidence', 'P1', 'P2', 'Review Army', 'adversarial'],
   },
@@ -440,7 +441,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
         '## Filesystem Boundary',
         'Synthesis recommendation (REQUIRED)',
         'Recommendation: <action> because',
-        'UNDER_CODEX',
+        'If the runtime guard reports a harness mismatch, stop.',
       ],
       mustPrecedeStop: ['## Step 1: Detect mode', '## Filesystem Boundary'],
       mustMoveToSection: [
@@ -451,7 +452,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
       gateAfterStop: 'EXIT PLAN MODE GATE',
     },
     behavioral: 'prompt',
-    maxSkeletonBytes: 58_400, // + v1.76 AUQ proactive SESSION_KIND=spawned rule (#2733); measured 58_006
+    maxSkeletonBytes: 59_300, // + v1.78 AUQ spawned-trigger objectivity (explicit declaration + interactive fence); measured 58_867
     minUnionBytes: 83_400, // Phase 4 wave 1; measured union 84,304
     mustContain: ['GATE: PASS', 'CROSS-MODEL ANALYSIS', 'codex exec resume', 'sandbox_mode="read-only"', 'mktemp'],
     maxSizeRatio: 1.06, // measured 1.040 vs the v1.64.1.0 parity baseline
@@ -471,13 +472,14 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
       mustPrecedeStop: ['land-deploy-confirmed'],
       mustMoveToSection: [
         'PRE-MERGE READINESS REPORT',
-        'gh pr merge --squash --auto --delete-branch',
+        'gh pr merge "$MERGE_FLAG" --auto --delete-branch',
         'DEPLOY INFRASTRUCTURE VALIDATION',
       ],
       gateAfterStop: undefined, // operational skill
     },
     behavioral: 'prompt',
-    maxSkeletonBytes: 61_600, // + v1.76 AUQ proactive SESSION_KIND=spawned rule (#2733); measured 61_160
+    maxSkeletonBytes: 74_500, // + Aside browser contract for Step 7 canary ({{ASIDE_SETUP}}); measured 73_523
+    maxSizeRatio: 1.10, // + v1.81 Aside contract + gstack-browser fallback block; measured 1.077
     minUnionBytes: 91_000, // Phase 4 wave 1; estimated union ~94.9KB
     mustContain: ['readiness', 'merge', 'canary', 'revert', 'staging'],
   },
@@ -494,7 +496,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
         '## Sequential Execution — MANDATORY',
         '## Decision Classification',
         '## Filesystem Boundary — Codex Prompts',
-        '## Phase 0.5: Codex auth + version preflight',
+        '## Phase 0.5: Outside reviewer preflight',
         '## Pre-Gate Verification',
         '## Phase 2: Design Review (conditional — skip if no UI scope)',
         '## Phase 2.5: DX Review (conditional — skip if no developer-facing scope)',
@@ -503,7 +505,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
       mustPrecedeStop: ['## The 6 Decision Principles', '## Sequential Execution — MANDATORY', '## Decision Classification'],
       mustMoveToSection: [
         'CEO DUAL VOICES — CONSENSUS TABLE:',
-        'CODEX SAYS (design — UX challenge)',
+        'Codex SAYS (design — UX challenge)',
         'ENG DUAL VOICES — CONSENSUS TABLE:',
         'DX DUAL VOICES — CONSENSUS TABLE:',
         '## Implementation Tasks aggregator',
@@ -512,9 +514,10 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     },
     behavioral: 'external',
     externalTest: 'test/skill-e2e-autoplan-chain.test.ts', // phase-complete markers live ONLY in sections — its assertions ARE section-read proof
-    maxSkeletonBytes: 63_650, // + v1.76 AUQ proactive SESSION_KIND=spawned rule (#2733); measured 63_245
+    maxSkeletonBytes: 70_000, // Phase-specific outside coverage, native fallback, and harness guard.
     minUnionBytes: 85_000, // measured union 86,926
     mustContain: ['6 Decision Principles', 'TASTE DECISION', 'USER CHALLENGE', 'consensus', 'Restore Point'],
+    maxSizeRatio: 1.12, // Four validated outside invocations replace raw CLI calls; phases keep independent coverage.
   },
   spec: {
     skill: 'spec',
@@ -541,7 +544,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
       gateAfterStop: undefined,
     },
     behavioral: 'prompt',
-    maxSkeletonBytes: 56_250, // + v1.76 AUQ proactive SESSION_KIND=spawned rule (#2733); measured 55_836
+    maxSkeletonBytes: 58_400, // + v2.0 {{ASIDE_RESEARCH}} (Aside first, WebSearch fallback); measured 57_356
     minUnionBytes: 64_500, // measured union 67,430
     mustContain: ['HARD GATE', 'dedupe', 'quality gate', 'acceptance criteria', 'archive'],
   },
@@ -570,7 +573,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
       gateAfterStop: undefined,
     },
     behavioral: 'prompt',
-    maxSkeletonBytes: 59_550, // + v1.76 AUQ proactive SESSION_KIND=spawned rule (#2733); measured 59_152
+    maxSkeletonBytes: 60_450, // + v1.78 AUQ spawned-trigger objectivity (explicit declaration + interactive fence); measured 60_013
     minUnionBytes: 78_300, // measured union 79,139
     mustContain: ['PGLite', 'Supabase', 'claude mcp add', 'read_secret_to_env', 'pooler'],
     maxSizeRatio: 1.07, // measured 1.051 vs the branch monolith: index + stubs + 4 STOP pointers
@@ -581,11 +584,11 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     expectedSections: ['test-bootstrap.md', 'qa-patterns.md'],
     requiredReads: ['qa-patterns.md'],
     scenario:
-      'Walk /qa in SIMULATION — do not launch a browser, run any $B command, or execute bash; treat the working tree as clean, the tier as Quick, and the target app as http://localhost:3000 with a small feature-branch diff touching one page. Skip the test-framework bootstrap (assume CLAUDE.md documents the test command). Read each pointed section before doing its step, then produce the QA plan as the report: the mode you selected and why, the Phase 1-6 steps you would run, and a worked health-score computation from the rubric. Do NOT use AskUserQuestion.',
+      'Walk /qa in SIMULATION — do not launch a browser, run any aside command, or execute bash; treat the working tree as clean, the tier as Quick, and the target app as http://localhost:3000 with a small feature-branch diff touching one page. Skip the test-framework bootstrap (assume CLAUDE.md documents the test command). Read each pointed section before doing its step, then produce the QA plan as the report: the mode you selected and why, the Phase 1-6 steps you would run, and a worked health-score computation from the rubric. Do NOT use AskUserQuestion.',
     staticInvariants: {
       mustStayInSkeleton: [
         '## Setup',
-        '## SETUP (run this check BEFORE any browse command)',
+        '## BROWSER SETUP (Aside',
         '## Phases 1-6: QA Baseline',
         '## Phase 7: Triage',
         '## Phase 8: Fix Loop',
@@ -605,29 +608,32 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
       gateAfterStop: undefined,
     },
     behavioral: 'prompt',
-    maxSkeletonBytes: 51_700, // + v1.76 AUQ proactive SESSION_KIND=spawned rule (#2733); measured 51_289
+    maxSkeletonBytes: 63_500, // + v2.0 {{ASIDE_SETUP}}/{{BROWSE_FALLBACK}} (replaces the browse setup block); measured 61_253
+    maxSizeRatio: 1.08, // + v1.81 Aside contract + gstack-browser fallback block; measured 1.063
     minUnionBytes: 69_500, // measured union 70,385
-    mustContain: ['bug', 'browse', 'fix', 'Health Score Rubric', 'regression'],
+    // 'aside repl' pins the Aside contract; '$B goto' pins the fallback block in the always-loaded skeleton.
+    mustContain: ['bug', 'aside repl', '$B goto', 'fix', 'Health Score Rubric', 'regression'],
   },
   browse: {
     skill: 'browse',
     expectedSections: ['command-list.md'],
     requiredReads: ['command-list.md'],
     scenario:
-      'QA a static page: before driving it, plan the full audit — enumerate which browse commands and snapshot flags you would use, including extraction/tab/dialog commands beyond the Most-Used table, reading the full command reference first. Do not launch the browser or run any $B command; produce the command plan as the report.',
+      'QA a static page: before driving it, plan the full audit — enumerate which browser steps you would run (the aside repl shapes, and the $B commands and snapshot flags the fallback would need), including extraction/tab/dialog commands beyond the basics, reading the full command reference first. Do not launch any browser or run any aside/$B command; produce the plan as the report.',
     staticInvariants: {
-      mustStayInSkeleton: ['## SETUP', '## Core QA Patterns', '## CSS Inspector', '## Most-Used Commands'],
-      mustPrecedeStop: ['## SETUP'],
+      // Aside is the primary browser: the skeleton carries the Aside contract;
+      // the $B command reference + snapshot flags are the carved section.
+      mustStayInSkeleton: ['## BROWSER SETUP (Aside'],
+      mustPrecedeStop: ['## BROWSER SETUP (Aside'],
       mustMoveToSection: ['## Full Command List', '## Snapshot Flags', '### Navigation'],
       gateAfterStop: undefined,
     },
     behavioral: 'prompt',
-    maxSkeletonBytes: 27_500, // Phase 4 wave 3; measured 26,875
-    minUnionBytes: 39_500, // measured union 41,115
-    // 'BEGIN/END UNTRUSTED EXTERNAL' pins the untrusted-content warning; the full
-    // envelope phrase wraps across lines in the rendered blockquote, so the
-    // contiguous-substring check needs the single-line prefix form.
-    mustContain: ['BEGIN/END UNTRUSTED EXTERNAL', 'snapshot -i', '@e refs', 'deviceScaleFactor', 'handoff'],
+    maxSkeletonBytes: 32_000, // + v2.0 {{ASIDE_SETUP}}/{{BROWSE_FALLBACK}} skeleton + the STOP-Read pointer; measured 29_986
+    minUnionBytes: 36_000, // skeleton + command-list section (14,240); measured union ~38.5 KB
+    // 'BEGIN/END UNTRUSTED EXTERNAL' pins the untrusted-content warning in the
+    // command reference; 'aside repl' pins the Aside contract in the skeleton.
+    mustContain: ['BEGIN/END UNTRUSTED EXTERNAL', 'snapshot -i', '@e refs', 'aside repl'],
   },
   retro: {
     skill: 'retro',
@@ -642,7 +648,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
       gateAfterStop: undefined,
     },
     behavioral: 'prompt',
-    maxSkeletonBytes: 72_600, // + v1.76 AUQ proactive SESSION_KIND=spawned rule (#2733); measured 72_198
+    maxSkeletonBytes: 73_450, // + v1.78 AUQ spawned-trigger objectivity (explicit declaration + interactive fence); measured 73_059
     minUnionBytes: 66_000, // measured union 73,496
     mustContain: ['retrospective', '45-minute gap', 'Ship of the week', 'Praise'],
   },
@@ -651,7 +657,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
   // (D3A: read-on-demand doctrine, requiredReads-guarded + loading eval)
   'design-html': {
     skill: 'design-html',
-    expectedSections: ['doctrine.md', 'pretext-patterns.md'],
+    expectedSections: ['doctrine.md', 'pretext-patterns.md', 'detector-install-offer.md'],
     requiredReads: ['doctrine.md', 'pretext-patterns.md'],
     scenario:
       'Walk /design-html in SIMULATION — do not run bash, start servers, launch a browser, or take screenshots. Treat Step 0 as already resolved: no CEO plan, no approved mockup, no variants, no DESIGN.md, no prior finalized.html — freeform mode (Case C option D), screen name "pricing", the user wants a pricing page for a developer-tools SaaS (dark, dense, three tiers, monospace-leaning). Do NOT use AskUserQuestion — proceed with the stated assumptions. Read each pointed section before doing its step, then execute Steps 1-3: produce the implementation spec, state the chosen Pretext tier and why, and generate the complete Pretext-native HTML — include the HTML in your report instead of writing files. Stop there: skip Step 3.5, Step 4, and Step 5.',
@@ -674,7 +680,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
       gateAfterStop: undefined, // operational skill, no plan-mode gate
     },
     behavioral: 'prompt',
-    maxSkeletonBytes: 52_050, // + v1.76 AUQ proactive SESSION_KIND=spawned rule (#2733); measured 51_631
+    maxSkeletonBytes: 55_400, // measured 55,262 (2026-09-09): the detector install offer pointer + its sections-table row (the brief itself lives in sections/detector-install-offer.md); before that 54,545 for the review-cycle trust prose, the Slop Gate's Decisions-Log clause, and the blacklist header's override sentence
     minUnionBytes: 57_500, // Phase 4 wave 4; measured union 58,682
     mustContain: ["Don't make me think", "Users scan, they don't read", 'The Goodwill Reservoir', 'PRETEXT API CHEATSHEET', 'Pattern 3: Text around obstacles'],
   },
@@ -701,7 +707,7 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
       gateAfterStop: undefined,
     },
     behavioral: 'prompt',
-    maxSkeletonBytes: 52_500, // + v1.76 AUQ proactive SESSION_KIND=spawned rule (#2733); measured 52_056
+    maxSkeletonBytes: 54_000, // + v2.0 preamble growth (merged); measured 52_962
     minUnionBytes: 53_200, // Phase 4 wave 4; measured union 54,290
     mustContain: ["Don't make me think", "Users scan, they don't read", 'trunk test', '44px minimum'],
   },

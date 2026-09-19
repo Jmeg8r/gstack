@@ -75,6 +75,18 @@ describe('selectTests', () => {
     expect(result.selected).not.toContain('document-release');
   });
 
+  test('aside resolver change selects the Aside-driven skill tests', () => {
+    const result = selectTests(['scripts/resolvers/aside.ts'], E2E_TOUCHFILES);
+    expect(result.selected).toContain('aside-browse-basic');
+    expect(result.selected).toContain('aside-browse-flow');
+    expect(result.selected).toContain('qa-quick');
+    expect(result.selected).toContain('qa-fix-loop');
+    expect(result.selected).toContain('design-review-fix');
+    expect(result.reason).toBe('diff');
+    expect(result.selected).not.toContain('plan-ceo-review');
+    expect(result.selected).not.toContain('retro');
+  });
+
   test('skill-specific change selects only that skill and related tests', () => {
     const result = selectTests(['plan-ceo-review/SKILL.md'], E2E_TOUCHFILES);
     expect(result.selected).toContain('plan-ceo-review');
@@ -109,8 +121,9 @@ describe('selectTests', () => {
     expect(result.selected).toContain('plan-ceo-split-overflow');
     // v2 plan Phase B carve: the section-loading E2E depends on plan-ceo-review/**.
     expect(result.selected).toContain('plan-ceo-section-loading');
-    expect(result.selected.length).toBe(21);
-    expect(result.skipped.length).toBe(Object.keys(E2E_TOUCHFILES).length - 21);
+    expect(result.selected).toContain('outside-plan-disabled-no-fallback');
+    expect(result.selected.length).toBe(22);
+    expect(result.skipped.length).toBe(Object.keys(E2E_TOUCHFILES).length - 22);
   });
 
   test('global touchfile triggers ALL tests', () => {
@@ -118,6 +131,14 @@ describe('selectTests', () => {
     expect(result.selected.length).toBe(Object.keys(E2E_TOUCHFILES).length);
     expect(result.skipped.length).toBe(0);
     expect(result.reason).toContain('global');
+  });
+
+  test('section-capture tool isolation regression selects only its three capture workflows', () => {
+    const result = selectTests(['test/session-runner-tools.test.ts'], E2E_TOUCHFILES);
+    expect(result.selected.sort()).toEqual([
+      'carve-section-loading', 'plan-ceo-section-loading', 'ship-section-loading',
+    ]);
+    expect(result.reason).toBe('diff');
   });
 
   test('gen-skill-docs.ts is a scoped touchfile, not global', () => {
