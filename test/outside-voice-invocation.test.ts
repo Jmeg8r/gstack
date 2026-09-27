@@ -205,6 +205,18 @@ describe('generated outside-review dispatch', () => {
     });
   }
 
+  test('a blocking finding fails even beside an unknown severity', () => {
+    expect(validateOutsideReview('[P1] Seeded data-loss bug\n[P7] Unknown severity', 'structured')).toEqual({ completed: true, gate: 'fail' });
+  });
+
+  // A severity written in a form the parser does not recognize must not be
+  // silently dropped while a recognized advisory tag passes the review.
+  for (const response of ['1. P0: Drops writes\n[P3] Typo', 'P0 : Drops writes\n[P3] Typo', '[p1] Drops writes\n[P3] Typo', 'Finding 1 P0: Drops writes\n[P3] Typo', '| P0 | Drops writes |\n[P3] Typo', '[P10] Drops writes']) {
+    test(`structured gate treats an unrecognized severity form as not completed: ${JSON.stringify(response)}`, () => {
+      expect(validateOutsideReview(response, 'structured').completed).toBe(false);
+    });
+  }
+
   test('a severity tag outranks a contradictory NO_FINDINGS line', () => {
     expect(validateOutsideReview('NO_FINDINGS\n[P1] Seeded data-loss bug', 'structured')).toEqual({ completed: true, gate: 'fail' });
   });
