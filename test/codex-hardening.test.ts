@@ -569,15 +569,20 @@ describe('codex skeleton+sections union: review sandbox + fail-closed gate + tim
       expect(content).not.toContain(
         'If no `[P1]` markers are found (only `[P2]` or no findings) — the gate is **PASS**',
       );
-      // The new rule: FAIL on non-zero exit, empty output, and untagged
-      // output; [P0] recognized as blocking; PASS reachable only through the
-      // explicit tagged-advisory-only branch.
+      // The verdict is computed by lib/codex-review-gate.ts (behavior pinned in
+      // test/codex-review-gate.test.ts); the prose must route through it, pass it
+      // the real exit code, and never let the model substitute its own reading.
       expect(content).toContain('The gate FAILS CLOSED');
+      expect(content).toContain('lib/codex-review-gate.ts <_CODEX_EXIT>');
+      expect(content).toContain('Never\nsubstitute your own reading of the output.');
+      expect(content).toContain('never assume 0');
       expect(content).toContain('`_CODEX_EXIT` is non-zero (including 124) → **GATE: FAIL**');
       expect(content).toContain('empty or whitespace-only → **GATE: FAIL**');
       expect(content).toContain('untagged output');
       expect(content).toContain('`[P0]`');
-      expect(content).toContain('PASS is only reachable through check 5');
+      expect(content).toContain('There is no default branch.');
+      // Both review paths must emit the exit code unconditionally.
+      expect(content.match(/echo "CODEX_EXIT=\$_CODEX_EXIT"/g)?.length).toBe(2);
     });
 
     test(`${relPath}: (c) every Bash gate sits strictly above its section's wrapper budgets`, () => {
