@@ -192,6 +192,40 @@ describe('generated outside-review dispatch', () => {
     }
   });
 
+  // P0 is more severe than P1; /codex review blocks on it, so this gate must too.
+  for (const response of ['[P0] Drops every write', 'P0: Drops every write', '**P0:** Drops every write', '- [P0] Drops every write\n- [P3] Typo']) {
+    test(`structured gate fails a P0 finding: ${JSON.stringify(response)}`, () => {
+      expect(validateOutsideReview(response, 'structured')).toEqual({ completed: true, gate: 'fail' });
+    });
+  }
+
+  for (const response of ['NO_FINDINGS', '**NO_FINDINGS**', 'Reviewed the diff.\n\nNO_FINDINGS\n']) {
+    test(`structured gate passes an explicit NO_FINDINGS line: ${JSON.stringify(response)}`, () => {
+      expect(validateOutsideReview(response, 'structured')).toEqual({ completed: true, gate: 'pass' });
+    });
+  }
+
+  test('a severity tag outranks a contradictory NO_FINDINGS line', () => {
+    expect(validateOutsideReview('NO_FINDINGS\n[P1] Seeded data-loss bug', 'structured')).toEqual({ completed: true, gate: 'fail' });
+  });
+
+  // Clean prose varies run to run and can sit beside an untagged defect, so it
+  // is missing coverage rather than a pass.
+  for (const response of [
+    'Looks good to me.',
+    'No actionable defects found.',
+    'no actionable issues',
+    'There are no bugs in the parser, but the cache silently drops writes.',
+    'I did not find any issues.',
+    'Summary: NO_FINDINGS except the race in flush().',
+    '[P7] Unknown severity',
+    '[P7] Unknown severity\n[P2] Minor naming',
+  ]) {
+    test(`structured gate treats untagged or unknown output as not completed: ${JSON.stringify(response)}`, () => {
+      expect(validateOutsideReview(response, 'structured').completed).toBe(false);
+    });
+  }
+
   test('malformed Claude JSON cannot reach completion evaluation', () => {
     const result = invoke('codex',{}, {FAKE_MODE:'malformed'});
     expect(result.status).toBe(1);
