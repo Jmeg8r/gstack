@@ -159,12 +159,12 @@ export function outsideVoiceInvocation(ctx: TemplateContext, opts: OutsideComman
   const completion = opts.gate === 'spec'
     ? 'Request exactly SCORE: N (integer 0-10) and AMBIGUITIES: ... (or NONE), as two distinct nonempty lines.'
     : opts.gate === 'structured'
-      ? 'Request severity-tagged findings or an explicit NO_FINDINGS conclusion.'
+      ? 'Request severity-tagged findings ([P0]–[P3]) or, when there are none, a line containing only NO_FINDINGS.'
       : opts.purpose === 'design-direction'
         ? 'Request a complete design proposal ending with Recommendation: <direction> because <product-specific reason>.'
         : 'Request a final Recommendation: <action> because <specific reason> line, including an explicit no-findings rationale.';
   const preparation = nativeStructured
-    ? 'Run Codex’s built-in structured review with the selected base. It supplies its own prompt and accepts no custom prompt file with --base. Require severity-tagged findings (including native P1:/P2: labels) or an explicit no-findings conclusion; arbitrary prose or a refusal is missing coverage.'
+    ? 'Run Codex’s built-in structured review with the selected base. It supplies its own prompt and accepts no custom prompt file with --base. Require severity-tagged findings (including native P0:/P1:/P2: labels); untagged output, including clean-review prose, a refusal, or an unknown severity, is missing coverage.'
     : `Use Write to save the **complete prompt and context** in a private file. Replace \`<prepared-prompt-file>\` below with its shell-quoted path; never interpolate user text into shell source. Include actual plan/spec/source content${outsideVoiceFor(ctx).id === 'claude-code' ? ': Claude Code review/challenge has no tools, git, or path access' : ''}. ${completion} A refusal is never completion.`;
   return `${preparation}
 
