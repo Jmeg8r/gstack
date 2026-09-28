@@ -2184,9 +2184,9 @@ If `CODEX_MODE` is `not_installed` / `not_authed` / `disabled`: the preflight al
 
 If `DIFF_TOTAL >= 200` AND `CODEX_MODE` is `ready`:
 
-Prepare a structured review prompt requesting severity-tagged findings ([P1], [P2], [P3]) or an explicit NO_FINDINGS conclusion. Preserve the base-branch scope including committed changes and working-tree changes.
+Prepare a structured review prompt requesting severity-tagged findings ([P0], [P1], [P2], [P3]) or, when there are none, a line containing only NO_FINDINGS. Preserve the base-branch scope including committed changes and working-tree changes.
 
-Use Write to save the **complete prompt and context** in a private file. Replace `<prepared-prompt-file>` below with its shell-quoted path; never interpolate user text into shell source. Include actual plan/spec/source content: Claude Code review/challenge has no tools, git, or path access. Request severity-tagged findings or an explicit NO_FINDINGS conclusion. A refusal is never completion.
+Use Write to save the **complete prompt and context** in a private file. Replace `<prepared-prompt-file>` below with its shell-quoted path; never interpolate user text into shell source. Include actual plan/spec/source content: Claude Code review/challenge has no tools, git, or path access. Request severity-tagged findings ([P0]–[P3]) or, when there are none, a line containing only NO_FINDINGS. A refusal is never completion.
 
 ```bash
 # GSTACK_ACTIVE_HOST names the harness, never the model.
@@ -2243,7 +2243,7 @@ Show the full response in a `tool-output` fence. Completed outside coverage requ
 The Claude Code backend receives the parent-captured base diff, including committed and working-tree changes, because review mode cannot execute git.
 
 Set the outer tool timeout to 600000ms. Present output under `CLAUDE CODE SAYS (code review):` inside a `tool-output` fence.
-Only a completed response with severity tags or an explicit no-findings conclusion establishes the gate. P1 findings (`[P1]` or native `P1:` labels) → GATE: FAIL. Completed without P1 → GATE: PASS. Refusal, failure, or missing markers → GATE: MISSING COVERAGE; preserve the existing user decision flow.
+Only a completed response with severity tags or a NO_FINDINGS line establishes the gate. P0 or P1 findings (`[P0]`/`[P1]` or native `P0:`/`P1:` labels) → GATE: FAIL. Completed without P0/P1 → GATE: PASS. Untagged clean prose (native Codex review cannot be prompted for NO_FINDINGS) is missing coverage, not a pass. Refusal, failure, or missing markers → GATE: MISSING COVERAGE; preserve the existing user decision flow.
 
 If GATE is FAIL, use AskUserQuestion:
 ```

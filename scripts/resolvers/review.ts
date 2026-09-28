@@ -560,14 +560,14 @@ If \`CODEX_MODE\` is \`not_installed\` / \`not_authed\` / \`disabled\`: the pref
 
 If \`DIFF_TOTAL >= 200\` AND \`CODEX_MODE\` is \`ready\`:
 
-Prepare a structured review prompt requesting severity-tagged findings ([P1], [P2], [P3]) or an explicit NO_FINDINGS conclusion. Preserve the base-branch scope including committed changes and working-tree changes.
+Prepare a structured review prompt requesting severity-tagged findings ([P0], [P1], [P2], [P3]) or, when there are none, a line containing only NO_FINDINGS. Preserve the base-branch scope including committed changes and working-tree changes.
 
 ${outsideVoiceInvocation(ctx, { timeoutMs: 540000, structuredBase: '<base>', gate: 'structured', diffCommand: 'DIFF_BASE=$(git merge-base <base> HEAD) && git diff "$DIFF_BASE"' })}
 
 ${outsideVoiceFor(ctx).id === 'codex' ? 'The Codex backend uses `codex review --base` without a positional prompt: those arguments are mutually exclusive. Never drop --base to resolve an argv error; prompt-only review changes the diff scope.' : 'The Claude Code backend receives the parent-captured base diff, including committed and working-tree changes, because review mode cannot execute git.'}
 
 Set the outer tool timeout to 600000ms. Present output under \`${outsideVoiceFor(ctx).label.toUpperCase()} SAYS (code review):\` inside a \`tool-output\` fence.
-Only a completed response with severity tags or an explicit no-findings conclusion establishes the gate. P1 findings (\`[P1]\` or native \`P1:\` labels) → GATE: FAIL. Completed without P1 → GATE: PASS. Refusal, failure, or missing markers → GATE: MISSING COVERAGE; preserve the existing user decision flow.
+Only a completed response with severity tags or a NO_FINDINGS line establishes the gate. P0 or P1 findings (\`[P0]\`/\`[P1]\` or native \`P0:\`/\`P1:\` labels) → GATE: FAIL. Completed without P0/P1 → GATE: PASS. Untagged clean prose (native Codex review cannot be prompted for NO_FINDINGS) is missing coverage, not a pass. Refusal, failure, or missing markers → GATE: MISSING COVERAGE; preserve the existing user decision flow.
 
 If GATE is FAIL, use AskUserQuestion:
 \`\`\`
