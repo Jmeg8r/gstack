@@ -186,6 +186,14 @@ function concludesNoFindings(code: string): boolean {
   });
 }
 
+/**
+ * Fork rule (jfcadm/gstack): the structured gate's prompt asks for an exact
+ * NO_FINDINGS line, and clean-review prose varies run to run and can sit
+ * beside an untagged defect, so only that line concludes no findings there.
+ * Matched before plainReview, which strips the sentinel's own underscore.
+ */
+const NO_FINDINGS_LINE = /^[\t ]*(?:[-+*][\t ]+)?([*_`]*)NO_FINDINGS\1[\t ]*\r?$/m;
+
 /** Formatting the requested marker in bold, inline code, or a list does not invalidate a completed review. */
 function plainReview(text: string): string {
   return text.split(/\r?\n/).map(line => line.replace(/^[\t ]*(?:#{1,6}[\t ]+|[-+*][\t ]+)?/, '').replace(/[*_`]/g, '')).join('\n');
@@ -266,7 +274,10 @@ export function classifyOutsideReview(input: OutsideReviewInput): OutsideReviewC
   const notReady = !findings.highest && verdictNotReady(plainCode);
   if (blocking || notReady) return { ...result('findings'), ...(unparsed ? { unparsed } : {}) };
   if (unparsed) return { ...result('unverified', 'unparsed_severity', unparsed), unparsed };
-  if ((input.gate === 'structured' || input.gate === 'review') && !findings.highest && !concludesNoFindings(code)) {
+  if (input.gate === 'structured' && !findings.highest && !NO_FINDINGS_LINE.test(code)) {
+    return result('unverified', 'untagged_review', 'missing severity or explicit no-findings conclusion');
+  }
+  if (input.gate === 'review' && !findings.highest && !concludesNoFindings(code)) {
     return result('unverified', 'untagged_review', 'missing severity or explicit no-findings conclusion');
   }
   return result('clean');

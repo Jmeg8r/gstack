@@ -95,10 +95,12 @@ describe('#3105 severity forms are read by every gate that summarises a review',
       }
     });
     test(`${gate}: negative controls stay clean`, () => {
-      expect(classifyOutsideReview({ text: read('no-findings.txt'), gate }).verdict).toBe('clean');
-      expect(classifyOutsideReview({ text: read('p1-in-code.txt'), gate }).verdict).toBe('clean');
+      // Fork rule: the structured gate concludes no findings only on an exact NO_FINDINGS line.
+      const concluded = (text: string) => gate === 'structured' ? `${text}\nNO_FINDINGS` : text;
+      expect(classifyOutsideReview({ text: concluded(read('no-findings.txt')), gate }).verdict).toBe('clean');
+      expect(classifyOutsideReview({ text: concluded(read('p1-in-code.txt')), gate }).verdict).toBe('clean');
       for (const text of ['The P1 queue drains first.', 'Ship it; we discussed P1 and P2 priorities yesterday.', 'See issue #P12.', 'Use a P10 bucket.'])
-        expect({ text, verdict: classifyOutsideReview({ text: `${text}\nNo issues found.\n${REC}`, gate }).verdict as string }).toEqual({ text, verdict: 'clean' });
+        expect({ text, verdict: classifyOutsideReview({ text: concluded(`${text}\nNo issues found.\n${REC}`), gate }).verdict as string }).toEqual({ text, verdict: 'clean' });
     });
   }
 

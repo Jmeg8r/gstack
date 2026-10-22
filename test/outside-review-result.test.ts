@@ -71,22 +71,37 @@ describe('a no-findings statement counts only as the reply\'s conclusion (#3294)
   const REPORTER = 'I found no actionable regressions in the staged, unstaged, or untracked changes.';
   const FINDING = 'The fallback path now swallows ENOENT and returns an empty config.';
 
-  test("the reporter's exact codex review reply reads clean through the reporter's CLI invocation", () => {
-    expect(classifyOutsideReview({ text: REPORTER, gate: 'structured' }).verdict).toBe('clean');
+  // Fork rule: the structured gate concludes no findings only on an exact
+  // NO_FINDINGS line, so the reporter's prose reply is unverified there.
+  test("the reporter's exact codex review reply is unverified on the structured gate, through the reporter's CLI invocation", () => {
+    expect(classifyOutsideReview({ text: REPORTER, gate: 'structured' }).verdict).toBe('unverified');
     const r = cli(['--label', 'probe', '--exit', '0', '--stderr', file(''), 'structured', file(REPORTER)]);
-    expect([r.status, r.stdout]).toEqual([0, 'VERDICT: clean\nFINDINGS: none\n']);
+    expect(r.status).toBe(4);
+    expect(r.stdout).toContain('VERDICT: unverified\n');
+    const marked = cli(['--label', 'probe', '--exit', '0', '--stderr', file(''), 'structured', file(`${REPORTER}\nNO_FINDINGS`)]);
+    expect([marked.status, marked.stdout]).toEqual([0, 'VERDICT: clean\nFINDINGS: none\n']);
   });
 
-  test('clean conclusions, with the added regressions/defects vocabulary and the requested marker formatted', () => {
+  test('the structured gate reads only the formatted NO_FINDINGS marker as clean', () => {
+    for (const text of ['NO_FINDINGS', '**NO_FINDINGS**', '`NO_FINDINGS`', '- NO_FINDINGS', `${REPORTER}\nNO_FINDINGS`]) {
+      expect({ text, verdict: classifyOutsideReview({ text, gate: 'structured' }).verdict }).toEqual({ text, verdict: 'clean' });
+    }
+    for (const text of ['NO_FINDINGS except the race in flush().', 'Summary: NO_FINDINGS', '```\nNO_FINDINGS\n```']) {
+      expect({ text, verdict: classifyOutsideReview({ text, gate: 'structured' }).verdict }).toEqual({ text, verdict: 'unverified' });
+    }
+  });
+
+  test('clean prose conclusions, with the added regressions/defects vocabulary, are clean on the review gate only', () => {
     for (const text of ['No regressions found.', 'I did not find any defects.', 'There are no actionable regressions.',
-      'NO_FINDINGS', '**NO_FINDINGS**', '`NO_FINDINGS`', '- NO_FINDINGS',
       `The change adds a retry cap and its tests.\n${REPORTER}`, 'Reviewed the retry helper.\n\nNo issues found in this change.',
       'After reviewing the patch, I found no issues.', 'I found no issues in this read-only change.',
       'Summary of the retry helper\nNo issues found.', 'I found no actionable regressions in the staged\nchanges.',
       // Clean `codex review --uncommitted` replies captured from codex-cli 0.160.0 with gpt-6-sol.
       'The change validates the retry limit before execution. No actionable regression was found.',
       'The change validates `max` before retrying. No affected callers or tests are present in the repository, and no actionable regression is evident.']) {
-      expect({ text, verdict: classifyOutsideReview({ text, gate: 'structured' }).verdict }).toEqual({ text, verdict: 'clean' });
+      const review = classifyOutsideReview({ text: `${text}\nRecommendation: ship because it looks fine.`, gate: 'review' }).verdict;
+      const structured = classifyOutsideReview({ text, gate: 'structured' }).verdict;
+      expect({ text, review, structured }).toEqual({ text, review: 'clean', structured: 'unverified' });
     }
   });
 
@@ -249,8 +264,8 @@ describe('B1: a review whose sandbox could not start is unavailable, not clean',
     expect(classifyOutsideReview({ text: RECOMMEND, events: `${failed}\n${failed}`, gate: 'review' }).detail).toBe('all 2 commands failed');
   });
 
-  test('a clean "I did not find any issues" with empty stderr still passes', () => {
-    expect(classifyOutsideReview({ text: 'I did not find any issues.', stderr: '', exit: 0, gate: 'structured' }).verdict).toBe('clean');
+  test('a clean NO_FINDINGS reply with empty stderr still passes', () => {
+    expect(classifyOutsideReview({ text: 'I did not find any issues.\nNO_FINDINGS', stderr: '', exit: 0, gate: 'structured' }).verdict).toBe('clean');
   });
 
   test('the CLI reads --events', () => {
