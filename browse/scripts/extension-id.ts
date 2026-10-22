@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * Derive the Chrome extension ID from the "key" field in
  * extension/manifest.json.
@@ -8,7 +8,7 @@
  * 0-9a-f to a-p (the "mpdecimal" alphabet). Pinning the public key in the
  * manifest pins the ID, which lets the browse server verify the Origin
  * header on POST /extension-token against a single known extension
- * identity (GSTACK_EXTENSION_ID in browse/src/server.ts).
+ * identity (GSTACK_EXTENSION_ID in browse/src/extension-id.ts).
  *
  * The private half of the keypair is intentionally NOT in the repo — the
  * extension is loaded unpacked (or baked into Browser.app), so only the

@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * gstack-redact — scan text for secrets/PII/legal content via the shared engine.
  *
@@ -82,7 +82,7 @@ printf '%s' "$_input" | bun "${prepushBin}" "$@"
   // If a non-managed hook exists, preserve it as pre-push.local and chain it.
   if (fs.existsSync(hookPath)) {
     const existing = fs.readFileSync(hookPath, "utf8");
-    if (existing.includes(MANAGED_MARKER)) {
+    if (existing.split("\n").includes(MANAGED_MARKER)) {
       // A hook we already own. Returning here unconditionally froze every
       // existing install on whatever wrapper it first received: the `printf x`
       // fail-open fix landed in v1.64.0.0 and still had not reached a single
@@ -217,6 +217,8 @@ function buildOpts(): ScanOptions {
     selfEmail: arg("--self-email"),
     repoPublicEmails: readLines(arg("--repo-public-emails")),
     ...(maxBytesOpt !== undefined ? { maxBytes: maxBytesOpt } : {}),
+    // The scanned file's path lets patterns tell TS/JSX source syntax from a literal (#3048).
+    ...(arg("--from-file") ? { sourcePath: arg("--from-file") } : {}),
   };
 }
 

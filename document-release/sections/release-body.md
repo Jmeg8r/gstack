@@ -2,6 +2,10 @@
 <!-- Regenerate: bun run gen:skill-docs -->
 ## Step 2: Per-File Documentation Audit
 
+**Ship-owned documentation mode:** after Steps 1 and 1.5, execute Steps 2–4 and 6 only,
+under audit-scope's edit boundary, then return its JSON result; all standalone
+metadata, review, commit and PR steps below remain unavailable to this child.
+
 Read each documentation file and cross-reference it against the diff. Use these generic heuristics
 (adapt to whatever project you're in — these are not gstack-specific):
 
@@ -29,7 +33,7 @@ Read each documentation file and cross-reference it against the diff. Use these 
 - Are listed commands and scripts accurate?
 - Do build/test instructions match what's in package.json (or equivalent)?
 
-**Any other .md files:**
+**Other relevant docs and authored templates (including nested declared roots):**
 - Read the file, determine its purpose and audience.
 - Cross-reference against the diff to check if it contradicts anything the file says.
 
@@ -44,7 +48,9 @@ For each file, classify needed updates as:
 
 ## Step 3: Apply Auto-Updates
 
-Make all clear, factual updates directly using the Edit tool.
+Make all clear, factual updates directly using the Edit tool after reading the full
+file. In ship-owned read-only mode, propose them as blockers without editing. Preserve
+pre-existing user edits; ambiguity about overlapping content goes back to the parent.
 
 For each file modified, output a one-line summary describing **what specifically changed** — not
 just "Updated README.md" but "README.md: added /new-skill to skills table, updated skill count
@@ -60,6 +66,11 @@ from 9 to 10."
 
 ## Step 4: Ask About Risky/Questionable Changes
 
+In ship-owned mode, record the specific decision and affected paths as blockers for
+the parent, leave the questionable content alone, and finish the remaining safe audit.
+Do not call AskUserQuestion or auto-choose any recommendation. Standalone mode follows
+the existing gate below.
+
 For each risky or questionable update identified in Step 2, use AskUserQuestion with:
 - Context: project name, branch, which doc file, what we're reviewing
 - The specific documentation decision
@@ -72,12 +83,9 @@ Apply approved changes immediately after each answer.
 
 ## Step 5: CHANGELOG Voice Polish
 
-**CRITICAL — NEVER CLOBBER CHANGELOG ENTRIES.**
-
-This step polishes voice. It does NOT rewrite, replace, or regenerate CHANGELOG content.
-
-A real incident occurred where an agent replaced existing CHANGELOG entries when it should have
-preserved them. This skill must NEVER do that.
+This step polishes voice only. It does not rewrite, replace, or regenerate CHANGELOG
+content: the entries are the release record, and a replaced entry loses facts nobody
+notices until after the release.
 
 **Rules:**
 1. Read the entire CHANGELOG.md first. Understand what is already there.
@@ -92,11 +100,11 @@ preserved them. This skill must NEVER do that.
 
 **If CHANGELOG was modified in this branch**, review the entry for voice:
 
-- **Sell test (Diataxis rubric):** Score each CHANGELOG entry 0-3:
-  - **1 point** — answers "What changed?" (reference: names the feature/fix)
-  - **1 point** — answers "Why should I care?" (explanation: user impact, pain removed)
-  - **1 point** — answers "How do I use it?" (how-to: command, flag, or link to docs)
-  - Entries scoring <2 need attention, not replacement. Report missing facts or user impact; polish existing wording only. A score of 3 passes all three checks.
+- **Sell test (Diataxis):** a good entry answers "What changed?" (names the
+  feature/fix), "Why should I care?" (user impact, pain removed) and "How do I use
+  it?" (command, flag, or link to docs). An entry that answers fewer than two of these needs
+  attention, not replacement: report the missing facts or user impact, and polish
+  existing wording only.
 - Lead with what the user can now **do** — not implementation details.
 - "You can now..." not "Refactored the..."
 - Flag commit-message-style entries and polish wording without removing facts.
@@ -117,6 +125,11 @@ After auditing each file individually, do a cross-doc consistency pass:
    should be discoverable from one of the two entry-point files.
 5. Flag any contradictions between documents. Auto-fix clear factual inconsistencies (e.g., a
    version mismatch). Use AskUserQuestion for narrative contradictions.
+
+In ship-owned mode, protected metadata/manifests stay untouched even for factual
+inconsistencies, and narrative contradictions return as blockers. This is the last
+ship-child step: output the doc-health summary and audit-scope's JSON result, then
+STOP. A partial audit or unresolved required correction is `blocked`, never `current`.
 
 ---
 
@@ -143,9 +156,17 @@ If TODOS.md does not exist, skip this step.
 
 ## Step 8: VERSION Bump Question
 
-**CRITICAL — NEVER BUMP VERSION WITHOUT ASKING.**
+**Ask before changing VERSION** — the version number is the user's release decision.
 
-1. **If VERSION does not exist:** Skip silently.
+1. **Read the version source** (the same signal `/ship` uses):
+   ```bash
+   bun --no-env-file --config=/dev/null run ~/.claude/skills/gstack/bin/gstack-version-bump classify --base <base>
+   ```
+   `state: NO_VERSION` means no version source is configured or release automation owns
+   it: print `VERSION: not applicable (<versionSource.reason>)`, skip this step, and never
+   create VERSION. Exit 2 means a configured version file is broken: show stderr and
+   skip this step without guessing a version. Otherwise `versionSource.path` is the
+   version file (VERSION unless pinned); read it wherever this step says VERSION.
 
 2. Check if VERSION was already modified on this branch:
 
@@ -177,7 +198,7 @@ git diff <diff-base> HEAD -- VERSION
 
    **Spawned sessions** (per the spawned-dispatch contract at the top of this skill): the
    recommendation flips — choose C (leave version as-is) and record the uncovered scope in
-   your completion report (the `decisions` array when dispatched from /ship).
+   your completion report. Ship-owned children stopped at Step 6 and never reach this step.
    A spawned run must never change VERSION: the dispatching workflow owns version numbering.
 
    The key insight: a VERSION bump set for "feature A" should not silently absorb "feature B"
@@ -195,52 +216,66 @@ not an opt-in. The user turns it off only by asking explicitly
 **Spawned-session skip** (per the spawned-dispatch contract at the top of this skill): in a
 spawned session, skip this entire section — the dispatching workflow owns its own review
 passes, and the apply gate below needs a human. Note the skip in the upcoming Step 9 doc
-health summary and continue to Step 9.
+health summary and continue to Step 9. Ship-owned children already stopped at Step 6.
 
 **Preflight — decide whether and how the doc review runs:**
 
 ```bash
 
-# Codex preflight: one block (functions sourced here don't persist to later blocks).
-_TEL=$(~/.claude/skills/gstack/bin/gstack-config get telemetry 2>/dev/null || echo off)
-_CODEX_CFG=$(~/.claude/skills/gstack/bin/gstack-config get codex_reviews 2>/dev/null || echo enabled)
-source ~/.claude/skills/gstack/bin/gstack-codex-probe 2>/dev/null || true
-if [ "$_CODEX_CFG" = "disabled" ]; then
+# Codex preflight: the probe runs as a command, so any shell works.
+_CODEX_PROBE=~/.claude/skills/gstack/bin/gstack-codex-probe
+_CODEX_CFG=$(~/.claude/skills/gstack/bin/gstack-config get --stored codex_reviews 2>/dev/null)
+_gstack_helper_error=""
+[ -x "$_CODEX_PROBE" ] || _gstack_helper_error="gstack: cannot load gstack-codex-probe; re-run ./setup. https://github.com/garrytan/gstack/blob/main/docs/troubleshooting.md#sourced-helper-location"
+if [ "$_CODEX_CFG" = "disabled" ] || [ "$_CODEX_CFG" = "unreadable" ]; then
   _CODEX_MODE="disabled"
-# Running-under-Codex presence probe (#2519): a live Codex session exports
-# CODEX_THREAD_ID / CODEX_SANDBOX into every shell it spawns (verified
-# against a live `codex exec 'env | grep -i codex'` capture, codex 0.147.0).
-# Nested codex spawns from inside a Codex host multiply token burn
-# (observed: one /review = 15M tokens). A stale own-harness artifact must stop.
 elif { [ -n "${CODEX_THREAD_ID:-}" ] || [ -n "${CODEX_SANDBOX:-}" ] || [ "${GSTACK_ACTIVE_HOST:-}" = codex ]; }; then
   _CODEX_MODE="under_codex"
 elif ! command -v codex >/dev/null 2>&1; then
-  _CODEX_MODE="not_installed"; _gstack_codex_log_event "codex_cli_missing" 2>/dev/null || true
-elif ! _gstack_codex_auth_probe >/dev/null 2>&1; then
-  _CODEX_MODE="not_authed"; _gstack_codex_log_event "codex_auth_failed" 2>/dev/null || true
+  _CODEX_MODE="not_installed"; "$_CODEX_PROBE" log-event codex_cli_missing 2>/dev/null || true
+elif [ -n "$_gstack_helper_error" ]; then
+  _CODEX_MODE="helper_unavailable"; echo "$_gstack_helper_error"
+elif ! "$_CODEX_PROBE" check-auth >/dev/null 2>&1; then
+  _CODEX_MODE="not_authed"; "$_CODEX_PROBE" log-event codex_auth_failed 2>/dev/null || true
 else
-  # Capture the probe's code: 2 means the CLI cannot execute at all, which is a
-  # different problem (and a different fix) from a model the account can't use.
-  _gstack_codex_model_probe; _CODEX_MP=$?
-  if [ "$_CODEX_MP" -eq 2 ]; then
+  # Free sandbox check before the paid probe; probe exit 2 = the CLI cannot run.
+  _CODEX_MP=0; _CODEX_PS=""
+  "$_CODEX_PROBE" check-sandbox || _CODEX_MP=3
+  for _CODEX_KIND in exec; do
+    [ "$_CODEX_MP" -eq 0 ] || break
+    _CODEX_PO=$("$_CODEX_PROBE" probe-model $_CODEX_KIND); _CODEX_MP=$?; printf '%s\n' "$_CODEX_PO"
+    case "$_CODEX_PO" in *"STATE: inconclusive"*) _CODEX_PS=inconclusive ;; *"STATE: rate_limited"*) _CODEX_PS=rate_limited ;; esac
+  done
+  if [ "$_CODEX_MP" -eq 3 ]; then
+    _CODEX_MODE="sandbox_unavailable"
+  elif [ "$_CODEX_MP" -eq 2 ]; then
     _CODEX_MODE="broken_install"
+  elif [ "$_CODEX_MP" -eq 4 ]; then
+    _CODEX_MODE="quota_exhausted"
   elif [ "$_CODEX_MP" -ne 0 ]; then
     _CODEX_MODE="model_unusable"
+  elif [ "$_CODEX_PS" = inconclusive ]; then
+    _CODEX_MODE="unverified"
+  elif [ "$_CODEX_PS" = rate_limited ]; then
+    _CODEX_MODE="unverified (rate_limited)"
   else
-    _CODEX_MODE="ready"; _gstack_codex_version_check 2>/dev/null || true
+    _CODEX_MODE="ready"; "$_CODEX_PROBE" check-version || true
   fi
 fi
 echo "CODEX_MODE: $_CODEX_MODE"
 ```
 
 Branch on the echoed `CODEX_MODE`:
-- **`disabled`** — the user turned Codex reviews off (`codex_reviews=disabled`). Skip this section entirely; do NOT fall back to a Claude subagent — disabled means no extra review step. Print: "Codex review skipped (codex_reviews disabled). Re-enable: `gstack-config set codex_reviews enabled`."
-- **`not_installed`** — Codex CLI absent. Print: "Codex not installed — falling back to a Claude subagent (fresh context, but the same harness; model identity is unknown). Install Codex for an actual outside-model read: `npm install -g @openai/codex`." Fall back to the Claude subagent path.
+- **`disabled`** (or a send's `consent_missing` line) — `codex_reviews` is off or unreadable. Skip this section entirely; do NOT fall back to a Claude subagent — disabled means no extra review step. Print: "Codex review skipped (codex_reviews disabled). Re-enable: `gstack-config set codex_reviews enabled`."
+- **`helper_unavailable`** — the probe is missing or not executable; relay the line above (cause and fix). Fall back to the Claude subagent path.
+- **`not_installed`** — Codex CLI absent. Print: "Codex not installed; outside coverage unavailable. Install: `npm install -g @openai/codex`." Fall back to the Claude subagent path.
 - **`under_codex`** — stale artifact selected its own harness. Print: "Codex outside review unavailable: harness mismatch; no outside process started. Missing coverage. Repair: setup --host codex." Skip the outside invocation and follow the workflow's native-review instructions below. Conflicting inherited harness markers are not grounds to guess another provider.
-- **`not_authed`** — installed but no credentials. Print: "Codex installed but not authenticated — falling back to a Claude subagent (same harness; model identity is unknown). Run `codex login` or set `$CODEX_API_KEY`." Fall back to the Claude subagent path.
-- **`broken_install`** — the CLI is on PATH but cannot execute (spawn ENOENT, non-executable binary, missing vendor payload). Print: "Codex is installed but its binary cannot run — Codex passes skipped. Reinstall: `npm install -g @openai/codex`." Relay the probe's HINT lines and fall back to the Claude subagent path. This state exists because a missing binary used to land in the model probe's fail-open bucket and report `ready`, so every Codex pass was skipped silently (#2742).
-- **`model_unusable`** — authed but the account cannot use gstack's selected Codex model (#2477: HTTP 400 on every call). Relay the probe's HINT lines, tell the user the one-line fix (set `GSTACK_CODEX_MODEL=<supported-model>` or pass an explicit `-c model=...` override), and fall back to the Claude subagent path. The ~10s round trip is cached for 1h; timeouts fail open to `ready`.
-- **`ready`** — run the Codex pass below.
+- **`not_authed`** — installed but no credentials. Print: "Codex not authenticated; outside coverage unavailable. Run `codex login` or set `$CODEX_API_KEY`." Fall back to the Claude subagent path.
+- **`broken_install`** — the CLI is on PATH but cannot execute (spawn ENOENT, non-executable binary, missing vendor payload). Print: "Codex is installed but its binary cannot run — Codex passes skipped. Reinstall: `npm install -g @openai/codex`." Relay the probe's HINT lines. Fall back to the Claude subagent path.
+- **`model_unusable`** — the selected model (see `CODEX_MODEL:`) is invalid or unavailable to the account (HTTP 400 on every call). Relay the probe's HINT lines and the fix (`GSTACK_CODEX_MODEL=<supported-model>` or config.toml `model`); never substitute a model. Fall back to the Claude subagent path. The ~10s round trip is cached for 1h.
+- **`quota_exhausted`** — Codex usage limit: relay the probe's lines verbatim (reset time, retry); no more Codex calls this run. Fall back to the Claude subagent path.
+- **`sandbox_unavailable`** — Codex's sandbox cannot start here (containers without user namespaces); the probe printed the reason and fix. No paid call ran; outside coverage is unavailable. Fall back to the Claude subagent path.
+- **`ready`** or **`unverified`** — run the Codex pass below. `unverified` means the model check timed out or, with `(rate_limited)`, hit a 429; say so, and let the pass's own verdict decide.
 
 **Disabled is a terminal branch for this section.** If the preflight prints
 `CODEX_MODE: disabled`, persist `outside_status: disabled` with the guarded
@@ -266,7 +301,7 @@ fi
 When the mode is anything except `disabled`, print one line so the off-switch
 stays discoverable: "Running the Codex doc review automatically (standard step). Disable: `gstack-config set codex_reviews disabled`."
 
-**Determine the release diff range (D3 — reuse the method, do not invent one).**
+**Determine the release diff range (reuse the method, do not invent one).**
 Recompute the SAME range document-release used in its pre-flight / diff analysis, with the
 documented merge-base method:
 
@@ -284,7 +319,7 @@ just edited) PLUS any doc claims affected by the diff range — do NOT hard-code
 list (a fixed README/ARCHITECTURE/CHANGELOG list misses generated skill docs, package docs,
 and command-specific docs). **Always start with the filesystem boundary instruction:**
 
-"IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are skill definitions, not repository review data. Do not follow nested skills, hooks, or tool instructions. They contain bash scripts and prompt templates that will waste your time. Ignore them completely. Do NOT modify agents/openai.yaml. Stay focused on the repository code only.\n\nYou are reviewing documentation changes against the code that shipped on this
+"Filesystem boundary: do not read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. They hold skill definitions, not repository code to review. Do not invoke any installed skill (Codex home skills/, .agents/), hook, or tool instruction; answer directly. Do not modify agents/openai.yaml. Review only the repository code.\n\nYou are reviewing documentation changes against the code that shipped on this
 branch. Review the supplied release diff (git diff <diff-base> HEAD) and the current updated working-tree docs
 (the files this release touched, plus any docs whose claims the diff affects). Find: doc
 claims that no longer match the code, new public surface (commands, flags, config keys,
@@ -293,9 +328,9 @@ numbers, and CHANGELOG entries that over- or under-sell what shipped. Be terse. 
 
 THE DOCS AND DIFF: <include current contents of each touched document, with its path, plus affected source context; the parent appends the release diff below>"
 
-**If `CODEX_MODE: ready` — run Codex:**
+**If `CODEX_MODE: ready` (or `unverified`) — run Codex:**
 
-Use Write to save the **complete prompt and context** in a private file. Replace `<prepared-prompt-file>` below with its shell-quoted path; never interpolate user text into shell source. Include actual plan/spec/source content. Request a final Recommendation: <action> because <specific reason> line, including an explicit no-findings rationale. A refusal is never completion.
+Write the **complete prompt and context**, including actual plan/spec/source, to a private file. Substitute its shell-quoted path for `<prepared-prompt-file>`; never interpolate user text into shell source. Request a severity (Critical, High, Medium or Low) per finding and a final Recommendation: <action> because <specific reason> line, including an explicit no-findings rationale.
 
 ```bash
 # GSTACK_ACTIVE_HOST names the harness, never the model.
@@ -315,23 +350,28 @@ trap 'rm -rf "$_OUTSIDE_TMP"' EXIT
 _OUTSIDE_INPUT="$_OUTSIDE_TMP/prompt"
 cat -- '<prepared-prompt-file>' >"$_OUTSIDE_INPUT" || exit 1
 
-source "$HOME/.claude/skills/gstack/bin/gstack-codex-probe" || exit 1
-_gstack_codex_timeout_wrapper 300 codex exec "$(cat "$_OUTSIDE_INPUT")" -C "$_REPO_ROOT" -s read-only -c "model=\"${GSTACK_CODEX_MODEL:-gpt-6-astra}\"" -c 'model_reasoning_effort="high"' -c 'web_search="cached"' < /dev/null >"$_OUTSIDE_TMP/text" 2>"$_OUTSIDE_TMP/stderr"
-_OUTSIDE_EXIT=$?
-# Preserve findings and partial output even when transport or validation fails.
-cat "$_OUTSIDE_TMP/text"
+_CODEX_PROBE="$HOME/.claude/skills/gstack/bin/gstack-codex-probe"
+_CODEX_OUT=$("$_CODEX_PROBE" select-model exec) || exit 1
+_CODEX_SEL=$(echo "$_CODEX_OUT" | sed -n 's/^CODEX_SEL: //p')
+_CODEX_SANDBOX_MODE=$(echo "$_CODEX_OUT" | sed -n 's/^CODEX_SANDBOX: //p')
+"$_CODEX_PROBE" check-sandbox || exit 1
+"$_CODEX_PROBE" show-first-use-notice
+_OUTSIDE_EXIT=0
+"$_CODEX_PROBE" run-with-timeout --effort high 300 codex exec - -C "$_REPO_ROOT" -s "${_CODEX_SANDBOX_MODE:?}" -c "model=\"${_CODEX_SEL:?}\"" -c skills.include_instructions=false -c 'web_search="cached"' --json -o "$_OUTSIDE_TMP/text" <"$_OUTSIDE_INPUT" >"$_OUTSIDE_TMP/events" 2>"$_OUTSIDE_TMP/stderr" || _OUTSIDE_EXIT=$?
+cat "$_OUTSIDE_TMP/text" 2>/dev/null || tail -n 20 "$_OUTSIDE_TMP/events"
 
-cat "$_OUTSIDE_TMP/stderr" >&2
-if [ "$_OUTSIDE_EXIT" -ne 0 ]; then
-  echo 'Codex outside review unavailable: execution failed; missing coverage. Check the provider diagnosis above.' >&2
-  exit "$_OUTSIDE_EXIT"
-fi
-bun "$HOME/.claude/skills/gstack/lib/outside-review-result.ts" review "$_OUTSIDE_TMP/text" || exit 1
-
+cat "$_OUTSIDE_TMP/stderr" >&2 || { [ "$_OUTSIDE_EXIT" -ne 0 ] || _OUTSIDE_EXIT=1; }
+_OUTSIDE_RC=0
+bun --no-env-file --config=/dev/null "$HOME/.claude/skills/gstack/lib/outside-review-result.ts" --label 'Codex outside review' --exit "$_OUTSIDE_EXIT" --stderr "$_OUTSIDE_TMP/stderr" --events "$_OUTSIDE_TMP/events" review "$_OUTSIDE_TMP/text" || _OUTSIDE_RC=$?
+case "$_OUTSIDE_RC" in
+  0|3) ;;
+  4) echo 'OUTSIDE_STATUS: unverified provider=codex host=claude'; exit 4 ;;
+  *) [ "$_OUTSIDE_EXIT" -ne 0 ] && exit "$_OUTSIDE_EXIT"; exit 1 ;;
+esac
 echo 'OUTSIDE_STATUS: completed provider=codex host=claude'
 ```
 
-Show the full response in a `tool-output` fence. Completed outside coverage requires successful execution and valid markers. Refusal, empty/malformed output, missing score/severity/completion markers, timeout, or CLI failure means `outside_status: unavailable`. Follow this caller's fallback; missing coverage is never clean/PASS. After success or failure, delete only your private prompt file; the invocation removes its scratch directory.
+Use Bash `timeout: 360000`; show the full response in a `tool-output` fence. Require successful execution and valid markers. Refusal, empty/malformed output, missing score/severity/completion markers, timeout or CLI failure means `outside_status: unavailable`. P0/P1 findings block like native ones; `OUTSIDE_STATUS: unverified` is missing coverage. Use the caller's fallback; missing coverage is never clean/PASS. After either outcome, delete only your private prompt; scratch cleanup is automatic.
 
 Present the full output verbatim under `CODEX SAYS (documentation review):`.
 
@@ -348,10 +388,10 @@ On `CODEX_MODE: under_codex`, report the setup repair and
 `outside_status: unavailable`, run no outside CLI, and use the native subagent below.
 A native result never supplies outside coverage.
 
-Dispatch via the Agent tool with the same prompt, passing `run_in_background: false` (subagents default to background since Claude Code v2.1.198). Bound it at a 5-minute timeout; if it never completes, treat the review as unavailable and continue.
+Dispatch via the Agent tool with the same prompt, passing `run_in_background: false` when available (subagents default to background since Claude Code v2.1.198). A launch receipt means it went background: await its completion notice. Bound it at a 5-minute timeout; if it never completes, treat the review as unavailable and continue.
 Present findings under `DOCUMENTATION REVIEW (Claude subagent):`. If it fails: "Doc review unavailable. Continuing to Step 9." Skip the apply gate, persist `status: unavailable`, `outside_status: unavailable`, and `source: none` below, then continue; unavailable is not a clean review.
 
-**Apply decision (T3B — informational, never auto-edit, but findings don't evaporate).**
+**Apply decision (informational, never auto-edit, but findings don't evaporate).**
 If at least one reviewer completed and there are zero findings, say "Docs match what shipped — no gaps." and state which reviewer supplied that coverage. If neither completed, report "Doc review unavailable", skip the apply question, and persist unavailability below before Step 9. Otherwise
 present the findings, then use AskUserQuestion ONCE:
 
@@ -372,7 +412,7 @@ rewrites docs), respecting the skill's CHANGELOG and VERSION restrictions. Step 
 ```bash
 ~/.claude/skills/gstack/bin/gstack-review-log '{"skill":"codex-doc-review","timestamp":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","status":"STATUS","source":"SOURCE","host":"claude","outside_provider":"codex","outside_status":"OUTSIDE_STATUS","phase":"documentation","commit":"'"$(git rev-parse --short HEAD)"'"}'
 ```
-Substitute: STATUS = "clean" only if a reviewer completed and found no gaps; "issues_found" if gaps exist, or "unavailable" if neither reviewer completed. For this phase (documentation), retain the historical review-log skill identifier. Add `"host":"claude","outside_provider":"codex","outside_status":"completed|unavailable|disabled|skipped","phase":"documentation"`. Record each attempted pass separately when outcomes differ. Use `source:"codex"` only for completed external CLI output, and `source:"in-host"` for a native pass. Historical `source:"claude"` continues to mean a native Claude subagent. CLI availability or a native fallback does not count as outside completion. Preserve reported modelUsage, including multiple models; unknown model identity stays unknown.
+Substitute: STATUS = "clean" only if a reviewer completed and found no gaps; "issues_found" if gaps exist, or "unavailable" if neither reviewer completed. Retain the historical review-log skill ID; add `"host":"claude","outside_provider":"codex","outside_status":"completed|unavailable|disabled|skipped","phase":"documentation"`. Record differing attempt outcomes separately. `source:"codex"` requires completed CLI output; native uses `source:"in-host"` (historical `source:"claude"`: native Claude). Availability/native fallback is not outside completion. Preserve all reported modelUsage; unknown model identity stays unknown. Under `GSTACK_CODEX_NO_SANDBOX=1` add `"codex_sandbox":"danger-full-access"`.
 
 Continue to Step 9 to commit and publish the approved documentation edits.
 
@@ -395,7 +435,7 @@ modified by this run (including approved VERSION/manifest updates), skip commit/
 git commit -m "$(cat <<'EOF'
 docs: update project documentation for vX.Y.Z.W
 
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+Co-Authored-By: Claude <noreply@anthropic.com>
 EOF
 )"
 ```
@@ -417,7 +457,7 @@ near the write-back.
 1. Create a private run directory, then replace **every** `<run-dir>` below with its printed absolute path. This literal path survives separate shell calls; do not substitute `$$`.
 
 ```bash
-mktemp -d /tmp/gstack-doc-release-XXXXXXXX
+mktemp -d "${TMPDIR:-/tmp}/gstack-doc-release-XXXXXXXX"
 ```
 
 Fetch the existing PR/MR body using the platform from the shared Step 0. If no PR/MR exists, skip body/title updates and continue to the summary.
@@ -536,13 +576,14 @@ rmdir "<run-dir>"
 
 **PR/MR title sync (idempotent, always-on):**
 
-PR titles must always start with `v<VERSION>` — same rule as `/ship`. If Step 8 bumped VERSION after `/ship` had already created the PR, the title is now stale. This sub-step fixes it.
+PR titles must start with `v<VERSION>` whenever the project has a version source — same rule as `/ship`. If Step 8 bumped VERSION after `/ship` had already created the PR, the title is now stale. This sub-step fixes it.
 
-Run this entire block in one shell, substituting `github` or `gitlab` for `<platform>` from Step 0. No variables cross tool calls. Missing VERSION or PR/MR skips title sync; an update failure warns and continues.
+Run this entire block in one shell, substituting `github` or `gitlab` for `<platform>` from Step 0 and the base branch for `<base>`. No variables cross tool calls. No version source (NO_VERSION) or no PR/MR skips title sync; an update failure warns and continues.
 
 ```bash
-V=$(cat VERSION 2>/dev/null | tr -d '[:space:]')
-[ -n "$V" ] || exit 0
+VB=$(bun --no-env-file --config=/dev/null run ~/.claude/skills/gstack/bin/gstack-version-bump classify --base "<base>") || { echo "Title sync: not run (the version source is broken; see the error above)."; exit 0; }
+V=$(echo "$VB" | jq -r '.currentVersion // empty')
+[ -n "$V" ] || { echo "Title sync: not applicable (no version source is configured)."; exit 0; }
 case "<platform>" in
   github) CURRENT_TITLE=$(gh pr view --json title -q .title 2>/dev/null || true) ;;
   gitlab) CURRENT_TITLE=$(glab mr view -F json 2>/dev/null | jq -r '.title // empty') ;;

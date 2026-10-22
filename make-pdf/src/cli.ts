@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * make-pdf CLI — argv parse, dispatch, exit.
  *
@@ -7,7 +7,7 @@
  *   stderr: progress spinner per stage, final "Done in Xs. N pages."
  *   --quiet: suppress progress. Errors still print.
  *   --verbose: per-stage timings.
- *   exit 0 success / 1 bad args / 2 render error / 3 Paged.js timeout / 4 no browser
+ *   exit 0 success / 1 bad args / 2 render error / 3 TOC page numbers failed / 4 no browser
  *   (Aside not running AND gstack's own browser not built).
  */
 
@@ -40,6 +40,8 @@ export function parseArgs(argv: string[]): ParsedArgs {
     printUsage();
     process.exit(ExitCode.Success);
   }
+  // setup's and gstack-doctor's launch probe (#2595): the version command needs no browser.
+  if (args[0] === "--version") return { command: "version", positional: [], flags: {} };
 
   // First non-flag arg is the command.
   let command = "";
@@ -89,7 +91,7 @@ function printUsage(): void {
   lines.push("");
   lines.push("Document structure:");
   lines.push("  --cover                   Add a cover page.");
-  lines.push("  --toc                     Generate clickable table of contents.");
+  lines.push("  --toc                     Generate clickable table of contents with page numbers.");
   lines.push("  --no-chapter-breaks       Don't start a new page at every H1.");
   lines.push("");
   lines.push("Branding:");
@@ -274,9 +276,9 @@ async function main(): Promise<void> {
       console.error(`$P: file not found: ${err.path ?? err.message}`);
       process.exit(ExitCode.BadArgs);
     }
-    if (err?.name === "PagedJsTimeout") {
-      console.error(`$P: ${err.message}`);
-      process.exit(ExitCode.PagedJsTimeout);
+    if (err?.name === "TocPaginationError") {
+      console.error(`$P: --toc: ${err.message}`);
+      process.exit(ExitCode.TocPagination);
     }
     console.error(`$P: ${err?.message ?? String(err)}`);
     if (parsed.flags.verbose && err?.stack) {

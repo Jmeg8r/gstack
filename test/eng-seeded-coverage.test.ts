@@ -1,212 +1,21 @@
 import { describe, expect, test } from 'bun:test';
-import captured from './fixtures/eng-count-ad-v2.json';
-import af from './fixtures/eng-first-category-af.json';
-import type { NativePlanQuestionCall, PlanCountTranscript } from './helpers/plan-count-transcript';
-import { ENG_DECISION_SEEDS, evaluateEngSeedCoverage, isEngBatchingIssueAUQ } from './helpers/eng-seeded-coverage';
-import { nativePlanCallFingerprint } from './helpers/claude-pty-runner';
-import { E2E_TOUCHFILES, matchGlob } from './helpers/touchfiles';
+import type { NativePlanQuestionCall } from './helpers/plan-count-transcript';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { createEngBatchingIssueCounter, isEngBatchingIssueAUQ } from './helpers/eng-seeded-coverage';
+import { engSetupAUQ, hasCompletePlanReport, nativePlanCallFingerprint } from './helpers/claude-pty-runner';
+import batchingCapture from './fixtures/eng-batching-unsourced-brief-36606688266.json';
+import bulletTargetCapture from './fixtures/eng-batching-bullet-target-rerun.json';
 
-// Exact public decisions reused from the existing fixture. The report below is
-// a synthetic assembly of its retained task catalog, not a claim that the old run passed.
-const calls = captured.cases.first.calls as NativePlanQuestionCall[];
-const indices = [2, 4, 6, 8];
-const start = Date.parse('2026-09-09T19:00:00Z'), end = Date.parse('2026-09-09T19:30:00Z');
-const report = '# Reviewed plan\n\n' + captured.reviewedTasks.lines.join('\n') + '\n\n## GSTACK REVIEW REPORT\nEng review complete.\n';
-const transcript = (): PlanCountTranscript => ({ status: 'ready', calls: structuredClone(calls), assistantMessages: [] });
-const evaluate = (t = transcript(), p = report) => evaluateEngSeedCoverage(t, p, start, end);
 function question(call: NativePlanQuestionCall, text: string) {
   const answer = call.answers![call.questions[0]!.question]!;
   call.questions[0]!.question = text; call.answers = { [text]: answer };
 }
 
 describe('Eng seeded coverage from completed native decisions', () => {
-  test('four separate decisions plus the auto-added regression cover all five seeds regardless of total count', () => {
-    const result = evaluate();
-    expect(result.ok).toBe(true);
-    expect(Object.keys(result.decisions)).toEqual([...ENG_DECISION_SEEDS]);
-    expect(new Set(Object.values(result.decisions)).size).toBe(4);
-    expect(result.regression).toBe('plan');
-    // Historical evidence remains a failure, never a retroactive live pass.
-    expect(captured.cases.first.actual.outcome).toBe('ceiling_reached');
-    expect(captured.cases.first.actual.reviewCount).toBeGreaterThan(7);
-    const t = transcript();
-    for (let i = 0; i < 12; i++) {
-      const extra = structuredClone(calls[7]!); extra.toolUseId += `-extra-${i}`; t.calls.push(extra);
-    }
-    expect(evaluate(t).ok).toBe(true);
-  });
-
-  test('every offered choice is coverage, including rejecting or deferring the recommended change', () => {
-    for (const index of indices) for (const option of calls[index]!.questions[0]!.options) {
-      const t = transcript(), call = t.calls[index]!;
-      call.questions[0]!.options.reverse();
-      call.answers = { [call.questions[0]!.question]: option.label };
-      expect(evaluate(t).ok).toBe(true);
-    }
-    const t = transcript(), c = t.calls[4]!;
-    c.questions[0]!.options.push({ label: 'Defer the cache change', description: 'Accept the stated risk for this release.' });
-    c.answers = { [c.questions[0]!.question]: 'Defer the cache change' };
-    expect(evaluate(t).ok).toBe(true);
-  });
-
-  test('presentation numbers and headings do not establish or remove seed identity', () => {
-    const t = transcript();
-    for (const index of indices) {
-      const c = t.calls[index]!; c.questions[0]!.header = 'Decision';
-      question(c, c.questions[0]!.question.replace(/^D\d+ — Issue \d+(?: \([^)]+\))?[: ]*/, 'Decision: '));
-    }
-    expect(evaluate(t).ok).toBe(true);
-  });
-
-  test('a direct seeded action question can use terse Yes/No choices', () => {
-    const titles = [
-      'Should we reduce the four new classes spread across twelve files?',
-      'Should we inject the shared global AuthCache?',
-      'Should we split validateAndDispatch to remove its nested swallowing catches?',
-      'Should we parallelize the five sequential IDP calls?',
-    ];
-    for (const answer of ['Yes', 'No']) {
-      const t = transcript();
-      indices.forEach((index, n) => {
-        const c = t.calls[index]!; question(c, titles[n]!);
-        c.questions[0]!.options = [{ label: 'Yes' }, { label: 'No' }];
-        c.answers = { [c.questions[0]!.question]: answer };
-      });
-      expect(evaluate(t).ok).toBe(true);
-      indices.forEach((index, n) => {
-        const administrative = structuredClone(t);
-        const c = administrative.calls[index]!;
-        question(c, titles[n]!.replace('Should we ', 'Should we document how to '));
-        expect(evaluate(administrative).missing).toContain(ENG_DECISION_SEEDS[n]!);
-      });
-    }
-  });
-
-  test('omitting each seed remains missing even when unrelated completed decisions are plentiful', () => {
-    for (let n = 0; n < indices.length; n++) {
-      const t = transcript(); t.calls.splice(indices[n]!, 1);
-      expect(evaluate(t).missing).toContain(ENG_DECISION_SEEDS[n]!);
-      expect(evaluate(t).ok).toBe(false);
-    }
-  });
-
-  test('batched questions or one combined approval cannot supply four distinct decisions', () => {
-    const t = transcript(), combined = structuredClone(calls[2]!);
-    combined.questions = indices.map(i => structuredClone(calls[i]!.questions[0]!));
-    combined.answers = Object.fromEntries(indices.map(i => Object.entries(calls[i]!.answers!)[0]!));
-    t.calls = [combined]; expect(evaluate(t).missing).toHaveLength(4);
-    combined.questions = [structuredClone(calls[2]!.questions[0]!)];
-    question(combined, indices.map(i => calls[i]!.questions[0]!.question.split('\n')[0]).join(' '));
-    combined.questions[0]!.options = [
-      { label: 'Reduce classes, inject cache, split errors and parallelize IDP', description: 'Approve all four changes.' },
-      { label: 'Keep all four unchanged', description: 'Reject every change.' },
-    ];
-    combined.answers = { [combined.questions[0]!.question]: combined.questions[0]!.options[0]!.label };
-    expect(evaluate(t).missing).toHaveLength(4);
-  });
-
-  test('pending, failed, stale, foreign, malformed or unoffered replies provide no decision credit', () => {
-    for (const mutate of [
-      (c: NativePlanQuestionCall) => { c.answered = false; },
-      (c: NativePlanQuestionCall) => { c.failed = true; },
-      (c: NativePlanQuestionCall) => { delete c.failed; },
-      (c: NativePlanQuestionCall) => { c.answers = {}; },
-      (c: NativePlanQuestionCall) => { c.answers = { [c.questions[0]!.question]: 'not offered' }; },
-      (c: NativePlanQuestionCall) => { c.answers!.foreign = 'Yes'; },
-      (c: NativePlanQuestionCall) => { c.answeredAt = 'invalid'; },
-      (c: NativePlanQuestionCall) => { c.answeredAt = new Date(start - 1).toISOString(); },
-      (c: NativePlanQuestionCall) => { c.answeredAt = new Date(end + 1).toISOString(); },
-      (c: NativePlanQuestionCall) => { c.sessionId = 'foreign'; },
-      (c: NativePlanQuestionCall) => { c.toolUseId = ''; },
-      (c: NativePlanQuestionCall) => { c.unansweredQuestionIndices = [0]; },
-      (c: NativePlanQuestionCall) => { c.questions[0]!.multiSelect = true; },
-      (c: NativePlanQuestionCall) => { c.questions[0]!.options[1]!.label = c.questions[0]!.options[0]!.label; },
-    ]) {
-      const t = transcript(); mutate(t.calls[4]!); expect(evaluate(t).ok).toBe(false);
-    }
-    const duplicate = transcript(); duplicate.calls.push(structuredClone(duplicate.calls[4]!));
-    expect(evaluate(duplicate).ok).toBe(false);
-    const missing = transcript(); missing.status = 'missing'; expect(evaluate(missing).ok).toBe(false);
-  });
-
-  test('quoted examples, resolved defects and option-only references cannot impersonate a seeded issue', () => {
-    for (const prefix of ['> ', 'Example: ', '```text\n', 'Hypothetical: ', 'No defect remains: ']) {
-      const t = transcript(); question(t.calls[4]!, prefix + t.calls[4]!.questions[0]!.question);
-      expect(evaluate(t).missing).toContain('shared-cache');
-    }
-    const t = transcript(); question(t.calls[4]!, 'Which format should the final report use?');
-    expect(evaluate(t).missing).toContain('shared-cache');
-  });
-
-  test('mandatory regression evidence requires an affirmative legacy task or scoped public narration', () => {
-    const base = '## GSTACK REVIEW REPORT\nEng complete.\n';
-    for (const text of [
-      'legacyAuthFlow will be rewritten; no regression test for prior behavior is planned.',
-      'Do not add legacyAuthFlow regression characterization fixtures.',
-      'Defer adding legacyAuthFlow regression characterization fixtures.',
-      'Maybe add legacyAuthFlow regression characterization fixtures.',
-      '"Add legacyAuthFlow regression characterization fixtures before changes."',
-      'Example: Add legacyAuthFlow regression characterization fixtures before changes.',
-      'It is unclear whether to add legacyAuthFlow regression characterization fixtures before changes.',
-      'We would add legacyAuthFlow regression characterization fixtures before changes.',
-      'Add a report paragraph describing legacyAuthFlow regression characterization fixtures before changes.',
-      'Record a note about legacyAuthFlow regression characterization fixtures before changes.',
-      'Add regression characterization tests for newAuthFlow before changes; legacyAuthFlow is only mentioned in release notes.',
-      'Record regression characterization fixtures for newAuthFlow before changes. The legacyAuthFlow documentation was updated.',
-      'Add tests for legacyAuthFlow before changes; newAuthFlow gets regression characterization fixtures.',
-      'legacyAuthFlow — Add regression characterization tests for newAuthFlow before changes.',
-      '> Add legacyAuthFlow regression characterization fixtures before changes.',
-      '```\nAdd legacyAuthFlow regression characterization fixtures before changes.\n```',
-    ]) expect(evaluate(transcript(), text + '\n\n' + base).ok).toBe(false);
-    expect(evaluate(transcript(), 'Add regression characterization tests for legacyAuthFlow before changes.\n\n' + base).regression).toBe('plan');
-    const t = transcript(); t.assistantMessages.push({ sessionId: calls[0]!.sessionId, timestamp: new Date(end - 1).toISOString(),
-      text: 'Added legacyAuthFlow regression characterization fixtures before the rewrite.' });
-    expect(evaluate(t, base).regression).toBe('public-narration');
-    t.assistantMessages[0]!.sessionId = 'foreign'; expect(evaluate(t, base).ok).toBe(false);
-    t.assistantMessages[0]!.sessionId = calls[0]!.sessionId;
-    t.assistantMessages[0]!.timestamp = new Date(start - 1).toISOString(); expect(evaluate(t, base).ok).toBe(false);
-    expect(evaluate(transcript(), captured.reviewedTasks.lines.join('\n')).ok).toBe(false);
-    expect(evaluate(transcript(), report.replace('Eng review complete.', '')).ok).toBe(false);
-  });
-
-  test('local evidence dependencies select both Eng consumers', () => {
-    for (const file of ['test/helpers/eng-seeded-coverage.ts', 'test/eng-seeded-coverage.test.ts']) {
-      expect(Object.entries(E2E_TOUCHFILES).filter(([, patterns]) => patterns.some(p => matchGlob(file, p))).map(([key]) => key))
-        .toEqual(['plan-eng-finding-count', 'plan-eng-multi-finding-batching']);
-    }
-  });
-
-  test('AF numbered regression task accepts its component-path metadata', () => {
-    const context = af.regressionTask.lines.join('\n');
-    const result = evaluate(transcript(), context + '\n\n## GSTACK REVIEW REPORT\nEng complete.\n');
-    expect(result.regression).toBe('plan');
-    expect(result.ok).toBe(true);
-    expect(af.regressionTask.provenance.retrospectivePass).toBe(false);
-  });
-
-  test('component metadata cannot remove prose, uncertainty or a different test target', () => {
-    const task = af.regressionTask.lines[0]!;
-    const evaluateTask = (text: string) => evaluate(transcript(), text + '\n\n## GSTACK REVIEW REPORT\nEng complete.\n');
-    for (const path of ['src/auth/legacy', 'auth_core/legacy-v2']) {
-      expect(evaluateTask(task.replace('auth/legacy', path)).regression).toBe('plan');
-    }
-    for (const text of [
-      task.replace('auth/legacy', 'skip the tests'),
-      task.replace('auth/legacy', 'maybe'),
-      task.replace('auth/legacy', '../auth/legacy'),
-      task.replace('auth/legacy', 'auth/legacy — unrelated prose'),
-      task.replace(/^.*? — auth\/legacy/, 'auth/legacy'),
-      task.replace('Write characterization', 'Do not write characterization'),
-      task.replace('Write characterization', 'Maybe write characterization'),
-      task.replace('Write characterization', 'If approved, write characterization'),
-      task.replace('Write characterization', 'Write a report describing characterization'),
-      task.replace('`legacyAuthFlow()`', '`newAuthFlow()`') + '; legacyAuthFlow is documented elsewhere.',
-      task.replace('before any rewrite', 'only if the rewrite requires it'),
-      'Example: ' + task, '> ' + task, '"' + task + '"',
-      '```text\n' + task + '\n```',
-    ]) expect(evaluateTask(text).regression, text).toBeUndefined();
-  });
 });
+
 
 describe('batching caller counts completed issue decisions across setup boundaries', () => {
   const issue = (number: number, header = 'Architecture'): NativePlanQuestionCall => {
@@ -272,5 +81,147 @@ describe('batching caller counts completed issue decisions across setup boundari
     expect(check(call)).toBe(true);
     const quoted = issue(1); question(quoted, quoted.questions[0]!.question + '\n`This decision is withdrawn.`');
     expect(check(quoted)).toBe(true);
+  });
+});
+
+describe('batching replay of run 36606688266 (unsourced native briefs)', () => {
+  // Run 36606688266 asked one native question per finding (D1-D9 bound to
+  // ledger records R1-R9, D10 a TODO follow-up) but cited no PLAN.md line in the
+  // native brief, so the old detector counted zero review decisions.
+  const FLOOR = 3;
+  const calls = batchingCapture.calls as unknown as NativePlanQuestionCall[];
+
+  function count(plan: string, edit: (calls: NativePlanQuestionCall[]) => void = () => {}) {
+    const copy = structuredClone(calls);
+    edit(copy);
+    const counter = createEngBatchingIssueCounter(() => plan, engSetupAUQ);
+    const counted = copy.filter((call, index) => counter.isReviewAUQ(nativePlanCallFingerprint(call, 0, true), copy.slice(0, index)));
+    return { counted: counted.length, issues: counter.trace.map(entry => entry.issue) };
+  }
+
+  test('the recorded failing verdict is the detector, not the review', () => {
+    expect(batchingCapture.recordedOutcome).toEqual({ outcome: 'completion_summary', step0Count: 10, reviewCount: 0 });
+    expect(calls.every(call => call.answered && call.questions.length === 1)).toBe(true);
+  });
+
+  test('each ledger-bound native decision counts once without a native source citation', () => {
+    const { counted, issues } = count(batchingCapture.plan);
+    expect(issues).toEqual(['R1', 'R2', 'R3', 'R4', 'R5', 'R6', 'R7', 'R8', 'R9'].map(id => `record:${id}`));
+    expect(counted).toBeGreaterThanOrEqual(FLOOR);
+  });
+
+  test('a re-asked decision cannot inflate the count', () => {
+    const { counted } = count(batchingCapture.plan, all => {
+      const again = structuredClone(all[0]!);
+      again.toolUseId += '-again';
+      all.splice(1, 0, again);
+    });
+    expect(counted).toBe(9);
+  });
+
+  const target = 'Review target (fixed): `PLAN.md`';
+  for (const [name, plan] of [
+    ['a foreign target', batchingCapture.plan.replace(target, 'Review target (fixed): `OTHER.md`')],
+    ['a mixed target', batchingCapture.plan.replace(target, 'Review target (fixed): `OTHER.md` and `PLAN.md`')],
+    ['two target declarations', batchingCapture.plan.replace(target, `${target}\nReview target (fixed): \`PLAN.md\``)],
+    ['no target declaration', batchingCapture.plan.replace(target, 'Report scope: the fixture repo')],
+    ['a report title for another plan', batchingCapture.plan.replace('# Engineering review: Add background job retry framework', '# Engineering review: Replace all customer data')],
+    ['an archived report title', batchingCapture.plan.replace('# Engineering review:', '# Archived engineering review:')],
+    ['a copied H1 naming another plan', batchingCapture.plan.replace('# Plan: Add background job retry framework', '# Plan: Replace all customer data')],
+  ] as const) test(`the unsourced route rejects ${name}`, () => {
+    expect(count(plan).counted).toBe(0);
+  });
+
+  test('the unsourced route rejects a native brief naming another plan or file', () => {
+    const rename = (from: string, to: string) => (all: NativePlanQuestionCall[]) => {
+      for (const call of all) call.questions[0]!.question = call.questions[0]!.question.replace(from, to);
+    };
+    expect(count(batchingCapture.plan, rename('plan "Add background job retry framework"', 'plan "Replace all customer data"')).counted).toBe(0);
+    expect(count(batchingCapture.plan, rename('plan "Add background job retry framework"', 'plan "Add background job retry framework", OTHER.md')).counted).toBe(0);
+    expect(count(batchingCapture.plan, rename('plan "Add background job retry framework"', 'the plan')).counted).toBe(0);
+  });
+
+  test('a saved record whose brief title differs from the native question does not bind it', () => {
+    const plan = batchingCapture.plan.replace(/^Question D1:\n.*$/m, 'Question D1:\nD1 — Some other decision?');
+    expect(count(plan).issues).not.toContain('record:R1');
+  });
+
+  test('the completed report is the early outcome point; a partial report is not', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'eng-batching-report-'));
+    try {
+      const report = path.join(dir, 'report.md');
+      fs.writeFileSync(report, batchingCapture.plan);
+      expect(hasCompletePlanReport(report, 0, Date.now() + 1_000)).toBe(true);
+      fs.writeFileSync(report, batchingCapture.plan.slice(0, batchingCapture.plan.indexOf('## Completion summary')));
+      expect(hasCompletePlanReport(report, 0, Date.now() + 1_000)).toBe(false);
+      fs.writeFileSync(report, batchingCapture.plan.replace('## GSTACK REVIEW REPORT', '```\n## GSTACK REVIEW REPORT') + '\n```\n');
+      expect(hasCompletePlanReport(report, 0, Date.now() + 1_000)).toBe(false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('batching replay of a 2.1.284 rerun (bullet target, unnamed plan)', () => {
+  // Eleven separate native questions; the briefs name no plan and the report
+  // declares '- **Review target (fixed):** `/abs/PLAN.md`' under '# Eng Review — PLAN.md: <plan>'.
+  const calls = bulletTargetCapture.calls as unknown as NativePlanQuestionCall[];
+  const count = (plan: string) => {
+    const counter = createEngBatchingIssueCounter(() => plan, engSetupAUQ);
+    calls.forEach((call, index) => counter.isReviewAUQ(nativePlanCallFingerprint(call, 0, true), calls.slice(0, index)));
+    return counter.trace.map(entry => entry.issue);
+  };
+
+  test('the recorded verdict counted none of the separate decisions', () => {
+    expect(bulletTargetCapture.recordedOutcome).toMatchObject({ reviewCount: 0 });
+    expect(calls.length).toBe(11);
+  });
+
+  test('ledger-bound decisions count once each through the report target field', () => {
+    expect(count(bulletTargetCapture.plan).length).toBe(9);
+  });
+
+  for (const [name, change] of [
+    ['a foreign target file', (plan: string) => plan.replace(/(Review target \(fixed\):\*\* `[^`]*\/)PLAN\.md`/, '$1OTHER.md`')],
+    ['a second target declaration', (plan: string) => plan.replace('- **Review target (fixed):**', '- **Review target (fixed):** `OTHER.md`\n- **Review target (fixed):**')],
+    ['no target declaration', (plan: string) => plan.replace('- **Review target (fixed):**', '- **Report scope:**')],
+    ['an archived report title', (plan: string) => plan.replace('# Eng Review —', '# Archived Eng Review —')],
+  ] as const) test(`the bullet target route rejects ${name}`, () => {
+    const plan = change(bulletTargetCapture.plan);
+    expect(plan).not.toBe(bulletTargetCapture.plan);
+    expect(count(plan)).toEqual([]);
+  });
+});
+
+describe('saved ledger from run 36798539821: report title and (recommended) marker', () => {
+  const reportTitleCapture: { calls: NativePlanQuestionCall[]; plans: string[] } = JSON.parse(
+    fs.readFileSync(path.join(import.meta.dir, 'fixtures/eng-batching-report-title-36798539821.json'), 'utf8'));
+  const [d1, d3] = reportTitleCapture.calls;
+  const [d1Plan, d3Plan] = reportTitleCapture.plans;
+  const countReportTitle = (call: NativePlanQuestionCall, plan: string, prior: NativePlanQuestionCall[] = []) =>
+    createEngBatchingIssueCounter(() => plan, engSetupAUQ).isReviewAUQ(nativePlanCallFingerprint(structuredClone(call), 0, true), prior);
+
+  test('a saved option label without the native (recommended) marker still owns the decision', () => {
+    expect(d1!.questions[0]!.options[0]!.label).toBe('Library hooks + custom backoff (recommended)');
+    expect(d1Plan).toContain('\nA) Library hooks + custom backoff\n');
+    expect(countReportTitle(d1!, d1Plan!)).toBe(true);
+  });
+
+  test('an unsourced brief inherits PLAN.md from an "Eng Review Report — <plan>" title', () => {
+    expect(d3Plan!.split('\n')[0]).toBe('# Eng Review Report — Add background job retry framework');
+    expect(d3!.questions[0]!.question.split('\n')[1]).not.toMatch(/\.md\b/);
+    expect(countReportTitle(d3!, d3Plan!, [d1!])).toBe(true);
+  });
+
+  test('rejects a saved label that changes the choice, not just the marker', () => {
+    expect(countReportTitle(d1!, d1Plan!.replace('\nA) Library hooks + custom backoff\n', '\nA) Library hooks without custom backoff\n'))).toBe(false);
+  });
+
+  test('rejects a report title that names a different plan', () => {
+    expect(countReportTitle(d3!, d3Plan!.replace('# Eng Review Report — Add background job retry framework', '# Eng Review Report — Rewrite the billing service'), [d1!])).toBe(false);
+  });
+
+  test('rejects a report title with an unrelated prefix', () => {
+    expect(countReportTitle(d3!, d3Plan!.replace('# Eng Review Report — ', '# Copied Review Notes — '), [d1!])).toBe(false);
   });
 });

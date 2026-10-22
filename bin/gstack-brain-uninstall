@@ -27,6 +27,7 @@
 #   .brain-skip.txt            — user-maintained skip list
 #   .brain-sync.lock.d/        — lock dir (if present)
 #   .brain-sync-status.json    — health status
+#   .brain-case-check          — cached case-collision verdict for HEAD
 #   consumers.json             — consumer/reader registry
 #
 # What it clears (via gstack-config):
@@ -41,7 +42,9 @@
 
 set -euo pipefail
 
-GSTACK_HOME="${GSTACK_HOME:-$HOME/.gstack}"
+. "$(dirname "$0")/gstack-state-root.sh" 2>/dev/null || { echo "$0: cannot resolve the gstack state root: $(dirname "$0")/gstack-state-root.sh is missing. fix: reinstall with ./setup or /gstack-upgrade (docs/state-root.md)" >&2; exit 1; }
+gstack_state_root_select
+GSTACK_HOME="$_gstack_sr_root"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONFIG_BIN="$SCRIPT_DIR/gstack-config"
 # v1.27.0.0+ canonical name; brain-remote is the legacy fallback during migration.
@@ -129,6 +132,7 @@ rm -f "$GSTACK_HOME/.brain-last-pull" 2>/dev/null || true
 rm -f "$GSTACK_HOME/.brain-worktree-last-advance" 2>/dev/null || true
 rm -f "$GSTACK_HOME/.brain-skip.txt" 2>/dev/null || true
 rm -f "$GSTACK_HOME/.brain-sync-status.json" 2>/dev/null || true
+rm -f "$GSTACK_HOME/.brain-case-check" 2>/dev/null || true
 rm -rf "$GSTACK_HOME/.brain-sync.lock.d" 2>/dev/null || true
 
 # ---- unregister gbrain federated source + remove worktree (best-effort) ----

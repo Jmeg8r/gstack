@@ -51,6 +51,8 @@ function run(args: string[], extra: Record<string, string> = {}) {
   const r = spawnSync('bash', [BIN, ...args], { env: { ...env, ...extra }, encoding: 'utf8', timeout: 30_000 });
   return { status: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
 }
+/** 5 tries x 0.1 s: the give-up path without the production 5 s wait (pinned in the source-pins test). */
+const QUICK_GIVE_UP = { GSTACK_MEMORABLE_LOCK_TRIES: '5' };
 const readSettings = (): any => JSON.parse(fs.readFileSync(settings, 'utf8'));
 const gate = () => spawnSync('bash', [CONFIG, 'get', 'memorable_recall'], { env, encoding: 'utf8', timeout: 20_000 }).stdout.trim();
 const setGate = (v: string) => spawnSync('bash', [CONFIG, 'set', 'memorable_recall', v], { env, encoding: 'utf8', timeout: 20_000 });
@@ -75,6 +77,17 @@ describe('enable', () => {
       'within a few seconds', 'gstack-memorable status', 'memorable enable', 'memorable forget', 'HIGH-tier'] ) {
       expect(r.stdout).toContain(s);
     }
+  });
+
+  test('a per-session CLAUDE_CONFIG_DIR linking back to ~/.claude registers the $HOME path, which outlives the session (#3180)', () => {
+    const session = path.join(home, 'session-1234');
+    fs.mkdirSync(session);
+    fs.symlinkSync(path.join(home, '.claude', 'skills'), path.join(session, 'skills'));
+    const r = run(['enable'], { CLAUDE_CONFIG_DIR: session });
+    expect(r.status).toBe(0);
+    expect(commands()).toEqual([`${canonical}/${HOOK_REL}`]);
+    fs.rmSync(session, { recursive: true, force: true });
+    expect(fs.existsSync(commands()[0])).toBe(true);
   });
 
   test('twice: unchanged, one entry; over a stale worktree path: re-pointed', () => {
@@ -372,10 +385,10 @@ describe('enable/disable failure paths (coverage audit)', () => {
     fs.writeFileSync(path.join(lock, 'ts'), String(Math.floor(Date.now() / 1000)));
     fs.writeFileSync(path.join(lock, 'owner'), '999999');
     const t0 = Date.now();
-    const r = run(['enable']);
+    const r = run(['enable'], QUICK_GIVE_UP);
     expect(r.status).toBe(5);
     expect(r.stderr).toContain('another gstack-memorable is running');
-    expect(Date.now() - t0).toBeGreaterThan(4000);
+    expect(Date.now() - t0).toBeGreaterThan(400);
     expect(fs.existsSync(lock)).toBe(true);
     expect(fs.existsSync(settings)).toBe(false);
   }, 30_000);
@@ -461,11 +474,11 @@ describe('lifecycle lock and static pins', () => {
     fs.chmodSync(locksDir, 0o555); // mv/rmdir of the stale lock now fails
     const t0 = Date.now();
     let r;
-    try { r = run(['disable']); } finally { fs.chmodSync(locksDir, 0o755); }
+    try { r = run(['disable'], QUICK_GIVE_UP); } finally { fs.chmodSync(locksDir, 0o755); }
     const wall = Date.now() - t0;
     expect(r.status).toBe(5);
     expect(r.stderr).toContain('another gstack-memorable is running');
-    expect(wall).toBeGreaterThan(4000);
+    expect(wall).toBeGreaterThan(400);
     expect(wall).toBeLessThan(12_000);
   }, 30_000);
 
@@ -473,9 +486,9 @@ describe('lifecycle lock and static pins', () => {
     const lock = path.join(env.GSTACK_HOME, 'locks', 'memorable-bridge.lock');
     fs.mkdirSync(lock, { recursive: true }); // no owner, no ts: a holder that just won mkdir
     const t0 = Date.now();
-    const r = run(['disable']);
+    const r = run(['disable'], QUICK_GIVE_UP);
     expect(r.status).toBe(5);
-    expect(Date.now() - t0).toBeGreaterThan(4000);
+    expect(Date.now() - t0).toBeGreaterThan(400);
     expect(fs.existsSync(lock)).toBe(true);
   }, 30_000);
 
@@ -488,5 +501,7 @@ describe('lifecycle lock and static pins', () => {
     expect(src).toContain('set -uo pipefail');
     expect(src).not.toContain('set -euo');
     expect(src).toContain('BASH_COMPAT=50');
+    expect(src).toContain('LOCK_TRIES="${GSTACK_MEMORABLE_LOCK_TRIES:-50}"');
+    expect(src).toContain('LOCK_SLEEP=0.1');
   });
 });

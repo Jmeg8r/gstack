@@ -77,7 +77,7 @@ describe('autoplan reads installed host methodology', () => {
         const refs = [...body.matchAll(/`(\.\.\/gstack-plan-[a-z-]+\/SKILL\.md)`/g)].map(match => match[1]!);
         expect([...new Set(refs)].sort()).toEqual(REVIEWS.map(name => `../gstack-${name}/SKILL.md`).sort());
         for (const review of REVIEWS) expect(body).not.toContain(`$GSTACK_ROOT/${review}/SKILL.md`);
-        expect(body).toContain('same installed skill registry as /autoplan');
+        expect(body.replace(/\s+/g, ' ')).toContain("Use /autoplan's installed registry; resolve siblings from its discovered SKILL.md");
       }
       const roots = host.name === 'claude'
         ? [path.join(owned, host.name, mode, 'home', host.globalRoot)]
@@ -99,7 +99,10 @@ describe('autoplan reads installed host methodology', () => {
           const loaded = fs.readFileSync(path.resolve(path.dirname(entry), reference), 'utf8');
           expect(loaded).toBe(fs.readFileSync(generatedReview, 'utf8'));
           expect(loaded).not.toContain('STALE FOREIGN HARNESS SKILL');
-          if (host.name === 'codex') expect(loaded).toContain('"outside_provider":"claude-code"');
+          // C4: a carved review (every host's plan-ceo-review; Claude's four) keeps its body in sections/.
+          const sectionSource = path.join(generatedRoot, reviewName, 'sections/review-sections.md');
+          const carved = fs.existsSync(sectionSource);
+          if (host.name === 'codex') expect(loaded + (carved ? fs.readFileSync(sectionSource, 'utf8') : '')).toContain('"outside_provider":"claude-code"');
           const phase = review === 'plan-devex-review' ? 'dx' : review.split('-')[1]!;
           const phaseBody = host.name === 'claude'
             ? fs.readFileSync(path.join(generatedRoot, 'autoplan', 'sections', `${phase}-phase.md`), 'utf8')
@@ -117,8 +120,9 @@ describe('autoplan reads installed host methodology', () => {
             expect(directive).toContain(`methodology ${phase} `);
             expect(directive).toContain('`methodologyPath` from');
             expect(directive).toContain('"<REVIEW_SKILL>"');
+          }
+          if (carved) {
             const relative = 'sections/review-sections.md';
-            const sectionSource = path.join(generatedRoot, review, relative);
             const sectionInstalled = path.resolve(path.dirname(entry), reference, '..', relative);
             installFile(sectionSource, sectionInstalled, mode);
             const section = fs.readFileSync(sectionInstalled, 'utf8');
@@ -192,8 +196,7 @@ describe('autoplan reads installed host methodology', () => {
   });
 
   test('the new discovery contract selects the affected live autoplan workflows', () => {
-    for (const name of ['autoplan-chain-pty', 'autoplan-dual-voice', 'carve-section-loading']) {
-      expect(E2E_TOUCHFILES[name]).toContain('test/autoplan-review-discovery.test.ts');
+    for (const name of ['autoplan-dual-voice', ...Object.keys(E2E_TOUCHFILES).filter(id => id.startsWith('carve-section-loading-'))]) {
       expect(E2E_TOUCHFILES[name]).toContain('scripts/resolvers/composition.ts');
     }
   });

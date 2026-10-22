@@ -21,11 +21,22 @@
  *    ends in 'asked', the question that fired must be the scope gate itself
  *    (outside plan mode with no named target, the gate is the FIRST
  *    question by contract).
+ *  - plan-devex-review: no no-target scope gate, so only the terminal
+ *    outcome and the absent plan-mode reminder are asserted. It reviews a
+ *    pasted developer-facing plan: without one it reviews the checkout's
+ *    branch diff, and a tests-only diff legitimately ends at its
+ *    applicability gate, which is neither 'asked' nor 'plan_ready'.
+ *  - plan-ceo-review reviews a pasted plan too. Without one it reviews the
+ *    checkout's branch diff, so its work before the first question (the
+ *    pre-review audit and landscape searches) grew with whatever PR the gate
+ *    ran on: on a 1,900-line PR it timed out at 300s in 3 of 10 measured
+ *    trials while still researching that diff. A fixed small plan keeps the
+ *    work the same on every branch.
  *  - named-target case: a pasted draft (initialPlanContent) IS an
  *    explicitly-named target, so the gate must NOT ask — and the review
  *    must actually consume the pasted content.
  *
- * Cost note: 4 sequential PTY runs (~3-5 min each) in the gate lane, up
+ * Cost note: 6 sequential PTY runs (~3-5 min each) in the gate lane, up
  * from 1 pre-bypass. Selected only when plan-ceo/eng/design or the runner
  * change (see 'plan-mode-no-op' in touchfiles.ts).
  */
@@ -57,8 +68,30 @@ weekly export emails. One new component, one route, one test file.
 - test/${SEED_TOKEN}.test.tsx (new)
 `;
 
+const CEO_PLAN = `
+# Plan: weekly digest email
+
+## Scope
+Send each workspace owner a weekly digest email listing the tasks closed
+that week. One scheduled job, one email template, one opt-out toggle in
+settings.
+`;
+
+const DEVEX_PLAN = `
+# Plan: tasks export command
+
+## Scope
+Add a \`tasks export --format csv|json\` CLI subcommand for developers who
+script against the task tracker. Prints to stdout; --out writes a file.
+
+## Developer experience
+- New flag help text and a README quickstart example.
+- Exit code 2 with a one-line error for an unknown --format value.
+`;
+
 describeE2E('plan-mode-info no-op outside plan mode (gate regression)', () => {
-  for (const skillName of ['plan-ceo-review', 'plan-eng-review', 'plan-design-review'] as const) {
+  for (const skillName of ['plan-ceo-review', 'plan-eng-review', 'plan-design-review', 'plan-devex-review'] as const) {
+    const hasScopeGate = skillName === 'plan-eng-review' || skillName === 'plan-design-review';
     test(`${skillName} reaches a terminal outcome outside plan mode`, async () => {
       const obs = await runPlanSkillObservation({
         skillName,
@@ -70,9 +103,15 @@ describeE2E('plan-mode-info no-op outside plan mode (gate regression)', () => {
         // that shape CONTRACTUAL ("use exactly this shape" in the template);
         // native AskUserQuestion could render terse option labels that a
         // correct run would fail on (red-team finding).
-        ...(skillName === 'plan-ceo-review'
-          ? {}
-          : { extraArgs: ['--disallowedTools', 'AskUserQuestion'] }),
+        // requireProseEvidence: with the prose fallback forced, the gate
+        // renders as a lettered menu, so a judge 'waiting' verdict on a
+        // spinner-only frame must not end the run as 'asked' before that
+        // menu has rendered.
+        ...(hasScopeGate
+          ? { extraArgs: ['--disallowedTools', 'AskUserQuestion'], requireProseEvidence: true }
+          : {}),
+        ...(skillName === 'plan-devex-review' ? { initialPlanContent: DEVEX_PLAN } : {}),
+        ...(skillName === 'plan-ceo-review' ? { initialPlanContent: CEO_PLAN } : {}),
       });
 
       if (obs.outcome === 'silent_write' || obs.outcome === 'exited' || obs.outcome === 'timeout') {
@@ -90,7 +129,7 @@ describeE2E('plan-mode-info no-op outside plan mode (gate regression)', () => {
       // section is leaking outside plan mode.
       expect(obs.evidence).not.toContain(PLAN_MODE_REMINDER);
 
-      if (skillName !== 'plan-ceo-review') {
+      if (hasScopeGate) {
         // Scope-gate bypass must not misfire: no auto-select announcement
         // outside plan mode.
         expect(obs.scopeGateAutoSelectObserved ?? false).toBe(false);
@@ -125,40 +164,42 @@ describeE2E('plan-mode-info no-op outside plan mode (gate regression)', () => {
   // review output), proving the target was used rather than the question
   // merely skipped. Also the over-trigger guard for the tightened
   // "explicit-only" exception wording.
-  test('plan-eng-review skips the scope gate for an explicitly-pasted target', async () => {
-    const obs = await runPlanSkillObservation({
-      skillName: 'plan-eng-review',
-      inPlanMode: false,
-      initialPlanContent: NAMED_TARGET_SEED,
-      trackTokens: [SEED_TOKEN],
-      timeoutMs: CAPTURE_MS,
-    });
+  for (const skillName of ['plan-eng-review', 'plan-design-review'] as const) {
+    test(`${skillName} skips the scope gate for an explicitly-pasted target`, async () => {
+      const obs = await runPlanSkillObservation({
+        skillName,
+        inPlanMode: false,
+        initialPlanContent: NAMED_TARGET_SEED,
+        trackTokens: [SEED_TOKEN],
+        timeoutMs: CAPTURE_MS,
+      });
 
-    if (
-      obs.outcome === 'wrote_findings_before_asking' ||
-      obs.outcome === 'silent_write' ||
-      obs.outcome === 'exited' ||
-      obs.outcome === 'timeout'
-    ) {
-      throw new Error(
-        `named-target no-op FAILED: outcome=${obs.outcome}\n` +
-          `summary: ${obs.summary}\n` +
-          `elapsed: ${obs.elapsedMs}ms\n` +
-          `--- evidence (last 2KB visible) ---\n${obs.evidence}`,
-      );
-    }
-    expect(['asked', 'plan_ready']).toContain(obs.outcome);
-    expect(obs.evidence).not.toContain(PLAN_MODE_REMINDER);
+      if (
+        obs.outcome === 'wrote_findings_before_asking' ||
+        obs.outcome === 'silent_write' ||
+        obs.outcome === 'exited' ||
+        obs.outcome === 'timeout'
+      ) {
+        throw new Error(
+          `named-target no-op FAILED (${skillName}): outcome=${obs.outcome}\n` +
+            `summary: ${obs.summary}\n` +
+            `elapsed: ${obs.elapsedMs}ms\n` +
+            `--- evidence (last 2KB visible) ---\n${obs.evidence}`,
+        );
+      }
+      expect(['asked', 'plan_ready']).toContain(obs.outcome);
+      expect(obs.evidence).not.toContain(PLAN_MODE_REMINDER);
 
-    // The pasted doc is the named target: gate question must not render,
-    // no plan-mode announcement either (we are NOT in plan mode).
-    expect(obs.scopeGateQuestionObserved ?? false).toBe(false);
-    expect(obs.scopeGateAutoSelectObserved ?? false).toBe(false);
+      // The pasted doc is the named target: gate question must not render,
+      // no plan-mode announcement either (we are NOT in plan mode).
+      expect(obs.scopeGateQuestionObserved ?? false).toBe(false);
+      expect(obs.scopeGateAutoSelectObserved ?? false).toBe(false);
 
-    // Target consumption via high-water token tracking over the CUMULATIVE
-    // buffer — the 2KB evidence tail is lossy and the plan-file fallback is
-    // unreachable outside plan mode (extractPlanFilePath only matches
-    // plan-mode save renders).
-    expect(obs.tokensObserved?.[SEED_TOKEN] ?? false).toBe(true);
-  }, CAPTURE_LONG_MS);
+      // Target consumption via high-water token tracking over the CUMULATIVE
+      // buffer — the 2KB evidence tail is lossy and the plan-file fallback is
+      // unreachable outside plan mode (extractPlanFilePath only matches
+      // plan-mode save renders).
+      expect(obs.tokensObserved?.[SEED_TOKEN] ?? false).toBe(true);
+    }, CAPTURE_LONG_MS);
+  }
 });

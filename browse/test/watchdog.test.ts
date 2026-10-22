@@ -43,8 +43,7 @@ afterEach(async () => {
   // Kill any survivors so subsequent tests get a clean slate.
   try { parentProc?.kill('SIGKILL'); } catch {}
   try { serverProc?.kill('SIGKILL'); } catch {}
-  // Give processes a moment to exit before tmpDir cleanup.
-  await Bun.sleep(100);
+  await Promise.all([parentProc?.exited, serverProc?.exited]);
   try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   parentProc = null;
   serverProc = null;
@@ -52,9 +51,19 @@ afterEach(async () => {
 
 function spawnServer(env: Record<string, string>): Subprocess {
   const stateFile = path.join(tmpDir, 'browse-state.json');
+  const home = path.join(tmpDir, 'home');
+  fs.mkdirSync(home, { recursive: true });
   return spawn(['bun', 'run', SERVER_SCRIPT], {
     env: {
       ...process.env,
+      // The headed server writes ~/.gstack/.auth.json for its extension.
+      HOME: home,
+      USERPROFILE: home,
+      GSTACK_HOME: path.join(home, '.gstack'),
+      PLAYWRIGHT_BROWSERS_PATH: process.env.PLAYWRIGHT_BROWSERS_PATH || path.join(
+        process.env.XDG_CACHE_HOME || path.join(os.homedir(), process.platform === 'darwin' ? 'Library/Caches' : '.cache'),
+        'ms-playwright',
+      ),
       BROWSE_STATE_FILE: stateFile,
       BROWSE_PORT: '0', // Use the existing available-port allocator; fixed ports can collide across shards.
       ...env,
@@ -209,12 +218,12 @@ describe('headed parent-death shutdown is suppressed on runtime promotion', () =
 
   test('the server binds that callback to the suppress-flag setter', () => {
     const src = read('src/server.ts');
-    expect(src).toContain('function suppressHeadedParentShutdown()');
+    expect(src).toContain('function suppressHeadedParentShutdown(');
     // Bound on BOTH the module-level manager and any embedder-supplied one; the
     // watchdog reads activeBrowserManager, so binding only the default instance
     // leaves embedders (e.g. gbrowser) promoting silently.
     expect(src).toContain('browserManager.onHeadedPromotion = suppressHeadedParentShutdown');
-    expect(src).toContain('cfgBrowserManager.onHeadedPromotion = suppressHeadedParentShutdown');
+    expect(src).toContain('cfgBrowserManager.onHeadedPromotion = () => suppressHeadedParentShutdown(cfg.config, cfgBrowserManager)');
   });
 
   test('promotion must NOT clear the interval — the tick doubles as the tunnel-orphan reaper', () => {
@@ -316,7 +325,13 @@ describe('suppressed watchdog still reaps tunnel orphans (behavioral)', () => {
   });
 
   test('CRITICAL: suppression active + tunnel live — parent death still shuts down', async () => {
-    const exitMock = mock((_code?: number) => {});
+    let resolveExit!: () => void;
+    let exitDeadline!: ReturnType<typeof setTimeout>;
+    const exited = new Promise<void>((resolve, reject) => {
+      resolveExit = resolve;
+      exitDeadline = setTimeout(() => reject(new Error('Watchdog shutdown did not exit within 3s')), 3_000);
+    });
+    const exitMock = mock((_code?: number) => { resolveExit(); });
     const originalExit = process.exit;
     (process as any).exit = exitMock;
     try {
@@ -324,12 +339,13 @@ describe('suppressed watchdog still reaps tunnel orphans (behavioral)', () => {
       __testInternals__.suppressHeadedParentShutdown();
       __testInternals__.setTunnelActive(true); // handoff → resume → /pair-agent tunnel
       __testInternals__.parentWatchdogTick(DEAD_PID);
-      await drainShutdown();
+      await exited;
       // The tick is the ONLY reaper for tunnel orphans (idle timeout is
       // disabled in tunnel mode). If this fails, an internet-exposed daemon
       // outlives its parent forever.
       expect(exitMock).toHaveBeenCalled();
     } finally {
+      clearTimeout(exitDeadline);
       (process as any).exit = originalExit;
     }
   });

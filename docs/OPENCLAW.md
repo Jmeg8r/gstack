@@ -127,7 +127,13 @@ environment variable should be set. gstack detects this and adjusts:
   rendering prose to nobody
 - Focuses on task completion and prose reporting
 
-Set the env var in sessions_spawn: `env: { OPENCLAW_SESSION: "1" }`
+`sessions_spawn` has no per-spawn environment argument
+([openclaw/openclaw#51654](https://github.com/openclaw/openclaw/issues/51654)
+was closed without adding one), so an `env` field in the tool call is ignored.
+Set `OPENCLAW_SESSION=1` in the environment of the Claude ACP harness or the
+Gateway service instead, keep credentials out of that wrapper, and confirm the
+variable from inside the spawned process (for example `echo $OPENCLAW_SESSION`)
+rather than trusting the session's final message.
 
 ### Explicit override: GSTACK_SESSION_KIND
 
@@ -142,9 +148,11 @@ the same command line:
 GSTACK_SESSION_KIND=spawned "$_SS" --skill "document-release" ...
 ```
 
-gstack itself uses this: `/ship` Step 18 dispatches the `/document-release`
-subagent with this prefix so its interactive gates auto-choose instead of
-prose-stopping. Deliberately narrow: only `spawned` is honored — `headless`
+gstack itself uses this: `/ship` Step 14.5 dispatches the `/document-release`
+subagent with this prefix before final commit, verification and publication.
+Its ship-owned scope overrides generic spawned auto-choice: risky or uncertain
+documentation changes return as blockers for the parent, without interactive
+questions or automatic approval. Deliberately narrow: only `spawned` is honored — `headless`
 already has `GSTACK_HEADLESS`, and letting an env var force `interactive`
 over CI markers would be a misclassification footgun. Empty or other values
 are reserved and ignored (fall through to ambient detection). Note that hook

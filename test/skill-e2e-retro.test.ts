@@ -1,4 +1,5 @@
 import { expect, beforeAll, afterAll } from 'bun:test';
+import { resolveEvalModel } from '../lib/eval-model';
 import { CAPTURE_MS, CAPTURE_LONG_MS } from './helpers/eval-budgets';
 import { runSkillTest } from './helpers/session-runner';
 import {
@@ -22,7 +23,6 @@ const evalCollector = createEvalCollector('e2e-retro');
 // still an extraction, not a full-file copy (sections ARE the minimal
 // on-demand units; same pattern as skill-e2e-review-army.test.ts).
 const RETRO_SKELETON_SECTIONS = [
-  'When to invoke this skill',
   'Step 0: Detect platform and base branch',
   'User-invocable',
   'Arguments',
@@ -78,11 +78,10 @@ describeIfSelected('Base branch detection', ['retro-base-branch'], () => {
   });
 
   testConcurrentIfSelected('retro-base-branch', async () => {
-    const dir = path.join(baseBranchDir, 'retro-base');
-    fs.mkdirSync(dir, { recursive: true });
+    const dir = baseBranchDir;
 
-    // Create git repo with commit history
-    run('git', ['init'], dir);
+    // Create git repo with commit history on main, the branch the prompt names
+    run('git', ['init', '-b', 'main'], dir);
     run('git', ['config', 'user.email', 'dev@example.com'], dir);
     run('git', ['config', 'user.name', 'Dev'], dir);
 
@@ -202,7 +201,7 @@ Analyze the git history and produce the narrative report as described in the SKI
       timeout: CAPTURE_MS,
       testName: 'retro',
       runId,
-      model: 'claude-opus-4-7',
+      model: resolveEvalModel('capture'),
     });
 
     logCost('/retro', result);

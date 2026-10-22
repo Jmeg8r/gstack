@@ -4,6 +4,8 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { createHash } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
+import { identityStartedAtMs, processIdentitySource } from '../lib/cso/process-identity';
+import { createPrecisionLossCandidate } from './helpers/cso-ntfs-fixture';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const windows = process.platform === 'win32';
@@ -91,6 +93,34 @@ function expectSuccessfulProcess(result: ReturnType<typeof spawnSync>, label: st
   })}`);
 }
 
+// Diagnostic snapshot of every lease artifact under a CSO state root. A failed
+// native lease command embeds it in the assertion and keeps a copy outside the
+// fixture so the exact owner/decision records survive cleanup.
+function leaseRecords(root: string): string {
+  const records: unknown[] = [];
+  for (const leases of filesNamed(root, '.mutation-lock').map(lock => path.join(path.dirname(lock), '.mutation-lock-leases'))) {
+    let names: string[] = [];
+    try { names = fs.readdirSync(leases).sort(); } catch { continue; }
+    for (const name of names) {
+      const file = path.join(leases, name);
+      try {
+        const stat = fs.lstatSync(file, { bigint: true }), text = stat.size <= 4096n ? fs.readFileSync(file, 'utf8') : '';
+        let pidAlive: boolean | undefined;
+        try { const value = JSON.parse(text), pid = value.ownerPid ?? value.pid; if (Number.isInteger(pid)) { try { process.kill(pid, 0); pidAlive = true; } catch (error: any) { pidAlive = error?.code === 'EPERM'; } } } catch {}
+        records.push({ file: path.relative(root, file), dev: String(stat.dev), ino: String(stat.ino), nlink: String(stat.nlink), size: String(stat.size), text, pidAlive });
+      } catch (error: any) { records.push({ file: path.relative(root, file), error: error?.code ?? String(error) }); }
+    }
+  }
+  const serialized = JSON.stringify(records), keep = path.join(process.env.RUNNER_TEMP ?? os.tmpdir(), 'cso-lease-diagnostics');
+  try { fs.mkdirSync(keep, { recursive: true }); fs.writeFileSync(path.join(keep, `${Date.now()}-${process.pid}.json`), serialized); } catch {}
+  return serialized.slice(0, 16_384);
+}
+
+function expectLeaseCommand(result: ReturnType<typeof spawnSync>, label: string, root: string) {
+  try { expectSuccessfulProcess(result, label); }
+  catch (error: any) { throw new Error(`${error.message}\nlease records: ${leaseRecords(root)}`); }
+}
+
 function filesNamed(root: string, name: string): string[] {
   const found: string[] = [];
   const walk = (directory: string) => {
@@ -111,7 +141,7 @@ describe('CSO native Windows build contract', () => {
   test('Windows builds use MSVC with a static CRT and no Bun-hosted public launcher', () => {
     const build = fs.readFileSync(path.join(ROOT, 'scripts/build-cso.sh'), 'utf8');
     const msvc = fs.readFileSync(path.join(ROOT, 'scripts/build-cso-windows.ps1'), 'utf8');
-    expect(build).toContain('powershell.exe -NoProfile -NonInteractive');
+    expect(build).toContain('"$CSO_POWERSHELL" -NoProfile -NonInteractive');
     expect(build).toContain('build-cso-windows.ps1');
     expect(build).toContain('-OutputPath "$(cygpath -w "$CSO_STAGE_LAUNCHER")"');
     expect(build).toContain('-LockOutputPath "$(cygpath -w "$CSO_STAGE_LOCKER")"');
@@ -134,7 +164,7 @@ describe('CSO native Windows build contract', () => {
     expect(msvc).toContain('GSTACK_CSO_GIT_PATH');
     expect(msvc).toContain('/FI$binding');
     expect(msvc).toContain('if ($LASTEXITCODE -ne 0)');
-    const processSource=fs.readFileSync(path.join(ROOT,'lib','cso','process.ts'),'utf8');
+    const processSource=fs.readFileSync(path.join(ROOT,'lib','cso','process.ts'),'utf8').replace(/\s+/g,'');
     expect(processSource).toContain("includeNullPath=process.platform==='win32'?'/dev/null':nullPath");
     const launcherSource = fs.readFileSync(path.join(ROOT, 'lib/cso/launcher-windows.c'), 'utf8');
     expect(launcherSource).toContain('.gstack-cso-generation.lock');
@@ -165,17 +195,25 @@ describe('CSO native Windows build contract', () => {
     expect(smoke['continue-on-error']).not.toBe(true);
   });
 
-  test.skipIf(!windows)('Windows build refuses output path escapes before invoking MSVC',()=>{
+  // Each PowerShell invocation has its own deadline. A serial loop placed all
+  // five cold starts under Bun's default five-second timeout.
+  const pathEscapeCases = [
+    ['launcher outside stage', (stage: string, outside: string) => [path.join(outside, 'gstack-cso-launcher.exe'), path.join(stage, 'gstack-cso-publish-lock.exe')]],
+    ['launcher in stage parent', (stage: string) => [path.join(stage, '..', 'gstack-cso-launcher.exe'), path.join(stage, 'gstack-cso-publish-lock.exe')]],
+    ['wrong launcher name', (stage: string) => [path.join(stage, 'wrong.exe'), path.join(stage, 'gstack-cso-publish-lock.exe')]],
+    ['lock outside stage', (stage: string, outside: string) => [path.join(stage, 'gstack-cso-launcher.exe'), path.join(outside, 'gstack-cso-publish-lock.exe')]],
+    ['wrong lock name', (stage: string) => [path.join(stage, 'gstack-cso-launcher.exe'), path.join(stage, 'wrong-lock.exe')]],
+  ] as const;
+  test.skipIf(!windows).each(pathEscapeCases)('Windows build rejects %s before invoking MSVC',(_name, outputs)=>{
     const script=path.join(ROOT,'scripts/build-cso-windows.ps1'),outside=fs.mkdtempSync(path.join(os.tmpdir(),'cso-bin-evil-'));
     const stage=fs.mkdtempSync(path.join(ROOT,'bin','.gstack-cso-stage.path-test.'));
-    const validOutput=path.join(stage,'gstack-cso-launcher.exe'),validLock=path.join(stage,'gstack-cso-publish-lock.exe'),digest='a'.repeat(64);
+    const [output,lock]=outputs(stage,outside),digest='a'.repeat(64);
     try{
-      for(const [output,lock] of [[path.join(outside,'gstack-cso-launcher.exe'),validLock],[path.join(stage,'..','gstack-cso-launcher.exe'),validLock],[path.join(stage,'wrong.exe'),validLock],[validOutput,path.join(outside,'gstack-cso-publish-lock.exe')],[validOutput,path.join(stage,'wrong-lock.exe')]]){
-        const result=spawnSync('powershell.exe',['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',script,'-RepoRoot',ROOT,'-OutputPath',output,'-LockOutputPath',lock,'-CoreSha256',digest,'-GitExePath',Bun.which('git')!],{encoding:'utf8',timeout:30_000});
-        expect(result.status).not.toBe(0);expect(`${result.stdout}${result.stderr}`).toContain('direct, non-reparse staging directory');
-      }
+      const result=spawnSync('powershell.exe',['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',script,'-RepoRoot',ROOT,'-OutputPath',output,'-LockOutputPath',lock,'-CoreSha256',digest,'-GitExePath',Bun.which('git')!],{encoding:'utf8',timeout:30_000});
+      expect(result.error).toBeUndefined();expect(result.signal).toBeNull();expect(result.status).not.toBeNull();
+      expect(result.status).not.toBe(0);expect(`${result.stdout}${result.stderr}`).toContain('direct, non-reparse staging directory');
     }finally{fs.rmSync(stage,{recursive:true,force:true});fs.rmSync(outside,{recursive:true,force:true});}
-  });
+  },35_000);
 });
 
 (windows ? describe : describe.skip)('CSO native Windows startup', () => {
@@ -301,6 +339,127 @@ describe('CSO native Windows build contract', () => {
     const doctor=spawnSync(actual,['doctor','--repo',repository],{cwd:repository,encoding:'utf8',env,timeout:30_000});expect(doctor.status).toBe(0);expect(JSON.parse(doctor.stdout).downloads).toBe(false);
     const started=spawnSync(actual,['start','--repo',repository,'--offline'],{cwd:repository,encoding:'utf8',env,timeout:30_000});expectSuccessfulProcess(started,'gstack-cso start');expect(JSON.parse(started.stdout).schemaVersion).toBe(3);expect(fs.existsSync(path.join(profile,'.gstack','security','cso'))).toBe(true);
   }, 120_000);
+
+  test('NTFS high file IDs survive repeated native commands and ambiguous old decisions remain blocked', () => {
+    const repository=path.join(temporary,'lease lifecycle repository'),profile=path.join(temporary,'lease lifecycle profile');
+    fs.mkdirSync(repository);fs.mkdirSync(profile);
+    const git='C:\\Program Files\\Git\\cmd\\git.exe',gitEnv={...process.env,HOME:profile};
+    for(const args of [['init','-q'],['config','user.email','fixture@example.test'],['config','user.name','Fixture']] as string[][]){const result=spawnSync(git,args,{cwd:repository,encoding:'utf8',env:gitEnv,timeout:10_000});expect(result.status).toBe(0);}
+    fs.writeFileSync(path.join(repository,'app.js'),'console.log("fixture")\n');
+    for(const args of [['add','app.js'],['commit','-qm','fixture']] as string[][]){const result=spawnSync(git,args,{cwd:repository,encoding:'utf8',env:gitEnv,timeout:10_000});expect(result.status).toBe(0);}
+    const actual=path.join(ROOT,'bin','gstack-cso-launcher.exe'),env={...process.env,HOME:'',GSTACK_HOME:'',CLAUDE_PLUGIN_ROOT:'',CLAUDE_PLUGIN_DATA:'',USERPROFILE:profile,PATH:temporary};
+    const command=(args:string[])=>spawnSync(actual,args,{cwd:repository,encoding:'utf8',env,timeout:30_000}),submission=path.join(profile,'submission.json');
+    fs.writeFileSync(submission,'{}\n');
+    for(let i=0;i<3;i++){
+      const started=command(['start','--repo',repository,'--offline']);expectSuccessfulProcess(started,'gstack-cso start');
+      const run=JSON.parse(started.stdout),dir=path.join(profile,'.gstack','security','cso',run.repoId,run.runId),leases=path.join(dir,'.mutation-lock-leases');
+      const initialized=command(['resume',run.runId]);expectSuccessfulProcess(initialized,'gstack-cso initialize mutation lease');
+      expect(fs.realpathSync(leases).startsWith(fs.realpathSync(profile)+path.sep)).toBe(true);
+      if(i===0){
+        const churn=path.join(leases,'churn');let inode=0n;
+        for(let attempt=0;attempt<1024;attempt++){
+          fs.writeFileSync(churn,'x');inode=fs.lstatSync(churn,{bigint:true}).ino;fs.unlinkSync(churn);
+          if(inode>BigInt(Number.MAX_SAFE_INTEGER))break;
+        }
+        expect(inode).toBeGreaterThan(BigInt(Number.MAX_SAFE_INTEGER));
+      }
+      const inspected=command(['inspect',run.runId]);expectSuccessfulProcess(inspected,'gstack-cso inspect');
+      expect(JSON.parse(inspected.stdout).report.status).toBe('running');
+      const read=command(['read',run.runId,'app.js']);expectSuccessfulProcess(read,'gstack-cso read');expect(read.stdout).toContain('fixture');
+      const history=command(['history',run.runId]);expectSuccessfulProcess(history,'gstack-cso history');
+      const submitted=command(['submit',run.runId,submission]);expectSuccessfulProcess(submitted,'gstack-cso submit');
+      const resumed=command(['resume',run.runId]);expectSuccessfulProcess(resumed,'gstack-cso resume');
+      const finished=command(['finish',run.runId]);expectSuccessfulProcess(finished,'gstack-cso finish');
+      expect(JSON.parse(finished.stdout).completeness).not.toBe('complete');
+      const report=JSON.parse(fs.readFileSync(path.join(dir,'report.json'),'utf8'));
+      expect(report.coverage.some((entry:any)=>entry.status==='not_assessed')).toBe(true);
+      expect(fs.readdirSync(leases)).toEqual([]);
+      if(i!==2)continue;
+      const token='d'.repeat(32),candidate=path.join(leases,`${token}.json`),decision=path.join(leases,`${token}.decision`);
+      for(const rounded of [false,true]){
+        const selected=createPrecisionLossCandidate(candidate,JSON.stringify({pid:2147483647,token,createdAt:0})+'\n');
+        const stat=fs.lstatSync(candidate,{bigint:true}),record={schemaVersion:1,token,kind:'ticket',ticket:'0000000000000001',candidateDev:String(stat.dev),candidateIno:rounded?String(Number(stat.ino)):String(stat.ino),ownerPid:2147483647,ownerCreatedAt:0,publisherPid:2147483647,createdAt:0};
+        expect(stat.ino).toBe(selected);
+        expect(stat.ino).toBeGreaterThan(BigInt(Number.MAX_SAFE_INTEGER));
+        expect(String(Number(stat.ino))).not.toBe(String(stat.ino));
+        fs.writeFileSync(decision,JSON.stringify(record)+'\n');
+        const result=command(['resume',run.runId]);expect(result.status).not.toBe(0);
+        if(rounded){
+          expect(record.candidateIno).not.toBe(String(stat.ino));expect(result.stderr).toContain('UNSAFE_PATH');
+          expect(fs.existsSync(candidate)).toBe(true);expect(fs.existsSync(decision)).toBe(true);
+          fs.unlinkSync(decision);fs.unlinkSync(candidate);
+        }else{
+          expect(result.stderr).toContain('INVALID_SCHEMA');
+          expect(fs.existsSync(candidate)).toBe(false);expect(fs.existsSync(decision)).toBe(false);
+        }
+      }
+      const next=command(['start','--repo',repository,'--offline']);expectSuccessfulProcess(next,'gstack-cso start after legacy state');
+      expect(JSON.parse(next.stdout).runId).not.toBe(run.runId);
+    }
+  }, 180_000);
+
+  test('#2894 the win32 process identity source reads real process start times', async () => {
+    const own = processIdentitySource.read(process.pid), started = identityStartedAtMs(own ?? '');
+    expect(own).toMatch(/^win32:\d+$/);
+    expect(processIdentitySource.read(process.pid)).toBe(own!);
+    expect(started!).toBeLessThanOrEqual(Date.now());
+    expect(started!).toBeGreaterThan(Date.now() - 3_600_000);
+    await Bun.sleep(20);
+    const child = spawn(process.execPath, ['-e', 'setTimeout(()=>{},30000)'], { stdio: 'ignore' });
+    try {
+      const identity = processIdentitySource.read(child.pid!);
+      expect(identity).toMatch(/^win32:\d+$/);
+      expect(identity).not.toBe(own!);
+      expect(identityStartedAtMs(identity!)!).toBeGreaterThanOrEqual(started!);
+    } finally { child.kill(); }
+    expect(processIdentitySource.read(2147483647)).toBeUndefined();
+  });
+
+  test('#2894 lease sequence: repeated commands, a legacy record elsewhere, and recycled or dead owners never brick start', async () => {
+    const repository=path.join(temporary,'issue 2894 repository'),other=path.join(temporary,'issue 2894 other repository'),profile=path.join(temporary,'issue 2894 profile');
+    for(const directory of [repository,other,profile])fs.mkdirSync(directory);
+    const git='C:\\Program Files\\Git\\cmd\\git.exe',gitEnv={...process.env,HOME:profile};
+    for(const repo of [repository,other]){
+      for(const args of [['init','-q'],['config','user.email','fixture@example.test'],['config','user.name','Fixture']] as string[][]){const result=spawnSync(git,args,{cwd:repo,encoding:'utf8',env:gitEnv,timeout:10_000});expect(result.status).toBe(0);}
+      fs.writeFileSync(path.join(repo,'app.js'),'console.log("fixture")\n');fs.writeFileSync(path.join(repo,'other.js'),'console.log("other")\n');
+      for(const args of [['add','app.js','other.js'],['commit','-qm','fixture']] as string[][]){const result=spawnSync(git,args,{cwd:repo,encoding:'utf8',env:gitEnv,timeout:10_000});expect(result.status).toBe(0);}
+    }
+    const actual=path.join(ROOT,'bin','gstack-cso-launcher.exe'),env={...process.env,HOME:'',GSTACK_HOME:'',CLAUDE_PLUGIN_ROOT:'',CLAUDE_PLUGIN_DATA:'',USERPROFILE:profile,PATH:temporary},state=path.join(profile,'.gstack','security','cso');
+    const command=(args:string[],cwd=repository)=>spawnSync(actual,args,{cwd,encoding:'utf8',env,timeout:30_000});
+    const step=(args:string[],label:string,cwd=repository)=>{const result=command(args,cwd);expectLeaseCommand(result,label,state);return result;};
+    const started=JSON.parse(step(['start','--repo',repository,'--offline'],'start').stdout),dir=path.join(state,started.repoId,started.runId),leases=path.join(dir,'.mutation-lock-leases');
+    for(const [args,label] of [[['resume',started.runId],'resume'],[['inspect',started.runId],'inspect'],[['read',started.runId,'app.js'],'read app.js'],[['read',started.runId,'other.js'],'read other.js'],[['history',started.runId],'history'],[['inspect',started.runId],'inspect again']] as [string[],string][])step(args,label);
+    expect(fs.readdirSync(leases)).toEqual([]);
+    // A record left by gstack <= 1.88.0 in another repository's run (lossy NTFS file ID) stays
+    // blocked for that run, but start for any repository still succeeds.
+    const otherRun=JSON.parse(step(['start','--repo',other,'--offline'],'start other',other).stdout),otherLeases=path.join(state,otherRun.repoId,otherRun.runId,'.mutation-lock-leases');
+    step(['resume',otherRun.runId],'resume other',other);
+    const legacy='d'.repeat(32),legacyCandidate=path.join(otherLeases,`${legacy}.json`),legacyDecision=path.join(otherLeases,`${legacy}.decision`);
+    createPrecisionLossCandidate(legacyCandidate,JSON.stringify({pid:2147483647,token:legacy,createdAt:1})+'\n');
+    const legacyStat=fs.lstatSync(legacyCandidate,{bigint:true});
+    fs.writeFileSync(legacyDecision,JSON.stringify({schemaVersion:1,token:legacy,kind:'ticket',ticket:'0000000000000001',candidateDev:String(legacyStat.dev),candidateIno:String(Number(legacyStat.ino)),ownerPid:2147483647,ownerCreatedAt:1,publisherPid:2147483647,createdAt:1})+'\n');
+    const next=JSON.parse(step(['start','--repo',repository,'--offline'],'start with a legacy record in another repository').stdout);
+    expect(next.runId).not.toBe(started.runId);
+    const blocked=command(['resume',otherRun.runId],other);expect(blocked.status).not.toBe(0);expect(blocked.stderr).toContain('UNSAFE_PATH');
+    expect(fs.existsSync(legacyCandidate)).toBe(true);expect(fs.existsSync(legacyDecision)).toBe(true);
+    // A recycled PID: the recorded owner is gone and an unrelated process that started after the
+    // lease was written now holds that PID. A plain dead PID is reclaimed the same way.
+    const nextLeases=path.join(state,next.repoId,next.runId,'.mutation-lock-leases');
+    step(['resume',next.runId],'resume next');
+    const createdAt=Date.now();await Bun.sleep(2_500);
+    const holder=spawn(process.execPath,['-e','setTimeout(()=>{},60000)'],{stdio:'ignore'});
+    try{
+      for(const [token,pid] of [['e'.repeat(32),holder.pid!],['f'.repeat(32),2147483647]] as [string,number][]){
+        const candidate=path.join(nextLeases,`${token}.json`),decision=path.join(nextLeases,`${token}.decision`);
+        fs.writeFileSync(candidate,JSON.stringify({pid,token,createdAt})+'\n');
+        const stat=fs.lstatSync(candidate,{bigint:true});
+        fs.writeFileSync(decision,JSON.stringify({schemaVersion:1,token,kind:'ticket',ticket:'0000000000000001',candidateDev:String(stat.dev),candidateIno:String(stat.ino),ownerPid:pid,ownerCreatedAt:createdAt,publisherPid:pid,createdAt})+'\n');
+        step(['inspect',next.runId],`inspect after ${pid===2147483647?'dead':'recycled'} owner`);
+        expect(fs.existsSync(candidate)).toBe(false);expect(fs.existsSync(decision)).toBe(false);
+      }
+      expect(fs.readdirSync(nextLeases)).toEqual([]);
+    }finally{holder.kill();}
+  }, 180_000);
 
   test('the actual helper rejects source mutation during snapshot capture without certifying a report', async () => {
     const repository=path.join(temporary,'racing repository'),profile=path.join(temporary,'race profile'),padding=path.join(repository,'padding'),target=path.join(repository,'zzzz-race-target.js');

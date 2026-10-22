@@ -15,7 +15,7 @@ Week of Mar 1: 47 commits (3 contributors), 3.2k LOC, 38% tests, 12 PRs, peak: 1
 (from Step 2)
 
 ### Trends vs Last Retro
-(from Step 12, loaded before save — skip if no matching history; in `compare` mode use **Current vs Prior Period** from the computed prior window even on the first run)
+(from Step 12, loaded before save — skip if no matching history; in `compare` mode use **Current vs Prior Period** from the computed prior window even on the first run). Include the Recommendation follow-through line when Step 12 produced one.
 
 ### Time & Session Patterns
 (from Steps 3-4)
@@ -51,9 +51,10 @@ Narrative covering:
 Check review JSONL logs for plan completion data from /ship runs this period:
 
 ```bash
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
 setopt +o nomatch 2>/dev/null || true  # zsh compat
-eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)"
-cat ~/.gstack/projects/$SLUG/*-reviews.jsonl 2>/dev/null | grep '"skill":"ship"' | grep '"plan_items_total"' || echo "NO_PLAN_DATA"
+SLUG=$(~/.claude/skills/gstack/bin/gstack-slug --get SLUG 2>/dev/null)
+cat "$GSTACK_STATE_ROOT"/projects/$SLUG/*-reviews.jsonl 2>/dev/null | grep '"skill":"ship"' | grep '"plan_items_total"' || echo "NO_PLAN_DATA"
 ```
 
 If plan completion data exists within the retro time window:
@@ -117,7 +118,7 @@ Identify the 3 highest-impact things shipped in the window across the whole team
 - Why it matters (product/architecture impact)
 
 ### 3 Things to Improve
-Specific, actionable, anchored in actual commits. Mix personal and team-level suggestions. Phrase as "to get even better, the team could..."
+Specific, actionable, anchored in actual commits. Mix personal and team-level suggestions. Phrase as "to get even better, the team could..." These are the items saved as `recommendations` in the Step 13 snapshot, which the next retro scores for follow-through, so name a concrete file, script or check in each.
 
 ### 3 Habits for Next Week
 Small, practical, realistic. Each must be something that takes <5 minutes to adopt. At least one should be team-oriented (e.g., "review each other's PRs same-day").

@@ -28,6 +28,7 @@ import type { GenerateOptions, PreviewOptions } from "./types";
 import { ExitCode } from "./types";
 import { pickEngine } from "../../lib/aside-render";
 import { renderPdf } from "./asideClient";
+import { printWithTocPages } from "./toc-pages";
 import {
   bundleRunner,
   contentWidthInches,
@@ -40,6 +41,7 @@ import {
   substituteSlots,
 } from "./diagram-prepass";
 import { applyImagePolicy } from "./image-policy";
+import { guardDocxImages } from "./docx-images";
 
 /** Default output location (`$P generate letter.md` → /tmp/letter.pdf). */
 export const OUTPUT_TMP_DIR = process.platform === "win32" ? os.tmpdir() : "/tmp";
@@ -173,6 +175,7 @@ export async function generate(opts: GenerateOptions): Promise<string> {
       progress.end("Rasterizing diagrams for DOCX");
     }
     finalHtml = convertDiagnosticsForDocx(finalHtml);
+    finalHtml = guardDocxImages(finalHtml, warn);
   }
 
   // ─── --to html: write the self-contained document, no print round-trip ──
@@ -216,13 +219,14 @@ export async function generate(opts: GenerateOptions): Promise<string> {
     return outputPath;
   }
 
-  // Stage 3: print — one render: serve the staged HTML over loopback, (wait
-  // ≤3s for Paged.js if --toc), print through whichever browser is up.
+  // Stage 3: print — serve the staged HTML over loopback and print through
+  // whichever browser is up. With --toc, toc-pages.ts prints until the TOC's
+  // page-number cells match the pages the PDF itself puts each heading on.
   const engine = pickEngine().engine;
   const via = engine === "aside" ? "Aside" : engine === "browse" ? "gstack's browser" : "a browser";
   progress.begin(`Rendering PDF through ${via}`);
-  const used = await renderPdf(finalHtml, {
-    output: outputPath,
+  const print = (html: string, out: string) => renderPdf(html, {
+    output: out,
     format: opts.pageSize ?? "letter",
     marginTop: opts.marginTop ?? opts.margins ?? "1in",
     marginRight: opts.marginRight ?? opts.margins ?? "1in",
@@ -241,8 +245,10 @@ export async function generate(opts: GenerateOptions): Promise<string> {
     // sizes. Flip it ONLY when a promotion exists — minimal behavior change
     // for every other document.
     preferCSSPageSize: hasLandscape ? true : undefined,
-    toc: opts.toc,
   });
+  const used = opts.toc
+    ? await printWithTocPages(finalHtml, outputPath, print)
+    : await print(finalHtml, outputPath);
   progress.end(`Rendering PDF through ${via}`);
   if (used && used !== engine) {
     // render() fell back mid-run (Aside quit or its CLI could not start): say

@@ -10,14 +10,15 @@ DATETIME=$(date +%Y%m%d-%H%M%S)
 
 **Design lineage:** Before writing, check for existing design docs on this branch:
 ```bash
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
 setopt +o nomatch 2>/dev/null || true  # zsh compat
-PRIOR=$(ls -t ~/.gstack/projects/$SLUG/*-$BRANCH-design-*.md 2>/dev/null | head -1)
+PRIOR=$(ls -t "$GSTACK_STATE_ROOT"/projects/$SLUG/*-$BRANCH-design-*.md 2>/dev/null | head -1)
 ```
 If `$PRIOR` exists, the new doc gets a `Supersedes:` field referencing it. This creates a revision chain — you can trace how a design evolved across office hours sessions.
 
-Write to `~/.gstack/projects/{slug}/{user}-{branch}-design-{datetime}.md`.
+Write to `<PROJECT_DIR>/{user}-{branch}-design-{datetime}.md` (`PROJECT_DIR` printed by the setup block above).
 
-**Repo copy (dual-write, #703 + #2000).** When the session runs inside a git
+**Repo copy (dual-write).** When the session runs inside a git
 repository, ALSO write the doc to `docs/designs/{topic-slug}.md` in the repo —
 visible, committable, team-shareable. The `~/.gstack` copy is still written
 (memory ingest and cross-session discovery depend on it); the repo copy is
@@ -34,7 +35,7 @@ what teammates and plan reviews read. Rules:
 3. **Name the repo path** in the handoff line and any approval questions when
    the repo copy exists — that's the copy the user can open and commit.
 
-**Decision-record concision (#2000).** The doc is a decision record, not a
+**Decision-record concision.** The doc is a decision record, not a
 transcript: one bullet per decision with its why; an approach the user ruled
 out DURING the session gets one line (name + rejection reason), never a
 resurrected full section that re-argues the case; omit template sections that
@@ -166,6 +167,19 @@ Supersedes: {prior filename — omit this line if first design on this branch}
 
 ---
 
+**Before asking for approval, output the full design doc inline.**
+
+Print the complete contents of the design doc as direct assistant text in the
+conversation — do NOT ask the user to open the file, and do NOT rely on a
+`Bash cat` or `Read` tool call to show it. Tool outputs are frequently
+collapsed in the Claude Code UI, which leaves the user approving a document
+they cannot actually see. The one place the full doc is guaranteed to render
+is the assistant message itself.
+
+Format: a short preamble (`Here is the design doc saved to {path} — please
+review before approving:`) followed by the verbatim document body. Then
+proceed to the AskUserQuestion below.
+
 Present the reviewed design doc to the user via AskUserQuestion:
 - A) Approve — mark Status: APPROVED and proceed to handoff
 - B) Revise — specify which sections need changes (loop back to revise those sections)
@@ -185,16 +199,22 @@ Once the design doc is APPROVED, deliver the closing sequence. The closing adapt
 on how many times this user has done office hours, creating a relationship that deepens
 over time.
 
-### Step 1: Read Builder Profile
+### Step 1: Builder Profile
+
+Use SESSION_TIER, PRIOR_SESSION_COUNT, LAST_PROJECT, LAST_ASSIGNMENT and CROSS_PROJECT from the
+`Builder profile before this session:` line you wrote in Phase 4.5. This is session
+PRIOR_SESSION_COUNT + 1. If that line says `PROFILE_READ=failed` or is gone, use the introduction
+tier and tell the user: "I couldn't read your builder profile, so I'm treating this as your first
+office hours session."
+
+Then read the running totals, which now include this session:
 
 ```bash
-PROFILE=$(~/.claude/skills/gstack/bin/gstack-builder-profile 2>/dev/null) || PROFILE="SESSION_COUNT: 0
-TIER: introduction"
-SESSION_TIER=$(echo "$PROFILE" | grep "^TIER:" | awk '{print $2}')
-SESSION_COUNT=$(echo "$PROFILE" | grep "^SESSION_COUNT:" | awk '{print $2}')
+~/.claude/skills/gstack/bin/gstack-builder-profile 2>/dev/null || echo "PROFILE_READ: failed"
 ```
 
-Read the full profile output. You will use these values throughout the closing.
+Use only its DESIGN_COUNT, DESIGN_TITLES, ACCUMULATED_SIGNALS, TOTAL_SIGNAL_COUNT, NUDGE_ELIGIBLE
+and RESOURCES_SHOWN(_COUNT); never its TIER, SESSION_COUNT, LAST_* or CROSS_PROJECT.
 
 ### Step 2: Follow the Tier Path
 
@@ -260,17 +280,20 @@ Then proceed to Founder Resources below.
 
 ---
 
-### If TIER = welcome_back (sessions 2-3)
+### If TIER = welcome_back (sessions 2-4)
 
 Lead with recognition. The magical moment is immediate.
 
-Read LAST_ASSIGNMENT and CROSS_PROJECT from the profile output.
+Use LAST_ASSIGNMENT, LAST_PROJECT and CROSS_PROJECT from Step 1 (the Phase 4.5 values).
 
 If CROSS_PROJECT is false (same project as last time):
-"Welcome back. Last time you were working on [LAST_ASSIGNMENT from profile]. How's it going?"
+"Welcome back. Last time you were working on [LAST_ASSIGNMENT]. How's it going?"
 
 If CROSS_PROJECT is true (different project):
-"Welcome back. Last time we talked about [LAST_PROJECT from profile]. Still on that, or onto something new?"
+"Welcome back. Last time we talked about [LAST_PROJECT]. Still on that, or onto something new?"
+
+If the value a greeting names (LAST_ASSIGNMENT or LAST_PROJECT) is empty, skip that clause and
+its question and say only "Welcome back." Backfilled profiles can have a tier without them.
 
 Then: "No pitch this time. You already know about YC. Let's talk about your work."
 
@@ -289,11 +312,12 @@ Then proceed to Founder Resources below.
 
 ---
 
-### If TIER = regular (sessions 4-7)
+### If TIER = regular (sessions 5-8)
 
 Lead with recognition and session count.
 
-"Welcome back. This is session [SESSION_COUNT]. Last time: [LAST_ASSIGNMENT]. How'd it go?"
+"Welcome back. This is session [PRIOR_SESSION_COUNT + 1]. Last time: [LAST_ASSIGNMENT]. How'd it go?"
+If LAST_ASSIGNMENT is empty, skip the "Last time" clause and its question.
 
 **Tone examples:**
 - GOOD: "You've been at this for 5 sessions now. Your designs keep getting sharper. Let me show you what I've noticed."
@@ -312,11 +336,12 @@ Design trajectory with interpretation:
 "You started this as a side project. But you've named specific users, pushed back when challenged, and your designs keep getting sharper each time. I don't think this is a side project anymore. Have you thought about whether this could be a company?"
 This must feel earned, not broadcast. If the evidence doesn't support it, skip entirely.
 
-**Builder Journey Summary** (session 5+): Auto-generate `~/.gstack/builder-journey.md`
-with a narrative arc (not a data table). The arc tells the STORY of their journey in
-second person, referencing specific things they said across sessions. Then open it:
+**Builder Journey Summary** (session 5+): Auto-generate `builder-journey.md` in the
+gstack state root (`$GSTACK_STATE_ROOT`, resolved by the block below) with a narrative
+arc (not a data table). The arc tells the STORY of their journey in second person,
+referencing specific things they said across sessions. Then open it:
 ```bash
-eval "$(~/.claude/skills/gstack/bin/gstack-paths)"
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
 open "$GSTACK_STATE_ROOT/builder-journey.md"
 ```
 
@@ -324,15 +349,15 @@ Then proceed to Founder Resources below.
 
 ---
 
-### If TIER = inner_circle (sessions 8+)
+### If TIER = inner_circle (sessions 9+)
 
-"You've done [SESSION_COUNT] sessions. You've iterated [DESIGN_COUNT] designs. Most people who show this pattern end up shipping."
+"You've done [PRIOR_SESSION_COUNT + 1] sessions. You've iterated [DESIGN_COUNT] designs. Most people who show this pattern end up shipping."
 
 The data speaks. No pitch needed.
 
 Full accumulated signal summary from the profile.
 
-Auto-generate updated `~/.gstack/builder-journey.md` with narrative arc. Open it.
+Auto-generate updated `$GSTACK_STATE_ROOT/builder-journey.md` with narrative arc (resolve the state root and open it as in the regular tier).
 
 Then proceed to Founder Resources below.
 
@@ -340,7 +365,7 @@ Then proceed to Founder Resources below.
 
 ### Founder Resources (all tiers)
 
-**Standing opt-out check (#538) — run FIRST:**
+**Standing opt-out check — run FIRST:**
 
 ```bash
 ~/.claude/skills/gstack/bin/gstack-config get founder_resources 2>/dev/null || echo "true"
@@ -442,14 +467,15 @@ PAUL GRAHAM ESSAYS:
 1. Log the selected resource URLs to the builder profile (single source of truth).
 Append a resource-tracking entry:
 ```bash
-eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null || true)"
+SLUG=$(~/.claude/skills/gstack/bin/gstack-slug --get SLUG 2>/dev/null) || true
 ~/.claude/skills/gstack/bin/gstack-developer-profile --log-session '{"date":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","mode":"resources","project_slug":"'"${SLUG:-unknown}"'","signal_count":0,"signals":[],"design_doc":"","assignment":"","resources_shown":["URL1","URL2","URL3"],"topics":[]}' 2>/dev/null || true
 ```
 
 2. Log the selection to analytics:
 ```bash
-mkdir -p ~/.gstack/analytics
-echo '{"skill":"office-hours","event":"resources_shown","count":NUM_RESOURCES,"categories":"CAT1,CAT2","ts":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}' >> ~/.gstack/analytics/skill-usage.jsonl 2>/dev/null || true
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
+mkdir -p "$GSTACK_STATE_ROOT"/analytics
+echo '{"skill":"office-hours","event":"resources_shown","count":NUM_RESOURCES,"categories":"CAT1,CAT2","ts":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}' >> "$GSTACK_STATE_ROOT"/analytics/skill-usage.jsonl 2>/dev/null || true
 ```
 
 3. Use AskUserQuestion to offer opening the resources:
@@ -507,13 +533,14 @@ D) Not now — I'll run a review later
 Net: 15 minutes of structured review now against rework risk later.
 
 On the user's SELECTION of A/B/C (not on invocation success), log the handoff, then invoke
-the chosen skill via the **Skill tool** (it auto-discovers the design doc):
+the chosen skill via the **Skill tool** (it auto-discovers the design doc). In both log
+commands, replace `SESSION_ID` with the value the skill-start output echoed:
 ```bash
-~/.claude/skills/gstack/bin/gstack-telemetry-log --event-type handoff --skill office-hours --outcome accepted --session-id "$_SESSION_ID" 2>/dev/null || true
+~/.claude/skills/gstack/bin/gstack-telemetry-log --event-type handoff --skill office-hours --outcome accepted --session-id "SESSION_ID" 2>/dev/null || true
 ```
 On D, log declined and stop:
 ```bash
-~/.claude/skills/gstack/bin/gstack-telemetry-log --event-type handoff --skill office-hours --outcome declined --session-id "$_SESSION_ID" 2>/dev/null || true
+~/.claude/skills/gstack/bin/gstack-telemetry-log --event-type handoff --skill office-hours --outcome declined --session-id "SESSION_ID" 2>/dev/null || true
 ```
 
 The design doc at `~/.gstack/projects/` is automatically discoverable by downstream skills — they will read it during their pre-review system audit.

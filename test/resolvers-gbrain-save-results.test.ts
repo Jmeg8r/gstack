@@ -15,6 +15,8 @@
  */
 
 import { describe, test, expect } from 'bun:test';
+import * as fs from 'fs';
+import * as path from 'path';
 import {
   generateGBrainContextLoad,
   generateGBrainSaveResults,
@@ -64,6 +66,7 @@ describe('generateGBrainSaveResults — wiring + compression pin', () => {
 
       // Compact: points to docs/gbrain-write-surfaces.md for full template.
       expect(out).toContain('docs/gbrain-write-surfaces.md');
+      expect(out).toContain('Read the saved page back before claiming persistence.');
     },
   );
 
@@ -113,7 +116,8 @@ describe('generateGBrainContextLoad — compression pin', () => {
     expect(out).toContain('Skip this entire section if `gbrain` is not on PATH');
     expect(out).toContain('docs/gbrain-write-surfaces.md');
     expect(out).toContain('gbrain search');
-    expect(out).toContain('gbrain get_page');
+    expect(out).toContain('gbrain get "<slug>"');
+    expect(out).not.toContain('gbrain get_page');
     if (out.length > 500) {
       throw new Error(
         `generateGBrainContextLoad emitted ${out.length} chars (~${Math.round(out.length / 4)} tokens), ` +
@@ -133,5 +137,20 @@ describe('generateGBrainContextLoad — compression pin', () => {
       const out = generateGBrainContextLoad(buildCtx(skill));
       expect(out).not.toContain('data-research');
     }
+  });
+});
+
+// CEO-23: brain pages are free text, so they reach `gbrain put` from an
+// agent-written file on stdin, never a heredoc or a quoted --content argument.
+describe('brain pages never travel in a shell string', () => {
+  test('the generic save block and the save template use the agent-written file', () => {
+    const generic = generateGBrainSaveResults(buildCtx('no-such-skill'));
+    expect(generic).not.toContain('--content');
+    expect(generic).toContain('gbrain put "<slug>" < "<page-file>"');
+    const doc = fs.readFileSync(path.join(import.meta.dir, '..', 'docs', 'gbrain-write-surfaces.md'), 'utf8');
+    expect(doc).not.toMatch(/<<\s*'?EOF/);
+    expect(doc).not.toMatch(/--content\s+"\$\(/);
+    expect(doc).toContain('gbrain put "<slug-prefix>/<feature-slug>" < "<page-file>"');
+    expect(doc).toContain('gbrain put "entities/<entity-slug>" < "<entity-file>"');
   });
 });

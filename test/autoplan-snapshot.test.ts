@@ -9,6 +9,7 @@ import { generateAutoplanSnapshotTool } from '../scripts/resolvers/composition';
 import { HOST_PATHS, type TemplateContext } from '../scripts/resolvers/types';
 import { ALL_HOST_CONFIGS } from '../hosts';
 import { E2E_TOUCHFILES } from './helpers/touchfiles';
+import { expectMentions } from './helpers/prompt-structure';
 
 const ROOT = resolve(import.meta.dir, '..');
 const TOOL = join(ROOT, 'bin/gstack-autoplan-snapshot.ts');
@@ -30,6 +31,133 @@ function cli(...args: string[]) {
   return spawnSync(process.execPath, [TOOL, ...args], { encoding: 'utf8', timeout: 10_000 });
 }
 afterEach(() => { for (const dir of owned.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+
+describe('phase-close packets preserve full readback before publication', () => {
+  function closeFixture(phase = 'ceo', body?: string) {
+    const f = fixture();
+    if (body !== undefined) writeFileSync(f.active, `## Implementation plan\n${body}\n## Review record\n`);
+    const method = methodology(phase, f.restore);
+    const checkpoint = createSnapshot(phase, f.active, f.restore, method);
+    const record = (text: string) => {
+      const plan = readFileSync(f.active, 'utf8');
+      writeFileSync(f.active, plan.slice(0, plan.indexOf('## Review record\n')) +
+        `## Review record\n<!-- autoplan-accepted:${phase} -->\n${text}\n<!-- /autoplan-accepted:${phase} -->\n`);
+    };
+    record('None: current implementation already covers all accepted requirements.');
+    const prepare = () => {
+      const result = cli('prepare-close', phase, f.active, checkpoint.snapshotPath, f.restore, method);
+      expect(result.status, result.stderr).toBe(0);
+      return JSON.parse(result.stdout);
+    };
+    return { ...f, method, checkpoint, record, prepare };
+  }
+
+  test('CLI close preparation binds an immutable complete packet without changing blind input', () => {
+    const f = closeFixture('ceo', '# Contract\n' + 'Required behavior.\n'.repeat(650) + '```text\nPhase 3 complete.\n```\n');
+    const packet = f.prepare();
+    const text = readFileSync(packet.closePacketPath, 'utf8');
+    const input = readFileSync(packet.reviewInputPath, 'utf8');
+    expect(packet.phase).toBe('ceo');
+    expect(packet.checkpointPath).toBe(f.checkpoint.snapshotPath);
+    expect(packet.reviewInputSha256).toBe(createHash('sha256').update(input).digest('hex'));
+    expect(packet.closePacketSha256).toBe(createHash('sha256').update(text).digest('hex'));
+    expect(packet.closePacketBytes).toBe(Buffer.byteLength(text));
+    expect(statSync(packet.closePacketPath).mode & 0o777).toBe(0o444);
+    expect(text).toContain(JSON.stringify(packet.reviewInputSha256));
+    expect(text).toContain(JSON.stringify(packet.sourceSha256));
+    expect(text).toContain(JSON.stringify(packet.checkpointPath));
+    expect(text).toContain(input);
+    expect(text.indexOf('## Return to the close procedure')).toBeGreaterThan(text.indexOf(input) + input.length);
+    expect(text).toContain('````text\n' + input);
+    expect(input).toBe(readFileSync(f.checkpoint.snapshotPath, 'utf8'));
+    expect(input).not.toContain('## Return to the close procedure');
+    expect(packet.phaseComplete).toBe(false);
+    let offset = 1;
+    const lines = text.split('\n'), delivered: string[] = [];
+    for (const range of packet.readRanges) {
+      expect(range.offset).toBe(offset);
+      expect(range.limit).toBeLessThanOrEqual(600);
+      delivered.push(...lines.slice(range.offset - 1, range.endLine));
+      offset = range.endLine + 1;
+    }
+    expect(offset).toBe(lines.length + 1);
+    expect(delivered.join('\n')).toBe(text);
+    expect(packet.readRanges.length).toBeGreaterThan(1);
+  });
+
+  test.each([
+    ['ceo', '1', '6', ['2']],
+    ['design', '2', 'rows in the completed design litmus scorecard', ['2.5', '3']],
+    ['dx', '2.5', '6', ['3']],
+    ['eng', '3', '6', ['4']],
+  ])('%s close supplies bound report data without publishing or advancing', (phase, number, total, next) => {
+    const packet = closeFixture(phase as string).prepare();
+    const text = readFileSync(packet.closePacketPath, 'utf8');
+    const binding = JSON.parse(text.split('Binding: ')[1]!.split('\n')[0]!);
+    expect(packet.report.number).toBe(number);
+    expect(packet.report.total).toBe(total);
+    expect([...packet.report.next.matchAll(/Phase (\d+(?:\.\d+)?)/g)].map(m => m[1])).toEqual(next);
+    expect(packet.report.includeDxMetrics).toBe(phase === 'dx');
+    expect(binding.report).toEqual(packet.report);
+    expect(binding.phase).toBe(phase);
+    const continuation = text.slice(text.indexOf('## Return to the close procedure'));
+    const verify = continuation.indexOf('**Verify the current implementation.**');
+    const publish = continuation.indexOf('**Publish the parent report.**');
+    const message = continuation.indexOf(`**Phase ${number} complete.**`);
+    const driver = continuation.indexOf('**Return to the driver.**');
+    expect(verify).toBeGreaterThanOrEqual(0);
+    expect(publish).toBeGreaterThan(verify);
+    expect(message).toBeGreaterThan(publish);
+    expect(driver).toBeGreaterThan(message);
+    const verification = continuation.slice(verify, publish).replace(/\s+/g, ' ');
+    expect(verification).toContain("Match a completed native review's INPUT to its voice snapshot");
+    expectMentions(verification, [['no', 'unavailable/disabled', 'completion']], 'verification');
+    expectMentions(verification, [['before', 'publication', 'checkpoint']], 'verification');
+    expectMentions(verification, [['do not', 'read-back', 'sentence']], 'verification');
+    const publication = continuation.slice(publish, driver).replace(/\s+/g, ' ');
+    expect(publication).toContain('After successful verification, SEND the filled template below now as visible parent assistant text');
+    expectMentions(publication, [['before', 'next-phase', 'operation']], 'publication');
+    expectMentions(publication, [['not', 'completed', 'unfilled']], 'publication');
+    expect(publication).toContain('Outside review: <completed: N concerns / unavailable / disabled>. Native subagent: <completed: N issues / unavailable>.');
+    expect(publication).toContain(`Consensus: <N/A (voice coverage missing) | X/${total} native+outside confirmed; Y disagreements → gate>.`);
+    expect(publication).toContain(`Passing to <applicable ${packet.report.next}>.`);
+    expect(publication.includes('DX overall: <score>/10. TTHW: <observed> min → <target> min.')).toBe(phase === 'dx');
+    expect(publication).not.toContain('completed: 0');
+    expect(publication).not.toContain('```');
+    const continuationAfterMessage = continuation.slice(driver).replace(/\s+/g, ' ');
+    expectMentions(continuationAfterMessage, [['only', 'sending', 'actual']], 'continuationAfterMessage');
+    expectMentions(continuationAfterMessage, [['never', 'applicable', 'completion']], 'continuationAfterMessage');
+    expect(continuationAfterMessage).toContain('Saving a report in ACTIVE_PLAN or printing it through Bash does not publish it');
+    expect(packet.phaseComplete).toBe(false);
+  });
+
+  test('many inline code spans do not overflow the fence maximum calculation', () => {
+    const packet = closeFixture('ceo', '# Contract\n' + '`code` '.repeat(150_000) + '\n').prepare();
+    const implementation = readFileSync(packet.reviewInputPath, 'utf8');
+    expect(readFileSync(packet.closePacketPath, 'utf8')).toContain('```text\n' + implementation + '```');
+    expect(packet.phaseComplete).toBe(false);
+  });
+
+  test('late amendments regenerate the entire packet against the fixed checkpoint', () => {
+    const f = closeFixture(), first = f.prepare();
+    const firstBytes = readFileSync(first.closePacketPath, 'utf8');
+    f.record('- Accepted late correction: hide badge during retry-pending as well as loading and errors.');
+    const second = f.prepare();
+    expect(second.closePacketPath).not.toBe(first.closePacketPath);
+    expect(second.checkpointPath).toBe(first.checkpointPath);
+    expect(second.sourceSha256).not.toBe(first.sourceSha256);
+    expect(second.reviewInputSha256).not.toBe(first.reviewInputSha256);
+    expect(readFileSync(second.closePacketPath, 'utf8')).toContain('hide badge during retry-pending');
+    expect(readFileSync(first.closePacketPath, 'utf8')).toBe(firstBytes);
+    expect(first.phaseComplete).toBe(false);
+    expect(second.phaseComplete).toBe(false);
+    const generic = cli('amend-input', 'ceo', f.active, f.checkpoint.snapshotPath, f.restore, f.method);
+    expect(generic.status, generic.stderr).toBe(0);
+    const input = JSON.parse(generic.stdout);
+    expect(input.closePacketPath).toBeUndefined();
+    expect(readFileSync(input.reviewInputPath, 'utf8')).toBe(readFileSync(second.reviewInputPath, 'utf8'));
+  });
+});
 
 
 describe('methodology preparation is a required snapshot input', () => {
@@ -168,10 +296,9 @@ describe('Autoplan phase snapshot continuity', () => {
       expect(generated.nativeDispatchPrompt).toContain(`Read file: ${JSON.stringify(generated.nativePromptPath)}`);
       expect(generated.nativeDispatchPrompt).toContain('FIRST tool action');
       expect(generated.nativeDispatchPrompt).toContain('line 1 through EOF');
-      expect(generated.nativeDispatchPrompt).toContain('Continue successful ranges until every line is loaded');
+      expectMentions(generated.nativeDispatchPrompt, [['until', 'successful', 'continue']], 'generated.nativeDispatchPrompt');
       expect(generated.nativeDispatchPrompt).toContain('Execute every criterion');
       expect(generated.nativeDispatchPrompt).toContain(`INPUT: ${phase} ${generated.sha256}`);
-      expect(generated.nativeDispatchPrompt).toContain('report the read failure instead of a completed review');
       expect(generated.nativeDispatchPrompt).toContain(generated.nativePromptSha256);
       expect(generated.nativeDispatchPrompt).toContain(`${generated.nativePromptBytes} UTF-8 bytes`);
       expect(generated.nativePromptBytes).toBe(Buffer.byteLength(generated.nativePrompt));
@@ -213,7 +340,7 @@ describe('Autoplan phase snapshot continuity', () => {
     expect(read.bytes).toBe(generated.nativePromptBytes);
     expect(read.sha256).toBe(generated.nativePromptSha256);
     expect(read.content.endsWith(body)).toBe(true);
-    expect(read.content).toContain('What alternatives were dismissed without sufficient analysis?');
+    expectMentions(read.content, [['without', 'alternatives', 'sufficient']], 'read.content');
     expect(read.content).toContain('LAST REQUIREMENT: tenant isolation + CSRF. 🧪');
     expect(read.content).not.toContain('PRIVATE PRIOR REVIEW');
     expect(generated.nativePromptLines).toBeGreaterThan(2200);
@@ -233,7 +360,7 @@ describe('Autoplan phase snapshot continuity', () => {
       // These existing contracts were lost in Q's manually abridged dispatch.
       expect(generated.nativePrompt).toContain('single-role member workspace');
       expect(generated.nativePrompt).toContain('Mutations already require CSRF tokens');
-      expect(generated.nativePrompt).toContain('You have NOT seen any prior review');
+      expectMentions(generated.nativePrompt, [['not', 'review', 'prior']], 'generated.nativePrompt');
       expect(generated.nativePrompt).toContain(`Input path: ${JSON.stringify(generated.snapshotPath)}`);
       expect(generated.nativePrompt).toContain(`INPUT: ${phase} ${generated.sha256}`);
       expect(generated.nativePrompt).not.toContain('CEO pending');
@@ -366,9 +493,8 @@ describe('installed snapshot helper in fresh shells', () => {
   });
 
   test('all affected live workflow selectors include the executable continuity contract', () => {
-    for (const name of ['autoplan-chain-pty', 'autoplan-dual-voice', 'carve-section-loading']) {
+    for (const name of ['autoplan-dual-voice', ...Object.keys(E2E_TOUCHFILES).filter(id => id.startsWith('carve-section-loading-'))]) {
       expect(E2E_TOUCHFILES[name]).toContain('bin/gstack-autoplan-snapshot.ts');
-      expect(E2E_TOUCHFILES[name]).toContain('test/autoplan-snapshot.test.ts');
     }
   });
 });

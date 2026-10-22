@@ -24,13 +24,30 @@ import { skillCensus } from './helpers/skill-census';
  *           line item, run parseFrontmatter() below and sum
  *           Buffer.byteLength(name) + Buffer.byteLength(description);
  *           token-equivalents = ceil(bytes / 4).
- *   result  53 authored skills = 4,371 bytes (1,093 token-equivalents);
- *           + root router alias 49 bytes = 4,420 bytes total
- *           = 1,105 token-equivalents (measured 2026-08-12)
- * Ceiling is 1,150 token-equivalents (4,600 bytes), so headroom is 180 bytes
- * (~4%). Dominant skill: design-consultation at 229 bytes name+description.
+ *   ref     deslop-shared-libs addition on base a6b3a575 (2026-09-16)
+ *   result  pre-addition aggregate 4,593 bytes; deslop-shared-libs adds
+ *           82 bytes (name + concise description), yielding 4,675 bytes
+ *           = 1,169 token-equivalents including the root router alias.
+ * New-skill ratchet: previous ceiling 1,150 + ceil(82 / 4) = 1,171
+ * token-equivalents (4,684 bytes), leaving 9 bytes. Existing descriptions
+ * are unchanged. Dominant skill: design-consultation at 229 bytes.
+ *   ref     test-audit addition on base 943105f1 (2026-09-29)
+ *   result  pre-addition aggregate 4,680 bytes; test-audit adds 92 bytes
+ *           (name + concise description), yielding 4,772 bytes = 1,193
+ *           token-equivalents including the root router alias.
+ * New-skill ratchet: previous ceiling 1,171 + ceil(92 / 4) = 1,194
+ * token-equivalents (4,776 bytes), leaving 4 bytes. Existing descriptions
+ * are unchanged.
+ *   ref     eval-plan addition on base 7552362 (2026-10-10)
+ *   result  pre-addition aggregate 4,776 bytes; eval-plan adds 10 bytes
+ *           (its description is a `|` block scalar, counted as the other
+ *           block-scalar skills are), yielding 4,786 bytes = 1,197
+ *           token-equivalents including the root router alias.
+ * New-skill ratchet: previous ceiling 1,194 + ceil(10 / 4) = 1,197
+ * token-equivalents (4,788 bytes), leaving 2 bytes. Existing descriptions
+ * are unchanged.
  */
-const CATALOG_BUDGET_TOKEN_EQUIVALENTS = 1_150;
+const CATALOG_BUDGET_TOKEN_EQUIVALENTS = 1_197;
 
 // Largest today: design-consultation at 229 bytes. A description that needs
 // more than 260 bytes is a body paragraph, not a catalog entry.

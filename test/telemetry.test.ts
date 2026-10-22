@@ -8,14 +8,18 @@ const ROOT = path.resolve(import.meta.dir, '..');
 const BIN = path.join(ROOT, 'bin');
 
 // Each test owns its state and HTTP transport. The real logger backgrounds
-// sync while retaining stdout, so execSync also waits for that transport.
+// sync while retaining stdout, and run() waits for that transport: the
+// command's stdout goes through cat, which exits only after every holder of
+// the pipe (the backgrounded sync included) closes it. execSync alone does
+// not guarantee that wait (Bun 1.3.x returns when the direct child exits).
 // Letting it reach the configured backend made a slow curl exceed our 10s
 // command timeout before the local marker assertions could run.
 let tmpDir: string;
 const FIXTURE_SUPABASE_URL = 'https://telemetry.fixture.invalid';
 
 function run(cmd: string, env: Record<string, string> = {}): string {
-  return execSync(cmd, {
+  return execSync(`{ ${cmd}\n} | cat; exit "\${PIPESTATUS[0]}"`, {
+    shell: '/bin/bash',
     cwd: ROOT,
     env: {
       ...process.env,
@@ -321,13 +325,9 @@ describe('gstack-telemetry-log', () => {
     expect(events[0].error_message.length).toBeLessThanOrEqual(200);
   });
 
-  test('fails closed: error_message becomes null when the engine cannot relocate a span (#1947)', () => {
+  test('redacts an anchored error_message value at its original offset (#1947, #2930)', () => {
     setConfig('telemetry', 'anonymous');
     const secret = '8Fk2pQ9vXz4wL7mN3rT6yB1cD5eG0hJq';
-    // env.kv-shaped finding (line-anchored, so the assignment leads the
-    // message): the span (value) starts past the regex match start,
-    // locateSpan misses it, redactFindingSpans returns null — the bin must
-    // drop the whole message, never pass it through raw.
     run(
       `${BIN}/gstack-telemetry-log --skill qa --duration 10 --outcome error --error-message 'API_KEY=${secret} rejected by daemon' --session-id red-4`,
     );
@@ -335,7 +335,7 @@ describe('gstack-telemetry-log', () => {
     const lines = readJsonl();
     expect(lines).toHaveLength(1);
     const event = JSON.parse(lines[0]);
-    expect(event.error_message).toBeNull();
+    expect(event.error_message).toBe('API_KEY=<REDACTED-env.kv> rejected by daemon');
     expect(lines[0]).not.toContain(secret);
   });
 

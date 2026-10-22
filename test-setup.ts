@@ -16,6 +16,29 @@
  * stays dead.
  */
 import { afterEach, beforeAll } from 'bun:test';
+import * as os from 'node:os';
+import * as path from 'node:path';
+
+// State-root hermeticity (docs/state-root.md). Tests isolate state with
+// GSTACK_HOME, but GSTACK_STATE_ROOT and GSTACK_STATE_DIR outrank or join it
+// in the chain, so an ambient value from the parent shell would redirect
+// every test's state. Strip them before any test module loads. The merged
+// privacy keys also read $HOME/.gstack; point that second root at a
+// per-process path that is never created (an empty root that leaves no
+// residue in fixtures that audit their temp dirs), so a developer's real
+// config never changes a result (only the dedicated merge tests unset
+// GSTACK_TEST_LEGACY_ROOT).
+for (const name of ['GSTACK_STATE_ROOT', 'GSTACK_STATE_DIR']) {
+  if (process.env[name] === undefined) continue;
+  delete process.env[name];
+  process.stderr.write(`test-setup: stripped inherited ${name}; tests isolate state via GSTACK_HOME\n`);
+}
+process.env.GSTACK_TEST_LEGACY_ROOT = path.join(os.tmpdir(), `gstack-test-legacy-root-${process.pid}-${Date.now()}-unused`);
+// Workflow leases (bin/gstack-lease) default to the installation's git dir;
+// for the dev checkout under test that is this repo's .git, and a live test
+// runner's lease would make `bin/gstack-upgrade` here refuse UPGRADE_BUSY.
+// Every spawned bin inherits a per-process scratch lease directory instead.
+process.env.GSTACK_LEASE_DIR ??= path.join(os.tmpdir(), `gstack-test-leases-${process.pid}`);
 
 // Narrowly restore PATH after every test. Defends against the recurring
 // pollution class where one test sets `process.env.PATH = '/test/bin:/usr/bin'`

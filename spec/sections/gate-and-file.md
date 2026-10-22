@@ -27,15 +27,29 @@ AskUserQuestion: A) edit, B) acknowledge and proceed, C) cancel. **On a PUBLIC r
 option B is disabled** — force A or C. This pass is fail-soft (LLM judgment); the
 4.5b regex is the deterministic backstop and runs after it.
 
-**Audit trail (always):** append a content-free record — no spec text, only the
-categories that fired plus a sha256 of the body:
+**Write the final draft into a private file once.** The audit record, the
+redaction scans, the outside reviewer, the issue and the archive all read this
+one file; the draft never goes into a shell command:
 
 ```bash
-printf '%s' "<the final draft body>" > /tmp/spec-semantic-$$.txt
-bun ~/.claude/skills/gstack/lib/redact-audit-log.ts \
+_GT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp"
+mkdir -p "$_GT" && chmod 700 "$_GT" || { echo "Not sent: cannot create $_GT for the text file." >&2; exit 1; }
+_EX=$(git rev-parse --git-path info/exclude 2>/dev/null) && mkdir -p "$(dirname "$_EX")" && { grep -qxF '/.gstack/tmp/' "$_EX" 2>/dev/null || echo '/.gstack/tmp/' >> "$_EX"; }
+REDACT_FILE=$(mktemp "${_GT:?}/spec.XXXXXX") || { echo "Not sent: mktemp failed in $_GT." >&2; exit 1; }; echo "REDACT_FILE: $REDACT_FILE (name: ${REDACT_FILE##*/})"
+```
+
+Write the text into each printed file with your file-write tool (Claude Code's Write tool needs a Read of the empty file first), exactly as it should appear. The text never goes into a shell command, heredoc or quoted argument. If a write fails or is refused, do not send: print the cause, the file path and the command below for sending by hand.
+
+**Audit trail (always):** append a content-free record — no spec text, only the
+categories that fired plus a sha256 of the body. Substitute the printed name for
+`<redact-file-name>`:
+
+```bash
+REDACT_FILE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp/<redact-file-name>"
+[ -s "$REDACT_FILE" ] || { echo "No audit record: $REDACT_FILE is missing or empty; write the draft into it first." >&2; exit 1; }
+bun --no-env-file --config=/dev/null ~/.claude/skills/gstack/lib/redact-audit-log.ts \
   "{\"repo_visibility\":\"$REDACT_VIS\",\"outcome\":\"<clean|flagged>\",\"categories_flagged\":[<...>],\"spec_archive_path\":\"\"}" \
-  /tmp/spec-semantic-$$.txt
-rm -f /tmp/spec-semantic-$$.txt
+  "$REDACT_FILE"
 ```
 
 ### Phase 4.5b: Fail-closed redaction (PRECEDES dispatch)
@@ -47,8 +61,10 @@ before dispatching to the outside reviewer:
 
 #### Redaction scan — pre-codex (the spec body)
 
-Scan-at-sink on the EXACT bytes that will be sent: write to a temp file, scan that
-file, pass the SAME file downstream. Never scan a string then re-render it.
+Scan-at-sink on the EXACT bytes that will be sent: they live in the private file
+you wrote with your file-write tool, the scan reads that file, and the SAME file goes
+downstream. Never scan a string then re-render it, and never put the text in a shell
+command. Substitute the file's printed name for `<redact-file-name>`.
 
 ```bash
 command -v bun >/dev/null 2>&1 || { echo "ERROR: bun unavailable — refusing unscanned outside dispatch." >&2; exit 1; }
@@ -58,10 +74,8 @@ REDACT_VIS=$(~/.claude/skills/gstack/bin/gstack-config get redact_repo_visibilit
 [ -z "$REDACT_VIS" ] && REDACT_VIS=$(gh repo view --json visibility -q .visibility 2>/dev/null | tr 'A-Z' 'a-z')
 [ -z "$REDACT_VIS" ] && REDACT_VIS=$(glab repo view -F json 2>/dev/null | grep -o '"visibility":"[^"]*"' | head -1 | sed 's/.*:"//;s/"//' | tr 'A-Z' 'a-z')
 REDACT_VIS="${REDACT_VIS:-unknown}"
-REDACT_FILE=$(mktemp) || { echo "ERROR: mktemp failed — refusing to send the spec body unscanned." >&2; exit 1; }
-cat > "$REDACT_FILE" <<'REDACT_BODY_EOF'
-<the exact the spec body goes here>
-REDACT_BODY_EOF
+REDACT_FILE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp/<redact-file-name>"
+[ -s "$REDACT_FILE" ] || { echo "ERROR: $REDACT_FILE is missing or empty — write the spec body into it first; refusing to send it unscanned." >&2; exit 1; }
 if REDACT_JSON=$("$HOME/.claude/skills/gstack/bin/gstack-redact" --from-file "$REDACT_FILE" --repo-visibility "$REDACT_VIS" --self-email "$(git config user.email 2>/dev/null)" --json); then REDACT_CODE=0; else REDACT_CODE=$?; fi
 case "$REDACT_CODE" in
   0) ;; # Only a successful scan may reach an outside or downstream sink.
@@ -115,8 +129,7 @@ dispatch. `spec-quality-gate-secret-sink.test.ts` enforces this.
 
 ```bash
 
-_OUTSIDE_CFG=enabled # This caller has its own opt-in/skip control.
-if [ "$_OUTSIDE_CFG" = disabled ]; then
+if ! _OUTSIDE_CFG=$("$HOME/.claude/skills/gstack/bin/gstack-config" get --stored codex_reviews) || [ "$_OUTSIDE_CFG" = disabled ]; then
   echo 'CODEX_MODE: disabled'
 elif ( # GSTACK_ACTIVE_HOST names the harness, never the model.
 if { [ -n "${CODEX_THREAD_ID:-}" ] || [ -n "${CODEX_SANDBOX:-}" ] || [ "${GSTACK_ACTIVE_HOST:-}" = codex ]; }; then
@@ -135,7 +148,7 @@ else
 fi
 ```
 
-The historical `CODEX_MODE` variable describes **Codex** availability here. Authentication and configured model validity are checked by the actual invocation, without overriding either. Missing/broken CLI: install or repair Codex; authentication failure: run `codex login`. Honor this caller’s existing opt-in/skip choice. Any non-ready outcome is missing outside coverage; follow the caller’s existing fallback. Never substitute another external provider.
+The historical `CODEX_MODE` variable describes **Codex** availability here. `CODEX_MODE: disabled` or a send's `consent_missing` line: `codex_reviews` is off or unreadable; do not ask; record `outside_status: disabled`. The invocation checks auth and the [policy](https://github.com/garrytan/gstack/blob/main/docs/model-policy.md) plan-review model. Missing/broken CLI: install or repair Codex; authentication failure: run `codex login`. Otherwise honor this caller’s opt-in/skip choice. Any non-ready outcome is missing outside coverage; follow the caller’s existing fallback. Never substitute another external provider.
 
 Write the prompt with the exact redaction-approved spec bytes using the Write tool; never shell-interpolate the raw draft. Keep hard delimiters and this boundary:
 
@@ -144,7 +157,7 @@ Write the prompt with the exact redaction-approved spec bytes using the Write to
 <exact redaction-approved spec bytes>
 <<<END_USER_SPEC>>>"
 
-Use Write to save the **complete prompt and context** in a private file. Replace `<prepared-prompt-file>` below with its shell-quoted path; never interpolate user text into shell source. Include actual plan/spec/source content. Request exactly SCORE: N (integer 0-10) and AMBIGUITIES: ... (or NONE), as two distinct nonempty lines. A refusal is never completion.
+Write the **complete prompt and context**, including actual plan/spec/source, to a private file. Substitute its shell-quoted path for `<prepared-prompt-file>`; never interpolate user text into shell source. Request exactly SCORE: N (integer 0-10) and AMBIGUITIES: ... (or NONE), as two distinct nonempty lines.
 
 ```bash
 # GSTACK_ACTIVE_HOST names the harness, never the model.
@@ -164,27 +177,31 @@ trap 'rm -rf "$_OUTSIDE_TMP"' EXIT
 _OUTSIDE_INPUT="$_OUTSIDE_TMP/prompt"
 cat -- '<prepared-prompt-file>' >"$_OUTSIDE_INPUT" || exit 1
 
-source "$HOME/.claude/skills/gstack/bin/gstack-codex-probe" || exit 1
-_gstack_codex_timeout_wrapper 120 codex exec "$(cat "$_OUTSIDE_INPUT")" -C "$_REPO_ROOT" -s read-only -c "model=\"${GSTACK_CODEX_MODEL:-gpt-6-astra}\"" -c 'model_reasoning_effort="medium"' -c 'web_search="cached"' < /dev/null >"$_OUTSIDE_TMP/text" 2>"$_OUTSIDE_TMP/stderr"
-_OUTSIDE_EXIT=$?
-# Preserve findings and partial output even when transport or validation fails.
-cat "$_OUTSIDE_TMP/text"
+_CODEX_PROBE="$HOME/.claude/skills/gstack/bin/gstack-codex-probe"
+export _CODEX_DEADLINE=$(($(date +%s)+120)); _CODEX_OUT=$("$_CODEX_PROBE" role-ready exec) || exit $?
+_CODEX_SEL=$(echo "$_CODEX_OUT" | sed -n 's/^CODEX_SEL: //p')
+_CODEX_SANDBOX_MODE=$(echo "$_CODEX_OUT" | sed -n 's/^CODEX_SANDBOX: //p')
+"$_CODEX_PROBE" show-first-use-notice
+_OUTSIDE_EXIT=0
+"$_CODEX_PROBE" run-with-timeout 120 codex exec - -C "$_REPO_ROOT" -s "${_CODEX_SANDBOX_MODE:?}" -c "model=\"${_CODEX_SEL:?}\"" -c skills.include_instructions=false -c 'model_reasoning_effort="medium"' -c 'web_search="cached"' --json -o "$_OUTSIDE_TMP/text" <"$_OUTSIDE_INPUT" >"$_OUTSIDE_TMP/events" 2>"$_OUTSIDE_TMP/stderr" || _OUTSIDE_EXIT=$?
+cat "$_OUTSIDE_TMP/text" 2>/dev/null || tail -n 20 "$_OUTSIDE_TMP/events"
 
-cat "$_OUTSIDE_TMP/stderr" >&2
-if [ "$_OUTSIDE_EXIT" -ne 0 ]; then
-  echo 'Codex outside review unavailable: execution failed; missing coverage. Check the provider diagnosis above.' >&2
-  exit "$_OUTSIDE_EXIT"
-fi
-bun "$HOME/.claude/skills/gstack/lib/outside-review-result.ts" spec "$_OUTSIDE_TMP/text" || exit 1
-
+cat "$_OUTSIDE_TMP/stderr" >&2 || { [ "$_OUTSIDE_EXIT" -ne 0 ] || _OUTSIDE_EXIT=1; }
+_OUTSIDE_RC=0
+bun --no-env-file --config=/dev/null "$HOME/.claude/skills/gstack/lib/outside-review-result.ts" --label 'Codex outside review' --exit "$_OUTSIDE_EXIT" --stderr "$_OUTSIDE_TMP/stderr" --events "$_OUTSIDE_TMP/events" spec "$_OUTSIDE_TMP/text" || _OUTSIDE_RC=$?
+case "$_OUTSIDE_RC" in
+  0|3) ;;
+  4) echo 'OUTSIDE_STATUS: unverified provider=codex host=claude'; exit 4 ;;
+  *) [ "$_OUTSIDE_EXIT" -ne 0 ] && exit "$_OUTSIDE_EXIT"; exit 1 ;;
+esac
 echo 'OUTSIDE_STATUS: completed provider=codex host=claude'
 ```
 
-Show the full response in a `tool-output` fence. Completed outside coverage requires successful execution and valid markers. Refusal, empty/malformed output, missing score/severity/completion markers, timeout, or CLI failure means `outside_status: unavailable`. Follow this caller's fallback; missing coverage is never clean/PASS. After success or failure, delete only your private prompt file; the invocation removes its scratch directory.
+Use Bash `timeout: 180000`; show the full response in a `tool-output` fence. Require successful execution and valid markers. Refusal, empty/malformed output, missing score/severity/completion markers, timeout or CLI failure means `outside_status: unavailable`. P0/P1 findings block like native ones; `OUTSIDE_STATUS: unverified` is missing coverage. Use the caller's fallback; missing coverage is never clean/PASS. After either outcome, delete only your private prompt; scratch cleanup is automatic.
 
 Missing/broken CLI, authentication failure, timeout, refusal, nonzero exit, invalid JSON, empty response, output overflow, or missing/invalid SCORE and AMBIGUITIES means missing coverage: name Codex, give the emitted diagnosis/setup command, mark unavailable, and continue to Phase 5 under the existing fallback. Never label these outcomes PASS. The CLI's transport success alone cannot pass the quality gate.
 
-For this phase (spec-quality-gate), retain the historical review-log skill identifier. Add `"host":"claude","outside_provider":"codex","outside_status":"completed|unavailable|disabled|skipped","phase":"spec-quality-gate"`. Record each attempted pass separately when outcomes differ. Use `source:"codex"` only for completed external CLI output, and `source:"in-host"` for a native pass. Historical `source:"claude"` continues to mean a native Claude subagent. CLI availability or a native fallback does not count as outside completion. Preserve reported modelUsage, including multiple models; unknown model identity stays unknown.
+Retain the historical review-log skill ID; add `"host":"claude","outside_provider":"codex","outside_status":"completed|unavailable|disabled|skipped","phase":"spec-quality-gate"`. Record differing attempt outcomes separately. `source:"codex"` requires completed CLI output; native uses `source:"in-host"` (historical `source:"claude"`: native Claude). Availability/native fallback is not outside completion. Preserve all reported modelUsage; unknown model identity stays unknown. Under `GSTACK_CODEX_NO_SANDBOX=1` add `"codex_sandbox":"danger-full-access"`.
 
 **Scoring outcomes:**
 
@@ -201,12 +218,6 @@ For this phase (spec-quality-gate), retain the historical review-log skill ident
   - C) One more revision attempt
 
 Max 3 dispatches total. If still <7 after iter 3, AskUserQuestion same options.
-
-
-
-**Audit-sink invariant:** When the redaction gate fires, the raw spec must NOT
-be persisted anywhere downstream (no archive write, no transcript log). The
-`spec-quality-gate-secret-sink.test.ts` enforces this.
 
 ### Phase 5: File the Spec (+ optional --execute)
 
@@ -237,27 +248,47 @@ interrupt before the work happens.
 
 #### File the issue (always)
 
-**Re-scan before filing** (Phase 4 edits can introduce content the 4.5b scan
-never saw, and the issue is world-readable):
-
-#### Redaction scan — pre-issue (the issue body you're about to file)
-
-Run the SAME scan-at-sink procedure shown above (resolve `$REDACT_VIS` once and
-reuse it; write the exact bytes to `$REDACT_FILE`; `~/.claude/skills/gstack/bin/gstack-redact --from-file "$REDACT_FILE"
---repo-visibility "$REDACT_VIS" --json`), now on the issue body you're about to file. Apply the same
-exit-3/2/0 handling. On exit 3, do NOT file the issue; HIGH has no skip. Pass the
-same `$REDACT_FILE` downstream so the bytes scanned are the bytes sent.
-
-If `gh` is available and authenticated, file from the scanned temp file:
+If `gh` is available and authenticated, file from the scanned draft file. The title
+and the one-line approach for the decision log are free text too, so they go into their
+own private files:
 
 ```bash
-ISSUE_URL=$(gh issue create --title "<title>" --body-file "$REDACT_FILE")
-ISSUE_NUMBER=$(echo "$ISSUE_URL" | sed -E 's|.*/issues/([0-9]+)$|\1|')
-echo "Filed: $ISSUE_URL"
-~/.claude/skills/gstack/bin/gstack-decision-log '{"decision":"Spec filed #ISSUE_NUMBER: TITLE","rationale":"APPROACH","scope":"issue","issue":"ISSUE_NUMBER","source":"skill","confidence":7}' 2>/dev/null || true
+_GT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp"
+mkdir -p "$_GT" && chmod 700 "$_GT" || { echo "Not sent: cannot create $_GT for the text file." >&2; exit 1; }
+_EX=$(git rev-parse --git-path info/exclude 2>/dev/null) && mkdir -p "$(dirname "$_EX")" && { grep -qxF '/.gstack/tmp/' "$_EX" 2>/dev/null || echo '/.gstack/tmp/' >> "$_EX"; }
+TITLE_FILE=$(mktemp "${_GT:?}/title.XXXXXX") || { echo "Not sent: mktemp failed in $_GT." >&2; exit 1; }; echo "TITLE_FILE: $TITLE_FILE (name: ${TITLE_FILE##*/})"
+APPROACH_FILE=$(mktemp "${_GT:?}/approach.XXXXXX") || { echo "Not sent: mktemp failed in $_GT." >&2; exit 1; }; echo "APPROACH_FILE: $APPROACH_FILE (name: ${APPROACH_FILE##*/})"
 ```
 
-The last line records the spec as a durable, issue-scoped cross-session decision so a future session (or `/ship` closing the issue) inherits the core approach and why, not just the issue link. Non-interactive, best-effort (`|| true`). Substitute `ISSUE_NUMBER` (from the filed issue), `TITLE` (the issue title), and `APPROACH` (the one core approach/decision the spec settled). Only fires when the issue was actually filed.
+Write the text into each printed file with your file-write tool (Claude Code's Write tool needs a Read of the empty file first), exactly as it should appear. The text never goes into a shell command, heredoc or quoted argument. If a write fails or is refused, do not send: print the cause, the file path and the command below for sending by hand.
+
+Then file, substituting the three printed names. `gstack-post` scans the exact title
+and body it sends (Phase 4 edits can introduce content the 4.5b scan never saw, and the
+issue is world-readable) and passes both to `gh` as arguments:
+
+```bash
+REDACT_FILE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp/<redact-file-name>"
+TITLE_FILE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp/<title-file-name>"
+APPROACH_FILE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp/<approach-file-name>"
+[ -s "$REDACT_FILE" ] && [ -s "$TITLE_FILE" ] || { echo "Not filed: $REDACT_FILE or $TITLE_FILE is missing or empty. Write them, then file by hand: ~/.claude/skills/gstack/bin/gstack-post issue-create --title-file $TITLE_FILE --body-file $REDACT_FILE" >&2; exit 1; }
+POST_OUT=$(~/.claude/skills/gstack/bin/gstack-post issue-create --title-file "$TITLE_FILE" --body-file "$REDACT_FILE"); POST_CODE=$?
+printf '%s\n' "$POST_OUT"
+[ "$POST_CODE" = 0 ] || { echo "Not filed (gstack-post exit $POST_CODE)." >&2; exit "$POST_CODE"; }
+ISSUE_URL=$(printf '%s\n' "$POST_OUT" | grep -m1 -E '^https?://')
+ISSUE_NUMBER=$(echo "$ISSUE_URL" | sed -E 's|.*/issues/([0-9]+)$|\1|')
+echo "Filed: $ISSUE_URL (ISSUE_NUMBER: $ISSUE_NUMBER)"
+[ -s "$APPROACH_FILE" ] && ~/.claude/skills/gstack/bin/gstack-decision-log "$(jq -cn --arg n "$ISSUE_NUMBER" --rawfile t "$TITLE_FILE" --rawfile a "$APPROACH_FILE" \
+  '{decision: ("Spec filed #" + $n + ": " + ($t | rtrimstr("\n"))), rationale: ($a | rtrimstr("\n")), scope: "issue", issue: $n, source: "skill", confidence: 7}')" 2>/dev/null || true
+rm -f "$APPROACH_FILE"
+```
+
+Exit 1 (HIGH): do NOT file; rotate and redact at source, no skip. Exit 2 (MEDIUM): ask
+per printed `RULE:` line exactly as in the 4.5b disposition (auto-redact rewrites
+`$REDACT_FILE`, which the archive then uses); when the user accepts a finding as it
+is, rerun the block with `--confirm <confirm-token>` after `--body-file "$REDACT_FILE"`.
+Any edit needs a new scan, so the token no longer applies. Exit 3: `gh` failed; report it.
+
+The last line records the spec as a durable, issue-scoped cross-session decision so a future session (or `/ship` closing the issue) inherits the core approach and why, not just the issue link. Non-interactive, best-effort (`|| true`). The approach file holds the one core approach/decision the spec settled. Only fires when the issue was actually filed.
 
 If `gh` is not available, print: "`gh` not authenticated — title and body below
 for paste into https://github.com/{owner}/{repo}/issues/new with zero
@@ -273,60 +304,65 @@ is consumed by `/ship` for auto-close.
 #### Redaction scan — pre-archive (the body about to be archived)
 
 Run the SAME scan-at-sink procedure shown above (resolve `$REDACT_VIS` once and
-reuse it; write the exact bytes to `$REDACT_FILE`; `~/.claude/skills/gstack/bin/gstack-redact --from-file "$REDACT_FILE"
+reuse it; when the body about to be archived changed since the last scan, rewrite the same `$REDACT_FILE`
+with your file-write tool; `~/.claude/skills/gstack/bin/gstack-redact --from-file "$REDACT_FILE"
 --repo-visibility "$REDACT_VIS" --json`), now on the body about to be archived. Apply the same
 exit-3/2/0 handling. On exit 3, do NOT write the archive; HIGH has no skip. Pass the
 same `$REDACT_FILE` downstream so the bytes scanned are the bytes sent.
 
-**D2 — sanitized body to the archive.** If auto-redact fired, the `<body>` below
-MUST be the sanitized body (`$REDACT_FILE`), not the original draft — one body for
-all sinks. The user's on-disk source draft keeps the original.
+**Sanitized body to the archive.** If auto-redact fired, the archived body MUST be
+the sanitized body (`$REDACT_FILE`), not the original draft — one body for all sinks.
+The user's on-disk source draft keeps the original. Title and body are copied from
+their files, never expanded by the shell.
 
 Resolve the archive path via the existing `gstack-paths` helper (handles
-`GSTACK_HOME`, `CLAUDE_PLUGIN_DATA`, Windows fallback):
+`GSTACK_HOME`, `CLAUDE_PLUGIN_DATA`, Windows fallback). Substitute the printed file
+names and the filed issue number for `<issue-number>` (digits, or empty when no
+issue was filed):
 
 ```bash
-eval "$(~/.claude/skills/gstack/bin/gstack-paths)"
-eval "$(~/.claude/skills/gstack/bin/gstack-slug)"
+REDACT_FILE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp/<redact-file-name>"
+TITLE_FILE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp/<title-file-name>"
+[ -s "$REDACT_FILE" ] && [ -s "$TITLE_FILE" ] || { echo "Not archived: $REDACT_FILE or $TITLE_FILE is missing or empty." >&2; exit 1; }
+ISSUE_NUMBER=<issue-number>
+ISSUE_URL=$([ -n "$ISSUE_NUMBER" ] && gh issue view "$ISSUE_NUMBER" --json url -q .url 2>/dev/null)
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
+SLUG=$(~/.claude/skills/gstack/bin/gstack-slug --get SLUG)
 ARCHIVE_DIR="$GSTACK_STATE_ROOT/projects/$SLUG/specs"
 mkdir -p "$ARCHIVE_DIR"
-SLUG_TITLE=$(echo "<title>" | tr ' ' '-' | tr -cd 'a-zA-Z0-9-' | tr A-Z a-z | cut -c1-60)
+SLUG_TITLE=$(head -1 "$TITLE_FILE" | tr ' ' '-' | tr -cd 'a-zA-Z0-9-' | tr A-Z a-z | cut -c1-60)
 ARCHIVE_NAME="$(date +%Y%m%d-%H%M%S)-$$-${SLUG_TITLE}.md"
 ARCHIVE_PATH="$ARCHIVE_DIR/$ARCHIVE_NAME"
 # Atomic write: tmp → rename
-cat > "$ARCHIVE_PATH.tmp" <<EOF
----
-spec_issue_number: ${ISSUE_NUMBER:-}
-spec_issue_url: ${ISSUE_URL:-}
-spec_filed_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)
-spec_branch: $(git branch --show-current 2>/dev/null || echo unknown)
-spec_plan_mode: ${GSTACK_PLAN_MODE:-unset}
-spec_executed: ${WILL_EXECUTE:-false}
-spec_worktree_path:
-ttfc_ms: ${TTFC_MS:-}
-tthw_ms: ${TTHW_MS:-}
----
-
-# <title>
-
-<body>
-EOF
-mv "$ARCHIVE_PATH.tmp" "$ARCHIVE_PATH"
-echo "Archived: $ARCHIVE_PATH"
+{
+  printf -- '---\n'
+  printf 'spec_issue_number: %s\n' "$ISSUE_NUMBER"
+  printf 'spec_issue_url: %s\n' "$ISSUE_URL"
+  printf 'spec_filed_at: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf 'spec_branch: %s\n' "$(git branch --show-current 2>/dev/null || echo unknown)"
+  printf 'spec_plan_mode: %s\n' "${GSTACK_PLAN_MODE:-unset}"
+  printf 'spec_executed: %s\n' "${WILL_EXECUTE:-false}"
+  printf 'spec_worktree_path:\n---\n\n# '
+  head -1 "$TITLE_FILE"
+  printf '\n'
+  cat "$REDACT_FILE"
+} > "$ARCHIVE_PATH.tmp"
+mv "$ARCHIVE_PATH.tmp" "$ARCHIVE_PATH" && rm -f "$TITLE_FILE"
+echo "Archived: $ARCHIVE_PATH (SLUG_TITLE: $SLUG_TITLE)"
 ```
 
 The PID suffix and atomic rename prevent collisions when two `/spec` invocations
 run in the same second.
 
 **Sync default:** `/specs/` is auto-excluded from the artifacts-sync allowlist —
-archives stay local unless the user opts in via `--sync-archive` (privacy default
-per codex review). If `--sync-archive` is passed, append `/specs/<archive_name>`
+archives stay local unless the user opts in via `--sync-archive` (privacy default).
+If `--sync-archive` is passed, append `/specs/<archive_name>`
 to the artifacts-sync allowlist (or symlink into the synced dir, depending on
 implementation).
 
 #### Spawn the agent (`--execute` path only)
 
-**E2 dirty-worktree gate:**
+**Dirty-worktree gate:**
 
 ```bash
 DIRTY=$(git status --porcelain 2>/dev/null)
@@ -339,7 +375,7 @@ If `$DIRTY` is non-empty, AskUserQuestion:
 - B) Stash and restore (auto-stash now, restore after spawn returns)
 - C) Cancel spawn (stop here; issue stays filed, archive stays written)
 
-**E2 TOCTOU re-check (F1):** After the user answers, IMMEDIATELY re-run
+**TOCTOU re-check:** After the user answers, IMMEDIATELY re-run
 `git status --porcelain` before any worktree operation. If state diverged
 from the answer, re-prompt the AskUserQuestion. The check must happen INSIDE
 the spawn workflow, not be cached from earlier.
@@ -352,48 +388,74 @@ git stash push -u -m "spec-execute-auto-$$"  # untracked YES, ignored NO
 STASH_REF="spec-execute-auto-$$"
 ```
 
-F2 stash policy: `-u` includes untracked; we deliberately do NOT use `--all`
+Stash policy: `-u` includes untracked; we deliberately do NOT use `--all`
 because ignored files (build artifacts, .env caches) are usually local-by-design
 and should stay in the current worktree.
 
 If C: print "Cancelled spawn. Issue filed: $ISSUE_URL, archive: $ARCHIVE_PATH."
 Exit /spec.
 
-**F4 SHA pin:** Capture the exact SHA AFTER the final dirty check. Use this
+**SHA pin:** Capture the exact SHA AFTER the final dirty check. Use this
 SHA (not "HEAD") for the worktree:
 
 ```bash
 PIN_SHA=$(git rev-parse HEAD)
 ```
 
-**F5 unique branch + worktree path:** Suffix with `$$` to avoid concurrent
+**Unique branch + worktree path:** Suffix with `$$` to avoid concurrent
 collisions:
 
 ```bash
 SPAWN_BRANCH="spec/${SLUG_TITLE}-$$"
 SPAWN_PATH="${WORKTREE_PARENT:-../worktrees}/${SLUG_TITLE}-$$"
-mkdir -p "$(dirname "$SPAWN_PATH")"
+mkdir -p "$(dirname "$SPAWN_PATH")" && SPAWN_PATH="$(cd -- "$(dirname "$SPAWN_PATH")" && pwd -P)/$(basename "$SPAWN_PATH")" || exit 1
+echo "SPAWN_BRANCH=$SPAWN_BRANCH SPAWN_PATH=$SPAWN_PATH PIN_SHA=${PIN_SHA:-}"
 ```
 
-**D16 mandatory final-confirm gate:** AskUserQuestion: "Spawn agent now? Last
+Shell variables do not survive between tool calls: start each block below by
+assigning `SPAWN_PATH`, `SPAWN_BRANCH`, `PIN_SHA` and `ARCHIVE_PATH` from the
+values printed above.
+
+**Final-confirm gate (required):** AskUserQuestion: "Spawn agent now? Last
 chance to revise the spec." Options: A) Spawn. B) Cancel (issue stays filed,
 archive stays written).
 
 If A:
 
 ```bash
+: "${SPAWN_PATH:?SPAWN_PATH is not set: substitute the printed path}" "${SPAWN_BRANCH:?SPAWN_BRANCH is not set}" "${PIN_SHA:?PIN_SHA is not set}"
 git worktree add "$SPAWN_PATH" -b "$SPAWN_BRANCH" "$PIN_SHA" 2>&1
 ```
 
 **Error: worktree create fails** (disk full, path exists, etc.): print:
 "Worktree create failed — `$ERROR`. Spawning agent in current dir instead. Your
 in-progress changes will be visible to the agent. Cancel with Ctrl+C if not
-desired." Then fall back to current dir (still spawn).
+desired." Then fall back to current dir (still spawn): set `SPAWN_PATH` to the
+repository root (`git rev-parse --show-toplevel`).
 
-If A and worktree created: spawn `claude -p` with the spec piped via stdin:
+If A and worktree created: spawn `claude -p` with the spec piped via stdin,
+followed by the coordinator contract every lane inherits word for word
+(`gstack-autoplan contract` prints exactly this block):
+
+## Coordinator contract (inherited by every lane)
+
+Merge conditions. A lane's PR merges only when: the required gate lanes are green on the stamped tree or the tree receipt says `gate-reuse: eligible`; `gstack-lane-check` reports `clear` for its planned files against every other open lane; the PR body opens with the `gstack-ship-receipt` block; and the coordinator, not the lane, says merge. A lane never merges, rebases another lane, or force-pushes.
+
+Behavior-change notices. Every user-visible behavior change outside the plan's own items is listed in the PR body under `## Behavior changes` with the file, the old behavior and the new one, before the review starts. An omitted change found in review is a CRITICAL finding, whatever its size.
+
+Spend caps. Each lane runs under the `--spend-cap` the coordinator names; a lane that reaches it stops `incomplete` (`STOP: reason=budget_exhausted`) and reports spent, reserved and unknown charges. Paid evals are never retried to change a verdict; a rerun needs a named repair. Host-subagent spend is reported as `unknown`, never zero.
+
+Before done. A lane pushes a WIP commit to its branch after each step and gates a pushed SHA. It is done only when `gstack-pregate run --allow-repo-commands` passes; `requires-remote` needs `--stage tests --remote --spend-cap <cap>`. Where `.gstack/pregate.json` has a `sealed` key, it runs `gstack-pregate sealed` before any push or PR creation; a refusal stops the push.
+
+Handoff format. A lane reports in this order, identifiers first: PR URL (or `no PR` with branch and SHA), `GSTACK_RESULT` line, the `gstack: ok|fail <rev>` line, the `PREGATE:` line, gate summary (lanes passed/failed/skipped), behavior changes (or `none`), spend (spent/reserved/unknown), then what it could not verify. Full thread ids (`jam_…`), never short codes, in every cross-thread message. Prose after the identifiers may be truncated; nothing before them may be.
 
 ```bash
-cat "$ARCHIVE_PATH" | (cd "$SPAWN_PATH" && claude -p 2>&1) &
+[ -r "${ARCHIVE_PATH:?ARCHIVE_PATH is not set: substitute the archived spec path}" ] || { echo "ERROR: cannot read $ARCHIVE_PATH; nothing was spawned." >&2; exit 1; }
+cd -- "${SPAWN_PATH:?SPAWN_PATH is not set: substitute the printed worktree path}" || exit 1
+{ _p=$(git rev-parse --show-prefix 2>/dev/null) && [ -z "$_p" ] && [ "$(git rev-parse --is-inside-work-tree 2>/dev/null)" = true ]; } || { echo "ERROR: $SPAWN_PATH is not a git worktree root; nothing was spawned." >&2; exit 1; }
+SPAWN_PATH=$(pwd -P)
+CONTRACT=$(~/.claude/skills/gstack/bin/gstack-autoplan contract) || { echo "ERROR: gstack-autoplan contract failed; nothing was spawned." >&2; exit 1; }
+{ cat "$ARCHIVE_PATH"; printf '\n\n%s\n' "$CONTRACT"; } | (cd "$SPAWN_PATH" && GSTACK_SESSION_KIND=spawned claude -p 2>&1) &
 SPAWN_PID=$!
 echo "Spawned: PID $SPAWN_PID in $SPAWN_PATH (branch $SPAWN_BRANCH)"
 echo "Follow with: cd $SPAWN_PATH && claude --resume"
@@ -402,22 +464,9 @@ echo "Follow with: cd $SPAWN_PATH && claude --resume"
 Update archive frontmatter with `spec_worktree_path: $SPAWN_PATH` and
 `spec_executed: true` (atomic re-write).
 
-**F3 stash restore safety (when B path was chosen):** Do NOT auto-restore inline
+**Stash restore safety (when B path was chosen):** Do NOT auto-restore inline
 — the spawned agent may take hours. Instead print: "Stash preserved as
 `$STASH_REF`. Restore later with `git stash list` then `git stash apply
 stash^{/$STASH_REF}`. Before restore, re-run `git status` to make sure your
 worktree is clean." Do NOT drop the stash; user owns it.
 
-#### TTHW telemetry (DX11/F7)
-
-Capture timestamps at three checkpoints, write to telemetry envelope at /spec
-exit:
-
-- `T_PHASE1_START` — Phase 1 first AskUserQuestion or first text emit
-- `T_FIRST_CITATION` — first file/symbol reference in Phase 3 prose
-- `T_FILE_OR_SPAWN` — issue filed OR agent spawned, whichever ends Phase 5
-
-Append the captured timestamps to the local analytics line that the preamble's
-end-of-skill telemetry write emits, as `ttfc_ms` (Phase 1 → first citation) and
-`tthw_ms` (Phase 1 → file/spawn) JSON fields. Surfacing the aggregates in
-`/retro` is a separate follow-up.
