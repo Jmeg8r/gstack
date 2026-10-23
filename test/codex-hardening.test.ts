@@ -16,6 +16,9 @@ function runProbe(opts: {
   snippet: string;
   env?: Record<string, string | undefined>;
   home?: string;
+  // Only the hang-learning integration test needs more than the default: it
+  // spawns the bun-backed learnings writer twice plus the reader once.
+  timeoutMs?: number;
 }): { stdout: string; stderr: string; status: number } {
   const env: Record<string, string> = {
     // Start from a clean env so test-env vars from the parent don't leak in.
@@ -37,7 +40,7 @@ function runProbe(opts: {
   const result = spawnSync('bash', ['-c', script], {
     env,
     stdio: ['pipe', 'pipe', 'pipe'],
-    timeout: 5000,
+    timeout: opts.timeoutMs ?? 5000,
   });
   return {
     stdout: (result.stdout ?? '').toString(),
