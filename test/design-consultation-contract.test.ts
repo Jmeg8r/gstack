@@ -41,6 +41,22 @@ test('creative wording leaves the review and scoring gates intact', () => {
   expect(outsideVoiceInvocation(ctx, { timeoutMs: 300000, gate: 'spec' })).toContain('SCORE: N');
 });
 
+// Fork rule: the structured validator needs a standalone NO_FINDINGS line, so
+// every structured prompt producer must ask for exactly that.
+test('structured prompts request the standalone NO_FINDINGS line the validator requires', () => {
+  const marker = 'a final line containing only NO_FINDINGS';
+  for (const { name: host } of ALL_HOST_CONFIGS) {
+    expect(outsideVoiceInvocation(context(host, 'review'), { timeoutMs: 300000, gate: 'structured' })).toContain(marker);
+  }
+  for (const section of ['review/sections/adversarial.md', 'ship/sections/adversarial.md']) {
+    const rendered = readFileSync(new URL(`../${section}`, import.meta.url), 'utf8');
+    expect(rendered).toContain(marker);
+    expect(rendered).not.toContain('explicit NO_FINDINGS conclusion');
+  }
+  expect(validateOutsideReview('Reviewed the diff.\nNO_FINDINGS', 'structured')).toEqual({ completed: true, gate: 'pass' });
+  expect(validateOutsideReview('Summary: NO_FINDINGS', 'structured').completed).toBe(false);
+});
+
 test('preview paths retain verified fonts and select their own token source', () => {
   const section = readFileSync(new URL('../design-consultation/sections/proposal-and-preview.md.tmpl', import.meta.url), 'utf8');
   expectMentions(section, [['does not', 'verification', 'competitive']], 'section');

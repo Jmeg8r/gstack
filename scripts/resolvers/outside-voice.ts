@@ -173,7 +173,7 @@ export function outsideVoiceInvocation(ctx: TemplateContext, requested: OutsideC
   const completion = opts.gate === 'spec'
     ? 'Request exactly SCORE: N (integer 0-10) and AMBIGUITIES: ... (or NONE), as two distinct nonempty lines.'
     : opts.gate === 'structured'
-      ? 'Request severity-tagged findings or an explicit NO_FINDINGS conclusion.'
+      ? 'Request severity-tagged findings ([P0]-[P3]) or, when there are none, a final line containing only NO_FINDINGS.'
       : opts.purpose === 'design-direction'
         ? 'Request a complete design proposal ending with Recommendation: <direction> because <product-specific reason>.'
         : 'Request a severity (Critical, High, Medium or Low) per finding and a final Recommendation: <action> because <specific reason> line, including an explicit no-findings rationale.';
