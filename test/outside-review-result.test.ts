@@ -86,7 +86,8 @@ describe('a no-findings statement counts only as the reply\'s conclusion (#3294)
     for (const text of ['NO_FINDINGS', '**NO_FINDINGS**', '`NO_FINDINGS`', '- NO_FINDINGS', `${REPORTER}\nNO_FINDINGS`]) {
       expect({ text, verdict: classifyOutsideReview({ text, gate: 'structured' }).verdict }).toEqual({ text, verdict: 'clean' });
     }
-    for (const text of ['NO_FINDINGS except the race in flush().', 'Summary: NO_FINDINGS', '```\nNO_FINDINGS\n```']) {
+    for (const text of ['NO_FINDINGS except the race in flush().', 'Summary: NO_FINDINGS', '```\nNO_FINDINGS\n```',
+      `NO_FINDINGS\n${FINDING}`, `**NO_FINDINGS**\n\n${FINDING}`]) {
       expect({ text, verdict: classifyOutsideReview({ text, gate: 'structured' }).verdict }).toEqual({ text, verdict: 'unverified' });
     }
   });
