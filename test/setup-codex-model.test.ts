@@ -78,8 +78,8 @@ describe('setup Codex model activation', () => {
     const kiroStart = setup.indexOf('# 6. Install for Kiro CLI');
     const kiroEnd = setup.indexOf('# 6b.', kiroStart);
     const block = setup.slice(kiroStart, kiroEnd);
-    expect(block).toContain('_link_or_copy "$KIRO_DIR/gstack-upgrade/SKILL.md"');
-    expect(block).toContain('_link_or_copy "$KIRO_DIR/gstack/SKILL.md"');
+    expect(block).toContain('_copy_skill_md "$KIRO_DIR/gstack-upgrade/SKILL.md"');
+    expect(block).toContain('_copy_skill_md "$KIRO_DIR/gstack/SKILL.md"');
     expect(block).toContain('_link_or_copy "$SOURCE_GSTACK_DIR/bin" "$KIRO_GSTACK/bin"');
     expect(block).toContain('_link_or_copy "$SOURCE_GSTACK_DIR/lib" "$KIRO_GSTACK/lib"');
     expect(block).not.toContain('$AGENTS_DIR');
@@ -109,10 +109,13 @@ describe('Sol E2E tree hygiene', () => {
   const solTest = fs.readFileSync(path.join(ROOT, 'test', 'codex-e2e-sol-scope.test.ts'), 'utf8');
 
   test('renders Sol in its own output tree without changing the installed profile', () => {
-    // Even a temporary shared render races parallel worktree copies. External
-    // hosts support --out-dir, so no installed-tree backup or mutation is needed.
-    expect(solTest).toContain("'--model', 'gpt-5.6-sol', '--out-dir', renderDir");
-    expect(solTest).toContain("path.join(renderDir, '.agents', 'skills', 'gstack-investigate')");
+    // The shared fixture owns generation and cleanup; sol-skill-fixture.test.ts
+    // proves its complete artifact bytes and unchanged installed-cache metadata.
+    const fixture = fs.readFileSync(path.join(ROOT, 'test/helpers/sol-skill-fixture.ts'), 'utf8');
+    expect(solTest).toContain('generatedFixture = await createSolSkillFixture()');
+    expect(solTest).toContain('skillDir = generatedFixture.skillDir');
+    expect(fixture).toContain("host: 'codex', model: 'gpt-5.6-sol', outputRoot, contentLinkRoot: null");
+    expect(fixture).toContain("path.join(outputRoot, '.agents', 'skills', 'gstack-investigate')");
     expect(solTest).not.toContain('priorAgentsBackup');
     expect(solTest).not.toContain("path.join(ROOT, '.agents')");
     // Scope-widening detection must see untracked + staged files, not just

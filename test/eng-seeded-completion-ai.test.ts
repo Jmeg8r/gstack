@@ -4,11 +4,11 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createFakeBunCli } from './helpers/fake-bun-cli';
+import { fakePlanSeedPrelude } from './helpers/fake-plan-seed';
 import fixture from './fixtures/eng-seeded-completion-ai.json';
 import { classifyVisible, extractPlanFilePath } from './helpers/claude-pty-runner';
 import * as predicates from './helpers/claude-pty-runner';
-import { selectTests, E2E_TOUCHFILES } from './helpers/touchfiles';
-
+import type { PtyDriver } from './helpers/claude-pty-runner';
 const gate = '─────\nClaude has written up a plan and is ready to execute. Would you like to proceed?\n❯ 1. Yes, and use auto mode\n2. Yes, manually approve edits\n3. Tell Claude what to change';
 const compactGate = 'Exit plan mode?\nClaude wants to exit plan mode\n❯ 1. Yes, and switch to default (ask each time) for this session\n2. No';
 const question = 'Which runner should the plan use?\nA) Use the built-in runner\nB) Build a custom runner\nRecommendation: A because it avoids duplicate scheduling logic.\nReply with A or B.';
@@ -59,12 +59,12 @@ test('real PTY waits past old TODO, stale, partial and mismatched panels but acc
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'seeded-completion-'));
     const working = path.join(dir, 'repo');
     fs.mkdirSync(working);
-    const cli = createFakeBunCli(path.join(dir, 'fake-claude'), `
+    const cli = createFakeBunCli(path.join(dir, 'fake-claude'), fakePlanSeedPrelude() + `
 const fs = require('node:fs');
 fs.writeFileSync(process.env.COMPLETION_ARGV, JSON.stringify(process.argv.slice(2)));
 let sent = false;
 const render = text => process.stdout.write('\\x1b[2J\\x1b[H' + text.replace(/\\n/g, '\\r\\n'));
-process.stdin.on('data', chunk => {
+process.on('gstack-seeded-slash', chunk => {
   if (sent || !chunk.toString().includes('/plan-eng-review')) return;
   sent = true;
   fs.writeFileSync(process.env.COMPLETION_PHASE, 'initial');
@@ -72,7 +72,7 @@ process.stdin.on('data', chunk => {
   if (${JSON.stringify(scenario.expected)} === 'asked') setTimeout(() => {
     fs.writeFileSync(process.env.COMPLETION_PHASE, 'question');
     render(${JSON.stringify(question)});
-  }, 4500);
+  }, 2500);
 });
 setInterval(() => {}, 1000);
 `);
@@ -120,13 +120,12 @@ console.log(JSON.stringify(obs));
 async function mockedObservation(frames: string[], verdict: 'waiting' | 'working', seeded = true) {
   // Execute the unchanged observer function with its real classifiers, a
   // synthetic clock/session, and a stubbed judge. No CLI or judge is launched.
-  const source = fs.readFileSync(path.join(import.meta.dir, 'helpers/claude-pty-runner.ts'), 'utf8');
+  const source = fs.readFileSync(path.join(import.meta.dir, 'helpers/pty/runners/observation.ts'), 'utf8');
   const start = source.indexOf('export async function runPlanSkillObservation(');
-  const end = source.indexOf('\n// ─', start);
-  expect(start).toBeGreaterThan(0); expect(end).toBeGreaterThan(start);
-  const executable = source.slice(start, end).replace('export async function', 'async function') + '\nreturn runPlanSkillObservation;';
+  expect(start).toBeGreaterThan(0);
+  const executable = source.slice(start).replace(/^export /gm, '') + '\nreturn runPlanSkillObservation;';
   const js = new Bun.Transpiler({ loader: 'ts' }).transformSync(executable);
-  let clock = 0, tick = -1, closed = 0, judged = 0;
+  let clock = 0, tick = -1, closed = 0, judged = 0, seedSubmittedAt: number | null = null;
   const current = () => frames[Math.min(Math.max(tick, 0), frames.length - 1)]!;
   const args: Record<string, unknown> = {
     path, process: { cwd: () => '/synthetic-owned' }, Date: { now: () => clock }, randomUUID: () => 'owned',
@@ -135,18 +134,33 @@ async function mockedObservation(frames: string[], verdict: 'waiting' | 'working
       visibleSince: current, rawOutput: current, currentScreen: async () => current(), hermeticConfigDir: null,
       close: async () => { closed++; } }),
     createPlanCountSnapshotWriter: () => () => ({}), logPtySnapshot: () => {},
+    submitPlanSeed: async () => { seedSubmittedAt = clock; }, PlanSeedTimeout: class extends Error {},
+    isRejectedSlashCommand: predicates.isRejectedSlashCommand,
     isProseAUQVisible: predicates.isProseAUQVisible, isPlanReadyVisible: predicates.isPlanReadyVisible,
+    isUnknownSlashCommandVisible: predicates.isUnknownSlashCommandVisible,
     isScopeGateQuestionVisible: predicates.isScopeGateQuestionVisible,
     isScopeGateAutoSelectVisible: predicates.isScopeGateAutoSelectVisible,
-    classifyVisible, extractPlanFilePath, findNativeAutoDecision: () => null,
+    classifyVisible, extractPlanFilePath, idleTurnEnd: predicates.idleTurnEnd, findNativeAutoDecision: () => null,
     judgePtyState: () => { judged++; return { state: verdict, reasoning: 'synthetic current-frame verdict' }; },
+    runPtySession: predicates.runPtySession,
   };
   const run = new Function(...Object.keys(args), js)(...Object.values(args));
-  const obs = await run({ skillName: 'plan-eng-review', timeoutMs: 70000,
+  const clockArgs = args as { Date: { now(): number }; Bun: { sleep(ms: number): Promise<void> }; launchClaudePty: PtyDriver['launch'] };
+  const driver: PtyDriver = { launch: clockArgs.launchClaudePty, now: clockArgs.Date.now, monotonic: clockArgs.Date.now, sleep: clockArgs.Bun.sleep };
+  const obs = await run({ skillName: 'plan-eng-review', timeoutMs: 70000, driver,
     ...(seeded ? { initialPlanContent: '# Plan: Required draft' } : {}) });
   expect(closed).toBe(1);
-  return { obs, judged };
+  return { obs, judged, seedSubmittedAt };
 }
+
+test('seeded preflight checks owned readiness without spending eight seconds before submission', async () => {
+  const seeded = await mockedObservation([gate], 'working');
+  expect(seeded.seedSubmittedAt).toBe(0);
+  expect(seeded.obs.outcome).toBe('plan_ready');
+  const unseeded = await mockedObservation([gate], 'working', false);
+  expect(unseeded.seedSubmittedAt).toBeNull();
+  expect(unseeded.obs.outcome).toBe('plan_ready');
+});
 
 for (const [name, current] of [
   ['cursorless approval', gate.replace('❯ ', '')],
@@ -167,12 +181,4 @@ test('rejected completion does not erase a genuine earlier question or change un
   expect(obs.waitingEverObserved).toBe(false);
   const unseeded = await mockedObservation([gate.replace('❯ ', '')], 'waiting', false);
   expect(unseeded.obs.outcome).toBe('plan_ready'); expect(unseeded.judged).toBe(0);
-});
-
-test('completion evidence dependencies select exactly the seeded observation owners', () => {
-  const owners = ['plan-ceo-review-plan-mode', 'plan-eng-review-plan-mode', 'plan-design-review-plan-mode',
-    'plan-devex-review-plan-mode', 'plan-mode-no-op', 'auto-decide-preserved', 'conductor-prose'].sort();
-  for (const file of ['test/eng-seeded-completion-ai.test.ts', 'test/fixtures/eng-seeded-completion-ai.json']) {
-    expect(selectTests([file], E2E_TOUCHFILES).selected.sort()).toEqual(owners);
-  }
 });

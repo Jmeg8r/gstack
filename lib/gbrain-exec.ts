@@ -35,11 +35,14 @@
 
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
-import { homedir } from "os";
+import { homedir, tmpdir } from "os";
 import { spawnSync, spawn, execFileSync, type SpawnSyncReturns, type ChildProcess, type SpawnOptions } from "child_process";
+import { resolveWindowsBash, type BashProbe } from "./script-invocation";
 
 interface GbrainConfig {
   database_url?: string;
+  engine?: string;
+  database_path?: string;
 }
 
 export interface BuildGbrainEnvOptions {
@@ -95,8 +98,14 @@ export function gbrainConfigDir(env: NodeJS.ProcessEnv = process.env): string {
  * unchanged when:
  *   - `GSTACK_RESPECT_ENV_DATABASE_URL=1` (intentional opt-out),
  *   - the config file is missing or unparseable,
- *   - the config has no `database_url`,
+ *   - the config has no `database_url` and is not a PGLite config,
  *   - the caller already set DATABASE_URL to the same value.
+ *
+ * A PGLite config has no URL to seed, so an inherited DATABASE_URL /
+ * GBRAIN_DATABASE_URL (Bun autoloads a project's `.env`) would make gbrain
+ * connect to the app's own database instead of its file brain (#1917). Both
+ * are blanked, not deleted: gbrain treats an empty value as unset, and an
+ * existing (empty) variable is never refilled by a child's dotenv autoload.
  *
  * GBRAIN_PREPARE is never set here (#1965): gbrain auto-disables prepared
  * statements on transaction-mode poolers itself, and forcing them on breaks
@@ -122,7 +131,13 @@ export function buildGbrainEnv(opts: BuildGbrainEnvOptions = {}): NodeJS.Process
   } catch {
     return out;
   }
-  if (!cfg.database_url) return out;
+  if (!cfg.database_url) {
+    if (cfg.engine === "pglite" || cfg.database_path) {
+      out.DATABASE_URL = "";
+      out.GBRAIN_DATABASE_URL = "";
+    }
+    return out;
+  }
 
   const hadCaller = baseEnv.DATABASE_URL !== undefined;
   const alreadyMatch = baseEnv.DATABASE_URL === cfg.database_url;
@@ -162,13 +177,6 @@ export function isExecTimeout(err: unknown): boolean {
   return e?.killed === true || e?.signal === "SIGTERM" || e?.code === "ETIMEDOUT";
 }
 
-/** Where Git for Windows puts bash, most-specific first. */
-const WINDOWS_BASH_CANDIDATES = [
-  "C:\\Program Files\\Git\\bin\\bash.exe",
-  "C:\\Program Files\\Git\\usr\\bin\\bash.exe",
-  "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
-];
-
 export interface ScriptInvocation {
   cmd: string;
   argv: string[];
@@ -188,38 +196,15 @@ export interface ScriptInvocation {
  * failing on **every** run on Windows. The two cases look identical and are not:
  * a `.cmd` shim needs a shell, a shebang script needs an interpreter.
  *
- * The consequence was quiet rather than loud. `artifacts_sync_mode` defaults to
- * pushing curated artifacts to git, so a Windows user's learnings accumulated in
- * `~/.gstack` and were never committed, while `/sync-gbrain` printed one red
- * line among four green ones.
- *
- * Git for Windows' bash is preferred over a bare `bash` on PATH because
- * WindowsApps ships a `bash.exe` that is the WSL launcher; if it wins PATH
- * order it interprets `C:\...` as a Linux path and the script never sees the
- * repo. `GSTACK_BASH` overrides everything for unusual installs.
- *
- * Returns `null` when no bash can be found, so the caller can say so plainly
- * instead of surfacing a spawn error nobody can act on.
+ * The bash comes from lib/script-invocation.ts, the one Windows resolver
+ * (GSTACK_GIT_BASH, then Git next to `git --exec-path`, the install paths, an
+ * MSYS PATH bash; WSL's launcher never). Returns `null` when no bash can be
+ * found; `noBashMessage()` there is the text to show.
  */
-export function bashScriptInvocation(
-  scriptPath: string,
-  args: string[],
-  opts: { platform?: string; exists?: (p: string) => boolean; env?: NodeJS.ProcessEnv } = {},
-): ScriptInvocation | null {
-  const platform = opts.platform ?? process.platform;
-  if (platform !== "win32") return { cmd: scriptPath, argv: args, shell: false };
-
-  const exists = opts.exists ?? existsSync;
-  const env = opts.env ?? process.env;
-
-  const override = env.GSTACK_BASH?.trim();
-  const candidates = [...(override ? [override] : []), ...WINDOWS_BASH_CANDIDATES];
-  const bash = candidates.find((p) => exists(p));
-  if (!bash) return null;
-
-  // Forward slashes: bash treats backslashes as escapes, so a Windows path
-  // passed verbatim loses its separators.
-  return { cmd: bash, argv: [scriptPath.replace(/\\/g, "/"), ...args], shell: false };
+export function bashScriptInvocation(scriptPath: string, args: string[], opts: BashProbe = {}): ScriptInvocation | null {
+  if ((opts.platform ?? process.platform) !== "win32") return { cmd: scriptPath, argv: args, shell: false };
+  const res = resolveWindowsBash(opts);
+  return res.ok ? { cmd: res.bash, argv: [scriptPath.replace(/\\/g, "/"), ...args], shell: false } : null;
 }
 
 /**
@@ -249,6 +234,19 @@ export function gbrainInvocation(args: string[]): { cmd: string; argv: string[];
     : { cmd: "gbrain", argv: args, shell: false };
 }
 
+/**
+ * Working directory for a gbrain child (#1917). gbrain (a Bun program) and
+ * its own config loader read `.env` / `.env.local` from the working
+ * directory, so a child started inside the user's project can pick the
+ * project's DATABASE_URL back up. Children run from gbrain's config
+ * directory (or the OS temp dir before init) unless the caller names a cwd.
+ */
+export function gbrainChildCwd(cwd?: string, env: NodeJS.ProcessEnv = process.env): string {
+  if (cwd) return cwd;
+  const dir = gbrainConfigDir(env);
+  return existsSync(dir) ? dir : tmpdir();
+}
+
 export interface SpawnGbrainOptions {
   /** Timeout in milliseconds. Defaults to 30s. */
   timeout?: number;
@@ -276,7 +274,7 @@ export function spawnGbrain(args: string[], opts: SpawnGbrainOptions = {}): Spaw
   return spawnSync(inv.cmd, inv.argv, {
     encoding: "utf-8",
     timeout: opts.timeout ?? 30_000,
-    cwd: opts.cwd,
+    cwd: gbrainChildCwd(opts.cwd, opts.baseEnv),
     stdio: opts.stdio || ["ignore", "pipe", "pipe"],
     env: buildGbrainEnv({ baseEnv: opts.baseEnv, announce: opts.announce }),
     shell: inv.shell, // #1731: gbrain is a .cmd shim on Windows (+#2471 quoting)
@@ -311,7 +309,7 @@ export function spawnGbrainAsync(
   const inv = gbrainInvocation(args);
   return spawn(inv.cmd, inv.argv, {
     stdio: opts.stdio || ["ignore", "pipe", "pipe"],
-    cwd: opts.cwd,
+    cwd: gbrainChildCwd(opts.cwd, opts.baseEnv),
     env: buildGbrainEnv({ baseEnv: opts.baseEnv, announce: false }),
     shell: inv.shell, // #1731: gbrain is a .cmd shim on Windows (+#2471 quoting)
   });
@@ -326,7 +324,7 @@ export function execGbrainText(args: string[], opts: SpawnGbrainOptions = {}): s
   return execFileSync(inv.cmd, inv.argv, {
     encoding: "utf-8",
     timeout: opts.timeout ?? 30_000,
-    cwd: opts.cwd,
+    cwd: gbrainChildCwd(opts.cwd, opts.baseEnv),
     stdio: opts.stdio || ["ignore", "pipe", "pipe"],
     env: buildGbrainEnv({ baseEnv: opts.baseEnv, announce: opts.announce }),
     shell: inv.shell, // #1731: gbrain is a .cmd shim on Windows (+#2471 quoting)

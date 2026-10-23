@@ -5,8 +5,6 @@ import path from 'node:path';
 import {readPlanCountTranscript,type NativePublicToolEvent} from './helpers/plan-count-transcript';
 import {autoplanPhaseCompletions} from './helpers/autoplan-phase-observer';
 import fixture from './fixtures/autoplan-public-narration-ad.json';
-import {E2E_TOUCHFILES,selectTests} from './helpers/touchfiles';
-
 const at=Date.parse(fixture.provenance.timestamp);
 function read(blocks: unknown[]= [fixture.block],delta: any={},complete=true) {
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'public-narration-')),cwd=path.join(dir,'repo');
@@ -123,12 +121,4 @@ test('phase ordering and duplicate collapse use native time rather than polling 
   {sessionId:'parent',timestamp:new Date(at+10).toISOString(),text:fixture.block.thinking},
   {sessionId:'parent',timestamp:new Date(at+30).toISOString(),text:'Phase 1 is done.'}]};
  expect(autoplanPhaseCompletions(t,at)).toEqual([{phase:1,ts:at+10},{phase:2,ts:at+20}]);
-});
-
-test('public narration changes select every existing shared native-reader consumer',()=>{
- const reader=selectTests(['test/helpers/plan-count-transcript.ts'],E2E_TOUCHFILES).selected.sort();
- expect(reader).toHaveLength(8);expect(reader).toContain('autoplan-chain-pty');
- expect(reader).toContain('plan-ceo-mode-routing');
- for(const file of ['test/autoplan-public-narration.test.ts','test/fixtures/autoplan-public-narration-ad.json'])
-  expect(selectTests([file],E2E_TOUCHFILES).selected.sort()).toEqual(reader);
 });

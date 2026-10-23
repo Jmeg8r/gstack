@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * Compare two eval runs from the project eval dir (~/.gstack/projects/<slug>/evals;
  * legacy fallback ~/.gstack-dev/evals)
@@ -61,7 +61,7 @@ if (args.length === 2) {
     .sort((a, b) => path.basename(b).localeCompare(path.basename(a)));
 
   if (files.length === 0) {
-    console.log('No eval runs yet. Run: EVALS=1 bun run test:evals');
+    console.log('No eval runs yet. Run: bun run eval:bg:pr');
     process.exit(0);
   }
   if (files.length < 2) {
@@ -78,7 +78,7 @@ if (args.length === 2) {
     }
   });
   if (!latest) {
-    console.log('No completed eval runs yet. Run: EVALS=1 bun run test:evals');
+    console.log('No completed eval runs yet. Run: bun run eval:bg:pr');
     process.exit(0);
   }
   afterFile = latest;

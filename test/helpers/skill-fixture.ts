@@ -39,7 +39,6 @@ import * as path from 'path';
 /** /review E2E (sql-injection, enum-completeness, design-lite): the core
  *  review workflow without the shared preamble, Review Army, or Fix-First. */
 export const REVIEW_E2E_SECTIONS = [
-  'When to invoke this skill',
   'Step 0: Detect platform and base branch',
   'Step 1: Check branch',
   'Step 2: Read the checklist',
@@ -54,7 +53,6 @@ export const REVIEW_E2E_SECTIONS = [
  *  (delivery-audit test) + Step 4.5 specialist dispatch (quality score,
  *  JSON findings schema, MULTI-SPECIALIST consensus, Red Team). */
 export const REVIEW_ARMY_E2E_SECTIONS = [
-  'When to invoke this skill',
   'Step 0: Detect platform and base branch',
   'Step 1: Check branch',
   'Step 1.5: Scope Drift Detection',
@@ -72,7 +70,6 @@ export const REVIEW_ARMY_E2E_SECTIONS = [
  *  + the narrative report template. Global mode and Compare mode are not
  *  exercised by the E2E tests and are dropped. */
 export const RETRO_E2E_SECTIONS = [
-  'When to invoke this skill',
   'Step 0: Detect platform and base branch',
   'User-invocable',
   'Arguments',
@@ -86,8 +83,7 @@ export const RETRO_E2E_SECTIONS = [
 
 /** codex-review-findings E2E against the Codex host variant
  *  (.agents/skills/gstack-review/SKILL.md). Same core workflow as
- *  REVIEW_E2E_SECTIONS, minus "When to invoke this skill" (the Codex host
- *  adapter does not emit that section). */
+ *  REVIEW_E2E_SECTIONS. */
 export const CODEX_REVIEW_E2E_SECTIONS = [
   'Step 0: Detect platform and base branch',
   'Step 1: Check branch',
@@ -148,8 +144,10 @@ function splitFrontmatter(raw: string, file: string): { frontmatter: string; bod
  * output format, the /context-save checkpoint template), NOT section
  * boundaries. Fences close only on a matching char of >= opening length,
  * per CommonMark, so 4-backtick fences embedding 3-backtick blocks work.
+ * Standalone generated STOP-Read blocks between horizontal rules replace
+ * entire carved steps and end the preceding H2. Nested pointers stay inside it.
  */
-function scanH2Sections(bodyLines: string[]): H2Section[] {
+function scanH2Sections(bodyLines: string[], stopAtH1 = false): H2Section[] {
   const sections: H2Section[] = [];
   let fence: { ch: string; len: number } | null = null;
 
@@ -166,17 +164,29 @@ function scanH2Sections(bodyLines: string[]): H2Section[] {
       }
       continue;
     }
-    if (!fence && line.startsWith('## ')) {
-      sections.push({ heading: line.slice(3).trim(), start: i, end: bodyLines.length });
+    if (!fence) {
+      const heading = line.startsWith('## ');
+      const title = stopAtH1 && /^ {0,3}#(?:[ \t]|$)/.test(line);
+      let carvedStep = /^> \*\*STOP\.\*\* Before .+, Read `[^`]+\/sections\/[^`]+\.md` and execute it$/.test(line)
+        && bodyLines[i + 1] === '> in full. Do not work from memory — that section is the source of truth for this step.';
+      if (carvedStep) {
+        let preceding = i - 1;
+        while (preceding >= 0 && !bodyLines[preceding].trim()) preceding--;
+        let following = i + 2;
+        while (following < bodyLines.length && !bodyLines[following].trim()) following++;
+        carvedStep = bodyLines[preceding] === '---' && bodyLines[following] === '---';
+      }
+      if (heading || title || carvedStep) {
+        const previous = sections.at(-1);
+        if (previous) previous.end = Math.min(previous.end, i);
+        if (heading) sections.push({ heading: line.slice(3).trim(), start: i, end: bodyLines.length });
+      }
     }
-  }
-  for (let s = 0; s < sections.length - 1; s++) {
-    sections[s].end = sections[s + 1].start;
   }
   return sections;
 }
 
-function loadSkill(skillDirOrFile: string): {
+function loadSkill(skillDirOrFile: string, stopAtH1 = false): {
   file: string;
   frontmatter: string;
   bodyLines: string[];
@@ -185,7 +195,7 @@ function loadSkill(skillDirOrFile: string): {
   const file = resolveSkillMd(skillDirOrFile);
   const raw = fs.readFileSync(file, 'utf-8');
   const { frontmatter, bodyLines } = splitFrontmatter(raw, file);
-  return { file, frontmatter, bodyLines, sections: scanH2Sections(bodyLines) };
+  return { file, frontmatter, bodyLines, sections: scanH2Sections(bodyLines, stopAtH1) };
 }
 
 function findSection(sections: H2Section[], name: string, file: string): H2Section {
@@ -227,7 +237,7 @@ export function extractSkillSections(skillDir: string, sections: string[]): stri
  * ~780-line shared generated preamble and nothing else.
  */
 export function extractSkillBody(skillDir: string): string {
-  const { file, frontmatter, bodyLines, sections: all } = loadSkill(skillDir);
+  const { file, frontmatter, bodyLines, sections: all } = loadSkill(skillDir, true);
   const boundary = (names: string[]): H2Section => {
     const matches = all.filter(section => names.includes(section.heading));
     const label = names.map(name => `"## ${name}"`).join(' or ');
@@ -273,4 +283,17 @@ export function sliceBetween(text: string, start: string, end: string): string {
   const j = text.indexOf(end, i + start.length);
   if (j < 0) throw new Error(`skill fixture: end marker not found after start: ${end}`);
   return text.slice(i, j);
+}
+
+export function extractDesignResearchContract(skill: string): string {
+  const setup = sliceBetween(skill, '## BROWSER SETUP', '### Rules for driving a real browser');
+  const probe = setup.match(/```bash\n[\s\S]*?\n```/)?.[0];
+  if (!probe) throw new Error('skill fixture: design research readiness probe missing');
+  const routing = sliceBetween(skill, '## Web research runs in Aside', '## Phase 2: Research');
+  const search = sliceBetween(skill, '**Step 1: Identify', '**Step 2: Visual research');
+  const prelude = search.match(/^_EG=.*_aside_exec\(\).*$/m)?.[0];
+  if (!prelude) throw new Error('skill fixture: design research egress prelude missing');
+  return ['Run this readiness probe once before research:', probe, routing,
+    'For each Aside research call, include this prelude before invoking `_aside_exec` with the requested query:',
+    '```bash', prelude, '```'].join('\n\n');
 }

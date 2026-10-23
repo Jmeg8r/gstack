@@ -18,6 +18,7 @@ const PREPUSH = path.resolve(import.meta.dir, "..", "bin", "gstack-redact-prepus
 const REDACT = path.resolve(import.meta.dir, "..", "bin", "gstack-redact");
 
 let repo: string;
+let stateHome: string;
 
 function git(args: string[], cwd = repo): string {
   const r = spawnSync("git", args, { cwd, encoding: "utf8", timeout: 30_000 });
@@ -73,6 +74,7 @@ const FAKE_AWS_KEY = ['AKIA', '1234567890ABCDEF'].join('');
 
 beforeEach(() => {
   repo = fs.mkdtempSync(path.join(os.tmpdir(), "prepush-"));
+  stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "prepush-state-"));
   git(["init", "-q", "-b", "main"]);
   git(["config", "user.email", "t@example.com"]);
   git(["config", "user.name", "T"]);
@@ -81,6 +83,7 @@ beforeEach(() => {
 
 afterEach(() => {
   fs.rmSync(repo, { recursive: true, force: true });
+  fs.rmSync(stateHome, { recursive: true, force: true });
 });
 
 describe("pre-push hook gating", () => {
@@ -106,6 +109,179 @@ describe("pre-push hook gating", () => {
     const { code, stderr } = runHook(`refs/heads/main ${head} refs/heads/main ${base}\n`);
     expect(code).toBe(0);
     expect(stderr).toContain("MEDIUM");
+  });
+});
+
+// #2856: a 4-part release version is shaped like a public IPv4 address.
+// Assembled at runtime so this file's own pushed diff carries no IP-shaped
+// literal for the repo's pre-push scan to warn about.
+const RELEASE = ["1", "84", "1", "0"].join(".");
+const PUBLIC_IP = ["8", "8", "8", "8"].join(".");
+
+describe("pushed diffs larger than the engine cap are scanned in chunks (#2915)", () => {
+  const commitLarge = (tail: string): { base: string; head: string } => {
+    const base = git(["rev-parse", "HEAD"]);
+    fs.writeFileSync(path.join(repo, "large-a.txt"), "clean-a ".repeat(90_000));
+    fs.writeFileSync(path.join(repo, "large-b.txt"), "clean-b ".repeat(90_000) + tail);
+    git(["add", "large-a.txt", "large-b.txt"]);
+    git(["commit", "-q", "-m", "large diff"]);
+    return { base, head: git(["rev-parse", "HEAD"]) };
+  };
+
+  test("a clean two-file diff over the cap passes without input_too_large", () => {
+    const { base, head } = commitLarge("");
+    const { code, stderr } = runHook(`refs/heads/main ${head} refs/heads/main ${base}\n`);
+    expect(code).toBe(0);
+    expect(stderr).not.toContain("engine.input_too_large");
+  });
+
+  test("a credential in a later file's chunk still blocks", () => {
+    const { base, head } = commitLarge("\n" + FAKE_AWS_KEY + "\n");
+    const { code, stderr } = runHook(`refs/heads/main ${head} refs/heads/main ${base}\n`);
+    expect(code).toBe(1);
+    expect(stderr).toContain("aws.access_key");
+    expect(stderr).not.toContain("engine.input_too_large");
+  });
+});
+
+describe("release version exemption (#2856)", () => {
+  const mediums = (stderr: string): number => Number(/(\d+) MEDIUM finding/.exec(stderr)?.[1] ?? 0);
+  const commitAll = (files: Record<string, string>, msg: string): string => {
+    for (const [file, content] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(repo, file)), { recursive: true });
+      fs.writeFileSync(path.join(repo, file), content);
+      git(["add", file]);
+    }
+    git(["commit", "-q", "-m", msg]);
+    return git(["rev-parse", "HEAD"]);
+  };
+
+  test("exempts only the VERSION file and the CHANGELOG release heading, not the same address elsewhere", () => {
+    const base = git(["rev-parse", "HEAD"]);
+    const head = commitAll({
+      "VERSION": `${RELEASE}\n`,
+      "CHANGELOG.md": `## [${RELEASE}] - 2026-10-01\n\n- Fixes.\n`,
+      "docs/links.md": `Admin console: http://${RELEASE}/admin\n`,
+      "deploy/net.conf": `server = ${RELEASE}\n`,
+    }, "release");
+    const { code, stderr } = runHook(`refs/heads/main ${head} refs/heads/main ${base}\n`);
+    expect(code).toBe(0);
+    expect(mediums(stderr)).toBe(2);
+  });
+
+  test("a version-only release push raises nothing, even with diff.noprefix set", () => {
+    git(["config", "diff.noprefix", "true"]);
+    const base = git(["rev-parse", "HEAD"]);
+    const head = commitAll({ "VERSION": `${RELEASE}\n`, "CHANGELOG.md": `## [${RELEASE}] - 2026-10-01\n` }, "bump");
+    const { stderr } = runHook(`refs/heads/main ${head} refs/heads/main ${base}\n`);
+    expect(stderr).not.toContain("MEDIUM");
+  });
+
+  test("a real public IP next to the word version is still flagged", () => {
+    const base = git(["rev-parse", "HEAD"]);
+    const head = commitAll({
+      "CHANGELOG.md": `## [${RELEASE}] - 2026-10-01 mirror ${PUBLIC_IP}\n- The version endpoint moved to ${PUBLIC_IP}.\n`,
+      "config/version.txt": `${RELEASE}\n`,
+      "VERSION": `${RELEASE}\nupstream ${PUBLIC_IP}\n`,
+    }, "not a release artifact");
+    const { stderr } = runHook(`refs/heads/main ${head} refs/heads/main ${base}\n`);
+    // heading tail + changelog body + config/version.txt + both VERSION lines
+    // (a two-line VERSION is not a whole-file version).
+    expect(mediums(stderr)).toBe(5);
+  });
+});
+
+describe("committed allowlist (.gstack-redact-allowlist)", () => {
+  const HOOK_ALLOWLIST = ".gstack-redact-allowlist";
+  const pushOf = (base: string, head: string) => `refs/heads/main ${head} refs/heads/main ${base}\n`;
+  const commitAllowlist = (content: string): string => {
+    return commit(HOOK_ALLOWLIST, content, "allowlist");
+  };
+  const DEV_URL = ["postgres://", "app:devpass", "@db:5432"].join("");
+
+  test("an exact committed span passes and the suppression is listed", () => {
+    const base = git(["rev-parse", "HEAD"]);
+    commit("config.txt", "key " + FAKE_AWS_KEY + "\n", "add key");
+    const head = commitAllowlist("# docs sample key\n" + FAKE_AWS_KEY + "\n");
+    const { code, stderr } = runHook(pushOf(base, head));
+    expect(code).toBe(0);
+    expect(stderr).not.toContain("BLOCKED");
+    expect(stderr).toContain(".gstack-redact-allowlist (1 entry) suppressed 2 finding(s) in this push:");
+    expect(stderr).toContain("HIGH  aws.access_key  config.txt:1");
+    expect(stderr).toContain("HIGH  aws.access_key  .gstack-redact-allowlist:2");
+  });
+
+  test("a different credential still blocks next to an allowlisted one", () => {
+    const base = git(["rev-parse", "HEAD"]);
+    const otherKey = ["AKIA", "FEDCBA0987654321"].join("");
+    commit("config.txt", "ok " + FAKE_AWS_KEY + "\nleak " + otherKey + "\n", "one benign one real");
+    const head = commitAllowlist(FAKE_AWS_KEY + "\n");
+    const { code, stderr } = runHook(pushOf(base, head));
+    expect(code).toBe(1);
+    expect(stderr).toContain("BLOCKED");
+    expect(stderr).toContain("suppressed 2 finding(s)");
+    const blocked = stderr.slice(stderr.indexOf("BLOCKED"));
+    expect(blocked.match(/HIGH {2}aws\.access_key/g)).toHaveLength(1);
+  });
+
+  test("a substring of the matched span does not suppress it", () => {
+    const base = git(["rev-parse", "HEAD"]);
+    commit("compose.txt", "DATABASE_URL=" + DEV_URL + "\n", "dev url");
+    const head = commitAllowlist("app:devpass\n");
+    const { code, stderr } = runHook(pushOf(base, head));
+    expect(code).toBe(1);
+    expect(stderr).toContain("db.url_with_password");
+    expect(stderr).toContain("suppressed 0 finding(s) in this push.");
+  });
+
+  test("the whole matched URL suppresses that URL only", () => {
+    const base = git(["rev-parse", "HEAD"]);
+    const prodUrl = ["postgres://", "app:devpass", "@prod.internal:5432"].join("");
+    commit("compose.txt", "DATABASE_URL=" + DEV_URL + "\nPROD_URL=" + prodUrl + "\n", "two urls");
+    const head = commitAllowlist(DEV_URL + "\n");
+    const { code, stderr } = runHook(pushOf(base, head));
+    expect(code).toBe(1);
+    expect(stderr).toContain("HIGH  db.url_with_password  compose.txt:1");
+    expect(stderr).toMatch(/BLOCKED[\s\S]*HIGH {2}db\.url_with_password/);
+  });
+
+  test("an uncommitted allowlist in the working tree suppresses nothing", () => {
+    const base = git(["rev-parse", "HEAD"]);
+    const head = commit("config.txt", "key " + FAKE_AWS_KEY + "\n", "add key");
+    fs.writeFileSync(path.join(repo, HOOK_ALLOWLIST), FAKE_AWS_KEY + "\n");
+    const { code, stderr } = runHook(pushOf(base, head));
+    expect(code).toBe(1);
+    expect(stderr).not.toContain("suppressed");
+  });
+
+  test("an oversized allowlist is ignored and the scan stays strict", () => {
+    const base = git(["rev-parse", "HEAD"]);
+    commit("config.txt", "key " + FAKE_AWS_KEY + "\n", "add key");
+    const head = commitAllowlist(FAKE_AWS_KEY + "\n" + "#".repeat(65 * 1024) + "\n");
+    const { code, stderr } = runHook(pushOf(base, head));
+    expect(code).toBe(1);
+    expect(stderr).toContain("is over 65536 bytes; ignoring it");
+  });
+
+  test("entries cover MEDIUM emails alongside gstack.redact.allowEmail", () => {
+    const base = git(["rev-parse", "HEAD"]);
+    git(["config", "--add", "gstack.redact.allowEmail", "carol@corp.io"]);
+    commit("notes.md", "contact bob@corp.io or carol@corp.io or dave@corp.io\n", "contacts");
+    const head = commitAllowlist("  bob@corp.io  \n");
+    const { code, stderr } = runHook(pushOf(base, head));
+    expect(code).toBe(0);
+    expect(stderr).toContain("MEDIUM  pii.email  notes.md:1");
+    expect(stderr).toContain("suppressed 2 finding(s)");
+    expect(stderr).toContain("1 MEDIUM finding(s) in pushed diff");
+  });
+
+  test("the block message names the allowlist without one present", () => {
+    const base = git(["rev-parse", "HEAD"]);
+    const head = commit("config.txt", "key " + FAKE_AWS_KEY + "\n", "add key");
+    const { code, stderr } = runHook(pushOf(base, head));
+    expect(code).toBe(1);
+    expect(stderr).toContain("commit its exact matched text as a line of .gstack-redact-allowlist");
+    expect(stderr).not.toContain("suppressed");
   });
 });
 
@@ -230,6 +406,7 @@ describe("install UX surfaces (#1946 / eng review D3+D10)", () => {
   describe("one-time consent prompt in setup (#1946, decision 6)", () => {
     const setup = fs.readFileSync(path.join(ROOT, "setup"), "utf8");
     const block = setup.slice(setup.indexOf("# ─── Redact pre-push guard consent"));
+    const readyLine = setup.slice(setup.indexOf("_setup_ready_line() {"), setup.indexOf("\n}\n", setup.indexOf("_setup_ready_line() {")) + 3);
 
     test("prompt is gated on key ABSENCE and a real TTY, with a timed default-N read", () => {
       expect(block).toContain("grep -q '^redact_prepush_hook:'");
@@ -256,6 +433,7 @@ describe("install UX surfaces (#1946 / eng review D3+D10)", () => {
           "QUIET=0",
           'log() { echo "$@"; }',
           `GSTACK_CONFIG="${path.join(ROOT, "bin", "gstack-config")}"`,
+          readyLine,
           block,
         ].join("\n");
         const r = spawnSync("bash", ["-c", script], {
@@ -283,6 +461,7 @@ describe("install UX surfaces (#1946 / eng review D3+D10)", () => {
           "QUIET=0",
           'log() { echo "$@"; }',
           `GSTACK_CONFIG="${path.join(ROOT, "bin", "gstack-config")}"`,
+          readyLine,
           block,
         ].join("\n");
         const r = spawnSync("bash", ["-c", script], {
@@ -352,10 +531,11 @@ describe("install / chaining", () => {
       cwd: repo,
       input: Buffer.from(line),
       encoding: "utf8",
-      env: { ...process.env, GSTACK_REDACT_PREPUSH: "skip" },
+      env: { ...process.env, GSTACK_REDACT_PREPUSH: "skip", GSTACK_HOME: stateHome },
       timeout: 30_000,
     });
     expect(r.status).toBe(0);
+    expect(fs.readFileSync(path.join(stateHome, "security", "prepush-skip.jsonl"), "utf8")).toContain("env-skip");
     expect(fs.existsSync(seen)).toBe(true);
     expect(fs.readFileSync(seen, "utf8").trim()).toBe(
       `refs/heads/main ${sha} refs/heads/main ${ZERO}`,
@@ -375,7 +555,7 @@ describe("install / chaining", () => {
       cwd: repo,
       input: Buffer.from(`refs/heads/main ${"b".repeat(40)} refs/heads/main ${ZERO}\n`),
       encoding: "utf8",
-      env: { ...process.env, GSTACK_REDACT_PREPUSH: "skip" },
+      env: { ...process.env, GSTACK_REDACT_PREPUSH: "skip", GSTACK_HOME: stateHome },
       timeout: 30_000,
     });
     expect(r.status).toBe(1);
@@ -438,9 +618,10 @@ describe("install / chaining", () => {
       cwd: repo,
       input: Buffer.from(`refs/heads/main ${sha} refs/heads/main ${ZERO}\n`),
       encoding: "utf8",
-      env: { ...process.env, GSTACK_REDACT_PREPUSH: "skip" },
+      env: { ...process.env, GSTACK_REDACT_PREPUSH: "skip", GSTACK_HOME: stateHome },
     });
     expect(run.status).toBe(0);
+    expect(fs.readFileSync(path.join(stateHome, "security", "prepush-skip.jsonl"), "utf8")).toContain("env-skip");
     expect(fs.readFileSync(seen, "utf8").trim()).toBe("refs/heads/main");
   });
 
@@ -552,5 +733,29 @@ describe("diff-extraction bypasses (#2498, minimal reimplementation)", () => {
     const { code, stderr } = runHook(`refs/heads/feat not-a-sha\n`);
     expect(code).toBe(1);
     expect(stderr).toContain("could not parse");
+  });
+});
+
+describe("#3048: the pushed diff is scanned per file, so TS/JSX source syntax is not a secret", () => {
+  const mediums = (stderr: string): number => Number(/(\d+) MEDIUM finding/.exec(stderr)?.[1] ?? 0);
+  test("a TS parameter type and a JSX expression raise nothing; the same shape in YAML still does", () => {
+    const base = git(["rev-parse", "HEAD"]);
+    for (const [file, content] of [
+      ["src/coach.ts", "export function issue(\n  session: SessionState,\n): void {}\n"],
+      ["src/Turn.tsx", "<Row key={turn.requestId + turn.role} />\n"],
+    ] as const) {
+      fs.mkdirSync(path.dirname(path.join(repo, file)), { recursive: true });
+      fs.writeFileSync(path.join(repo, file), content);
+      git(["add", file]);
+    }
+    git(["commit", "-q", "-m", "ts"]);
+    const tsHead = git(["rev-parse", "HEAD"]);
+    expect(mediums(runHook(`refs/heads/main ${tsHead} refs/heads/main ${base}\n`).stderr)).toBe(0);
+    fs.mkdirSync(path.join(repo, "deploy"), { recursive: true });
+    fs.writeFileSync(path.join(repo, "deploy", "values.yaml"), "  session: SessionState,\n");
+    git(["add", "deploy/values.yaml"]);
+    git(["commit", "-q", "-m", "yaml"]);
+    const yamlHead = git(["rev-parse", "HEAD"]);
+    expect(mediums(runHook(`refs/heads/main ${yamlHead} refs/heads/main ${tsHead}\n`).stderr)).toBe(1);
   });
 });

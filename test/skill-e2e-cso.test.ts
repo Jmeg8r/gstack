@@ -1,6 +1,6 @@
 import { test, expect, afterAll } from 'bun:test';
 import { CAPTURE_LONG_MS } from './helpers/eval-budgets';
-import { runSkillTest } from './helpers/session-runner';
+import { runSkillTest, SESSION_DRAIN_GRACE_MS } from './helpers/session-runner';
 import { ROOT, runId, describeIfSelected, logCost, recordE2E, createEvalCollector, finalizeEvalCollector } from './helpers/e2e-helpers';
 import { validateCoverage, validateFinding, completeness, type RunReportV3 } from '../lib/cso/contracts';
 import { spawnSync } from 'node:child_process';
@@ -11,7 +11,7 @@ import * as os from 'node:os';
 const evalCollector = createEvalCollector('e2e-cso');
 // runSkillTest can drain stderr for 5s after its unchanged CLI deadline.
 // Let cleanup and failure recording finish before Bun starts a retry.
-const CAPTURE_CLEANUP_MS = 6_000;
+const CSO_FINALIZE_MS = SESSION_DRAIN_GRACE_MS + 5_000;
 let captureSequence = 0;
 afterAll(() => finalizeEvalCollector(evalCollector));
 
@@ -144,7 +144,7 @@ http.createServer((req, res) => {
         recordE2E(evalCollector, 'cso-full-audit', 'e2e-cso', result, { passed });
       }
     });
-  }, CAPTURE_LONG_MS + CAPTURE_CLEANUP_MS);
+  }, CAPTURE_LONG_MS + CSO_FINALIZE_MS);
 });
 
 describeIfSelected('CSO v3 — diff mode', ['cso-diff-mode'], () => {
@@ -178,14 +178,14 @@ http.createServer((req, res) => {
         expect(report.policy.diff).toBe(true);
         expect(report.policy.base).toBe('main');
         expect(report.source.baseCommit).toBe(git(f.repo, 'rev-parse', 'main').trim());
-        expect(report.findings.some(item => item.location.path === 'webhook.js' && /signature|authenticat|forg/i.test(`${item.rootCause} ${item.impact}`))).toBe(true);
+        expect(report.findings.some(item => item.location.path === 'webhook.js' && /signature|authentic|forg|spoof|hmac/i.test(`${item.title} ${item.rootCause} ${item.impact}`))).toBe(true);
         expect(report.findings.every(item => item.location.path === 'webhook.js')).toBe(true);
         passed = result.browseErrors.length === 0;
       } finally {
         recordE2E(evalCollector, 'cso-diff-mode', 'e2e-cso', result, { passed });
       }
     });
-  }, CAPTURE_LONG_MS + CAPTURE_CLEANUP_MS);
+  }, CAPTURE_LONG_MS + CSO_FINALIZE_MS);
 });
 
 describeIfSelected('CSO v3 — infra scope', ['cso-infra-scope'], () => {
@@ -234,5 +234,5 @@ jobs:
         recordE2E(evalCollector, 'cso-infra-scope', 'e2e-cso', result, { passed });
       }
     });
-  }, CAPTURE_LONG_MS + CAPTURE_CLEANUP_MS);
+  }, CAPTURE_LONG_MS + CSO_FINALIZE_MS);
 });

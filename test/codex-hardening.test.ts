@@ -1,4 +1,4 @@
-import { generateAdversarialStep } from '../scripts/resolvers/review';
+import { generateAdversarialStep } from '../scripts/resolvers/outside-voice-steps';
 import { RESOLVERS } from '../scripts/resolvers';
 import { HOST_PATHS } from '../scripts/resolvers/types';
 import { describe, test, expect } from 'bun:test';
@@ -54,6 +54,44 @@ function tempHome(): string {
 }
 
 describe('gstack-codex-probe: auth probe', () => {
+  // #2192: custom OpenAI-compatible providers name their credential variable
+  // in config.toml [model_providers.<id>] env_key; a set variable is auth.
+  const withConfig = (toml: string, env: Record<string, string | undefined> = {}) => {
+    const home = tempHome();
+    try {
+      fs.mkdirSync(path.join(home, '.codex'), { recursive: true });
+      fs.writeFileSync(path.join(home, '.codex', 'config.toml'), toml);
+      return runProbe({ snippet: '_gstack_codex_auth_probe', env, home });
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  };
+  const MIMO = '[model_providers.mimo]\nenv_key = "MIMO_API_KEY"\n';
+
+  test('#2192: a provider env_key whose variable is set → AUTH_OK', () => {
+    const r = withConfig(MIMO, { MIMO_API_KEY: 'tp-test-key' });
+    expect([r.stdout.trim(), r.status]).toEqual(['AUTH_OK', 0]);
+    const several = withConfig('[model_providers.a]\nenv_key = "MISSING_A"\n\n[model_providers.b]\nenv_key = \'MIMO_API_KEY\'  # inline comment\n', { MIMO_API_KEY: 'k' });
+    expect(several.stdout.trim()).toBe('AUTH_OK');
+  });
+
+  test('#2192: a provider env_key that is unset or blank → AUTH_FAILED naming the key', () => {
+    for (const value of [undefined, '   \t\n']) {
+      const r = withConfig(MIMO, { MIMO_API_KEY: value });
+      expect([r.stdout.trim(), r.status]).toEqual(['AUTH_FAILED', 1]);
+      expect(r.stderr).toContain('custom provider key (MIMO_API_KEY)');
+    }
+  });
+
+  test('#2192: commented env_key lines and env_key outside [model_providers.*] never count', () => {
+    const toml = '[model_providers.mimo]\n# env_key = "DEPRECATED_KEY"\nenv_key = "MIMO_API_KEY"\n[profiles.work]\nenv_key = "PROFILE_KEY"\n';
+    expect(withConfig(toml, { DEPRECATED_KEY: 'old', PROFILE_KEY: 'p' }).stdout.trim()).toBe('AUTH_FAILED');
+  });
+
+  test('#2192: malformed config.toml or a non-identifier env_key → AUTH_FAILED, no crash', () => {
+    expect(withConfig('\x00\x01 garbage \xff[broken\n=no=\n').stdout.trim()).toBe('AUTH_FAILED');
+    const injected = withConfig('[model_providers.x]\nenv_key = "A;touch /tmp/never"\n');
+    expect([injected.stdout.trim(), injected.status]).toEqual(['AUTH_FAILED', 1]);
+  });
+
   test('CODEX_API_KEY set → AUTH_OK', () => {
     const home = tempHome();
     try {
@@ -281,13 +319,14 @@ describe('gstack-codex-probe: timeout wrapper + namespace hygiene', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-gto-stub-'));
     try {
       const stub = path.join(dir, 'gtimeout');
-      fs.writeFileSync(stub, '#!/bin/bash\necho gtimeout_chosen_$1\n');
+      fs.writeFileSync(stub, '#!/bin/bash\necho gtimeout_chosen "$@"\n');
       fs.chmodSync(stub, 0o755);
       const r = runProbe({
         snippet: `_gstack_codex_timeout_wrapper 5 echo nope`,
         env: { PATH: `${dir}:/bin:/usr/bin` },
       });
-      expect(r.stdout.trim()).toBe('gtimeout_chosen_5');
+      // The KILL escalation (#2776) precedes the duration, as timeout(1) requires.
+      expect(r.stdout.trim()).toBe('gtimeout_chosen -k 10 5 echo nope');
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -311,6 +350,128 @@ describe('gstack-codex-probe: timeout wrapper + namespace hygiene', () => {
         env: { PATH: dir },
       });
       expect(r.stdout).toContain('rc=124');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  for (const native of [false, true]) test(`${native ? 'bash-native watchdog' : 'timeout(1)'} KILLs a child that ignores TERM after the grace period (#2776)`, () => {
+    // An uncooperative provider used to outlive its deadline, so the outer
+    // tool gate killed the whole call and the partial output was lost.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-watchdog-stubborn-'));
+    try {
+      // pkill is part of the watchdog's contract (it reaps the provider's
+      // children; stock macOS ships /usr/bin/pkill). Without it the orphaned
+      // `sleep 30` keeps stdout open and the capture waits out the sleep.
+      for (const tool of native ? ['bash', 'sleep', 'cat', 'pkill'] : []) {
+        const resolved = spawnSync('bash', ['-c', `command -v ${tool}`], { timeout: 5000 });
+        fs.symlinkSync(resolved.stdout.toString().trim(), path.join(dir, tool));
+      }
+      const stubborn = path.join(dir, 'stubborn');
+      fs.writeFileSync(stubborn, `#!${spawnSync('bash', ['-c', 'command -v bash'], { timeout: 5000 }).stdout.toString().trim()}\ntrap '' TERM\necho partial\nsleep 30\necho late\n`, { mode: 0o755 });
+      const r = runProbe({
+        snippet: `_GSTACK_CODEX_KILL_AFTER=1 _gstack_codex_timeout_wrapper 1 "${stubborn}"; echo "rc=$?"`,
+        env: native ? { PATH: dir } : {},
+      });
+      expect(r.stdout).toContain('partial');
+      expect(r.stdout).not.toContain('late');
+      expect(r.stdout).toContain('rc=124');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('bash-native watchdog freezes the command before reaping its children, so nothing prints after the deadline', () => {
+    // A slow pkill widens the window between reaping the children and killing
+    // the command: a watchdog that does not stop the command first lets it run
+    // on past its killed child and print after the deadline.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-watchdog-freeze-'));
+    try {
+      const which = (tool: string) => spawnSync('bash', ['-c', `command -v ${tool}`], { timeout: 5000 }).stdout.toString().trim();
+      for (const tool of ['bash', 'sleep', 'cat']) fs.symlinkSync(which(tool), path.join(dir, tool));
+      fs.writeFileSync(path.join(dir, 'pkill'), `#!${which('bash')}\n"${which('pkill')}" "$@"\nrc=$?\n"${which('sleep')}" 0.5\nexit "$rc"\n`, { mode: 0o755 });
+      const stubborn = path.join(dir, 'stubborn');
+      fs.writeFileSync(stubborn, `#!${which('bash')}\ntrap '' TERM\necho partial\nsleep 30\necho late\n`, { mode: 0o755 });
+      const r = runProbe({
+        snippet: `_GSTACK_CODEX_KILL_AFTER=1 _gstack_codex_timeout_wrapper 1 "${stubborn}"; echo "rc=$?"`,
+        env: { PATH: dir },
+      });
+      expect(r.stdout).toBe('partial\nrc=124\n');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  for (const native of [false, true]) test(`E5: ${native ? 'bash-native watchdog' : 'timeout(1)'} passes the caller's stdin to the command (#1674)`, () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-watchdog-stdin-'));
+    try {
+      for (const tool of native ? ['bash', 'sleep', 'cat', 'printf'] : []) {
+        const resolved = spawnSync('bash', ['-c', `command -v ${tool}`], { timeout: 5000 });
+        const target = resolved.stdout.toString().trim();
+        if (target.startsWith('/')) fs.symlinkSync(target, path.join(dir, tool));
+      }
+      // A redirect onto the wrapper is how callers feed `codex exec -`; a
+      // backgrounded command without job control would otherwise read /dev/null.
+      const input = path.join(dir, 'prompt.txt');
+      fs.writeFileSync(input, 'prompt on stdin');
+      const r = runProbe({ snippet: `_gstack_codex_timeout_wrapper 5 cat < "${input}"; echo " rc=$?"`, env: native ? { PATH: dir } : {} });
+      expect(r.stdout).toBe('prompt on stdin rc=0\n');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('bash-native watchdog reports its timeout while still retiring after TERM', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-watchdog-race-'));
+    try {
+      for (const tool of ['bash', 'sleep']) {
+        const resolved = spawnSync('bash', ['-c', `command -v ${tool}`], { timeout: 5000 });
+        expect(resolved.status).toBe(0);
+        fs.symlinkSync(resolved.stdout.toString().trim(), path.join(dir, tool));
+      }
+      const r = runProbe({
+        snippet: `
+kill() {
+  builtin kill "$@"
+  local rc=$?
+  if [ "$1" = -TERM ] && [ "$rc" -eq 0 ]; then sleep 0.2; fi
+  return "$rc"
+}
+_gstack_codex_timeout_wrapper 0.1 sleep 30
+printf 'rc=%s\\n' "$?"
+`,
+        env: { PATH: dir },
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toBe('rc=124\n');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  for (const [name, command, expected] of [
+    ['success', 'printf finished', 'finishedrc=0\n'],
+    ['ordinary failure', "bash -c 'exit 7'", 'rc=7\n'],
+    ['independent signal', "bash -c 'kill -TERM $$'", 'rc=143\n'],
+  ]) test(`bash-native watchdog preserves ${name} without waiting for its deadline`, () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-watchdog-early-'));
+    try {
+      for (const tool of ['bash', 'sleep']) {
+        const resolved = spawnSync('bash', ['-c', `command -v ${tool}`], { timeout: 5000 });
+        expect(resolved.status).toBe(0);
+        fs.symlinkSync(resolved.stdout.toString().trim(), path.join(dir, tool));
+      }
+      const r = runProbe({
+        snippet: `
+trap 'printf caller-term' TERM
+output=$(_gstack_codex_timeout_wrapper 10 ${command}; printf 'rc=%s\\n' "$?")
+printf '%s\\n' "$output"
+trap -p TERM
+`,
+        env: { PATH: dir },
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toBe(`${expected}trap -- 'printf caller-term' SIGTERM\n`);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -471,8 +632,8 @@ describe('codex review-mode section Step 2A: PROMPT + --base mutual exclusion gu
 // which downstream reads as "Codex reviewed and found nothing".
 describe('codex timeout wrapper: /review + /ship diff passes', () => {
   const WRAPPED_SITES = [
-    'scripts/resolvers/review.ts', // generator (source of truth)
-    'review/sections/adversarial.md', // review section (Step 5.7 carved out of the skeleton)
+    'scripts/resolvers/outside-voice-steps.ts', // generator (source of truth)
+    'review/sections/adversarial.md', // review section (Step 4.8 carved out of the skeleton)
     'ship/sections/adversarial.md', // ship section source
   ];
 
@@ -481,26 +642,26 @@ describe('codex timeout wrapper: /review + /ship diff passes', () => {
   const BASH_GATE_MS = 600000;
 
   for (const relPath of WRAPPED_SITES) {
-    const read = () => relPath === 'scripts/resolvers/review.ts'
+    const read = () => relPath === 'scripts/resolvers/outside-voice-steps.ts'
       ? generateAdversarialStep({ host: 'claude', paths: HOST_PATHS.claude, skillName: 'review', tmplPath: 'review/SKILL.md.tmpl' })
       : fs.readFileSync(path.join(ROOT, relPath), 'utf8');
 
     test(`${relPath}: both diff-review Codex calls run under the wrapper`, () => {
       const wrapped =
-        read().match(/_gstack_codex_timeout_wrapper\s+\d+\s+codex\s+(exec|review)\b/g) ?? [];
+        read().match(/run-with-timeout\s+(?:--user-invoked\s+)?(?:--effort\s+\w+\s+(?:--request-effort\s+'[^']*'\s+)?)?\d+\s+codex\s+(exec|review)\b/g) ?? [];
       // Adversarial pass + structured review pass.
       expect(wrapped.length).toBeGreaterThanOrEqual(2);
     });
 
     test(`${relPath}: does not claim \`timeout\` is unavailable on macOS`, () => {
-      // _gstack_codex_timeout_wrapper resolves gtimeout -> timeout -> unwrapped,
+      // run-with-timeout resolves gtimeout -> timeout -> a bash watchdog,
       // so the coreutils-less case is already handled. The old claim is what
       // steered these call sites away from the wrapper in the first place.
       expect(read()).not.toMatch(/doesn't exist on macOS/);
     });
 
     test(`${relPath}: wrapper budget stays under the outer Bash gate`, () => {
-      const budgets = [...read().matchAll(/_gstack_codex_timeout_wrapper\s+(\d+)\s+codex\b/g)].map(
+      const budgets = [...read().matchAll(/run-with-timeout\s+(?:--user-invoked\s+)?(?:--effort\s+\w+\s+(?:--request-effort\s+'[^']*'\s+)?)?(\d+)\s+codex\b/g)].map(
         (m) => Number(m[1]) * 1000,
       );
       expect(budgets.length).toBeGreaterThan(0);
@@ -549,13 +710,16 @@ describe('codex skeleton+sections union: review sandbox + fail-closed gate + tim
   for (const relPath of ['codex tmpl union', 'codex rendered union'] as const) {
     const read = () => readCodexUnion(relPath === 'codex tmpl union' ? 'tmpl' : 'rendered');
 
-    test(`${relPath}: (a) every scoped codex review invocation pins sandbox_mode="read-only"`, () => {
+    test(`${relPath}: (a) every scoped codex review invocation pins sandbox_mode from the selected sandbox`, () => {
       const invocations = read()
         .split('\n')
-        .filter((l) => /_gstack_codex_timeout_wrapper\s+\d+\s+codex\s+review\b/.test(l));
+        .filter((l) => /run-with-timeout\s+(?:--user-invoked\s+)?(?:--effort\s+\w+\s+(?:--request-effort\s+'[^']*'\s+)?)?\d+\s+codex\s+review\b/.test(l));
       expect(invocations.length).toBeGreaterThanOrEqual(1);
       for (const line of invocations) {
-        expect(line).toContain('sandbox_mode="read-only"');
+        // select-model reports read-only (full access only for
+        // GSTACK_CODEX_NO_SANDBOX=1, test/codex-model-probe.test.ts); :? stops
+        // an unselected command instead of inheriting config.toml's default.
+        expect(line).toContain('sandbox_mode=\\"${_CODEX_SANDBOX_MODE:?}\\"');
         // `codex review` has no -s/--sandbox flag (verified 0.147.0) — the
         // config override is the only lever. `-s read-only` here would fail
         // at argv parsing, which check (b) would then read as a gate FAIL.
@@ -569,32 +733,49 @@ describe('codex skeleton+sections union: review sandbox + fail-closed gate + tim
       expect(content).not.toContain(
         'If no `[P1]` markers are found (only `[P2]` or no findings) — the gate is **PASS**',
       );
-      // The verdict is computed by lib/codex-review-gate.ts (behavior pinned in
-      // test/codex-review-gate.test.ts); the prose must route through it, pass it
-      // the real exit code, and never let the model substitute its own reading.
+      // The rule: FAIL on non-zero exit and empty output; [P0] recognized as
+      // blocking; untagged completed output is UNVERIFIED (#2769) — neither a
+      // PASS nor a FAIL; PASS reachable only through the explicit
+      // tagged-advisory-only branch, which now includes P3.
       expect(content).toContain('The gate FAILS CLOSED');
-      expect(content).toContain('lib/codex-review-gate.ts <_CODEX_EXIT>');
-      expect(content).toContain('Never\nsubstitute your own reading of the output.');
-      expect(content).toContain('never assume 0');
       expect(content).toContain('`_CODEX_EXIT` is non-zero (including 124) → **GATE: FAIL**');
       expect(content).toContain('empty or whitespace-only → **GATE: FAIL**');
-      expect(content).toContain('untagged output');
       expect(content).toContain('`[P0]`');
-      expect(content).toContain('There is no default branch.');
-      // Both review paths must emit the exit code unconditionally.
-      expect(content.match(/echo "CODEX_EXIT=\$_CODEX_EXIT"/g)?.length).toBe(2);
+      expect(content).toContain('PASS is only reachable through check 5');
+    });
+
+    test(`${relPath}: (b2) a clean untagged review is UNVERIFIED, and P2/P3-only output can PASS (#2769)`, () => {
+      const content = read();
+      expect(content).toContain(
+        'anywhere → **GATE: UNVERIFIED** (Codex completed and tagged nothing; read\n      the output above)',
+      );
+      expect(content).toContain('GATE: UNVERIFIED (Codex completed and tagged nothing; read the output above)');
+      expect(content).toContain('(only P2/P3 advisory) →\n      **GATE: PASS**');
+      expect(content).not.toContain('**GATE: FAIL** (fail-closed: untagged output');
+      expect(content).toContain('"unverified" if UNVERIFIED');
+      // The captured clean review from the real CLI carries no severity tag, so
+      // check 4 is the branch it takes; the captured P2 review takes check 5.
+      const fixtures = path.join(ROOT, 'test', 'fixtures', 'codex-review');
+      const clean = fs.readFileSync(path.join(fixtures, 'clean-review.stdout.txt'), 'utf-8');
+      const p2 = fs.readFileSync(path.join(fixtures, 'p2-review.stdout.txt'), 'utf-8');
+      const tagged = (t: string) => /\[P[0-3]\]|(^|\s)P[0-3]:/m.test(t);
+      const blocking = (t: string) => /\[P[01]\]|(^|\s)P[01]:/m.test(t);
+      expect(clean.trim().length).toBeGreaterThan(0);
+      expect(tagged(clean)).toBe(false);
+      expect(tagged(p2)).toBe(true);
+      expect(blocking(p2)).toBe(false);
     });
 
     test(`${relPath}: (c) every Bash gate sits strictly above its section's wrapper budgets`, () => {
       // Split on `## ` headings; within any section that declares BOTH a Bash
       // tool gate (`timeout: N` in ms) and a wrapper budget
-      // (`_gstack_codex_timeout_wrapper S codex`), every gate must be strictly
+      // (`run-with-timeout S codex`), every gate must be strictly
       // greater than every wrapper budget so the wrapper fires first.
       const sections = read().split(/\n## /);
       const inspected: string[] = [];
       for (const section of sections) {
         const gates = [...section.matchAll(/timeout:\s*(\d{4,})/g)].map((m) => Number(m[1]));
-        const wrappers = [...section.matchAll(/_gstack_codex_timeout_wrapper\s+(\d+)\s+codex\b/g)].map(
+        const wrappers = [...section.matchAll(/run-with-timeout\s+(?:--user-invoked\s+)?(?:--effort\s+\w+\s+(?:--request-effort\s+'[^']*'\s+)?)?(\d+)\s+codex\b/g)].map(
           (m) => Number(m[1]) * 1000,
         );
         if (gates.length === 0 || wrappers.length === 0) continue;
@@ -759,24 +940,75 @@ describe('codex broken-install detection (#2742)', () => {
   // hand-maintained copy that isn't resolver-generated — it must capture the
   // probe's exit code and route 2 to its own broken-install arm, or /autoplan
   // prints the wrong remedy for a broken binary.
-  test('autoplan preflight (tmpl + rendered) captures the probe exit and routes 2 to broken-install', () => {
-    for (const rel of ['autoplan/SKILL.md.tmpl', 'autoplan/SKILL.md']) {
-      const raw = fs.readFileSync(path.join(ROOT, rel), 'utf-8');
-      const src = rel.endsWith('.tmpl') ? raw.replace('{{OUTSIDE_PREFLIGHT:autoplan}}', RESOLVERS.OUTSIDE_PREFLIGHT({ host: 'claude', paths: HOST_PATHS.claude, skillName: 'autoplan', tmplPath: rel }, ['autoplan'])) : raw;
-      expect(src).toContain('_gstack_codex_model_probe; _CODEX_MP=$?');
-      expect(src).toMatch(/_CODEX_MP" -eq 2/);
-      expect(src).toContain('binary cannot run');
-      expect(src).not.toContain('elif ! _gstack_codex_model_probe');
+  test('autoplan (tmpl + rendered): availability pays for no probe; role-ready in the invocation probes, and its exit, 2 included, ends it', () => {
+    const ctx = { host: 'claude' as const, paths: HOST_PATHS.claude, skillName: 'autoplan', tmplPath: 'autoplan/SKILL.md.tmpl' };
+    const rendered = ['autoplan/SKILL.md', ...['ceo', 'design', 'dx', 'eng'].map(phase => `autoplan/sections/${phase}-phase.md`)]
+      .map(rel => fs.readFileSync(path.join(ROOT, rel), 'utf-8')).join('\n');
+    for (const src of [RESOLVERS.OUTSIDE_PREFLIGHT(ctx, ['autoplan']) + RESOLVERS.OUTSIDE_INVOCATION(ctx, ['autoplan']), rendered]) {
+      expect(src).toContain('_CODEX_OUT=$("$_CODEX_PROBE" role-ready exec) || exit $?');
+      expect(src).not.toMatch(/probe-model|_gstack_codex_/);
+      expect(src).toContain('echo "CODEX_MODE: $_CODEX_MODE"');
     }
+    const role = fs.readFileSync(PROBE, 'utf-8').match(/_gstack_codex_role_ready\(\) \{[\s\S]*?\n\}/)![0];
+    expect(role).toContain('_gstack_codex_model_probe "$1" || return $?');
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-role-broken-'));
+    try {
+      const bin = path.join(home, 'bin');
+      fs.mkdirSync(bin);
+      fs.mkdirSync(path.join(home, '.codex'));
+      fs.writeFileSync(path.join(home, '.codex', 'auth.json'), '{}');
+      fs.writeFileSync(path.join(bin, 'codex'), `#!/usr/bin/env bash\n[ "$1" = sandbox ] && exit 0\n[ "$1" = --version ] && { echo codex-cli 0.160.0; exit 0; }\necho 'Error: spawn /usr/lib/codex/vendor/codex ENOENT' >&2\nexit 1\n`, { mode: 0o755 });
+      const r = spawnSync(PROBE, ['role-ready', 'exec'], { encoding: 'utf8', timeout: 20000,
+        env: { PATH: `${bin}:${process.env.PATH ?? ''}`, HOME: home, CODEX_HOME: path.join(home, '.codex'), GSTACK_HOME: path.join(home, 'state'), _TEL: 'off' } });
+      expect(r.status).toBe(2);
+      expect(r.stdout).toBe('');
+      expect(r.stderr).toContain('MODEL_UNUSABLE_INSTALL');
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
   });
 
   test('the preflight resolver routes exit 2 to broken_install', () => {
     const src = fs.readFileSync(path.join(ROOT, 'scripts/resolvers/constants.ts'), 'utf8');
     expect(src).toContain('broken_install');
-    // The chain must capture the probe's code; `elif ! _gstack_codex_model_probe`
+    // The chain must capture the probe's code; `elif ! gstack-codex-probe probe-model`
     // collapses 1 and 2 into one branch and loses the distinction.
     expect(src).toContain('_CODEX_MP=$?');
   });
+});
+
+// --- Live codex smokes keep away from the real Codex home -------------------
+
+describe('live codex smokes run codex in a private HOME and CODEX_HOME', () => {
+  // Every codex run writes $CODEX_HOME/tmp/arg0. The two smokes below probe the
+  // CLI at module load or in free-tier tests, so with a real codex on PATH they
+  // used to write into the developer's ~/.codex.
+  for (const file of ['test/codex-resume-flag-semantics.test.ts', 'test/codex-e2e-sol-scope.test.ts']) {
+    test(`${file} never runs codex with the caller's HOME or Codex home`, () => {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-codex-smoke-home-'));
+      try {
+        const stubDir = path.join(home, 'stub-bin');
+        const log = path.join(home, 'codex-calls.log');
+        fs.mkdirSync(stubDir);
+        fs.writeFileSync(path.join(stubDir, 'codex'), `#!/usr/bin/env bash
+printf '%s|%s\\n' "$HOME" "\${CODEX_HOME:-unset}" >> "${log}"
+mkdir -p "\${CODEX_HOME:-$HOME/.codex}/tmp" && : > "\${CODEX_HOME:-$HOME/.codex}/tmp/arg0"
+printf 'Usage: codex exec [OPTIONS]\\n  -c, --config <key=value>  sandbox_mode\\n      --ignore-user-config\\n'
+`, { mode: 0o755 });
+        const r = spawnSync(process.execPath, ['test', file], {
+          cwd: ROOT, encoding: 'utf8', timeout: 120_000,
+          env: { PATH: `${stubDir}:${process.env.PATH ?? ''}`, HOME: home, TMPDIR: os.tmpdir() },
+        });
+        expect(r.status).toBe(0);
+        const calls = fs.readFileSync(log, 'utf8').trim().split('\n');
+        expect(calls.length).toBeGreaterThan(0);
+        for (const call of calls) {
+          const [callHome, codexHome] = call.split('|');
+          expect({ call, privateHome: callHome !== home, privateCodexHome: codexHome !== 'unset' && !codexHome!.startsWith(home) })
+            .toEqual({ call, privateHome: true, privateCodexHome: true });
+        }
+        expect(fs.existsSync(path.join(home, '.codex'))).toBe(false);
+      } finally { fs.rmSync(home, { recursive: true, force: true }); }
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------

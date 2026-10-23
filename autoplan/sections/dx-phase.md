@@ -5,12 +5,12 @@ Before dispatch, Read `methodologyPath` from `bun "<SNAPSHOT_TOOL>" methodology 
 **Override rules:**
 - Mode selection: DX POLISH
 - Persona: infer from README/docs, pick the most common developer type (P6)
-- Competitive benchmark: research through Aside per the loaded skill's "Web research runs in Aside" section (WebSearch when Aside is not ready); use the reference benchmarks when neither is available (P1)
+- Competitive benchmark: research through Aside per the loaded skill's "Web research runs in Aside" section (WebSearch when Aside is not ready); reference benchmarks when neither is available (P1)
 - Magical moment: pick the lowest-effort delivery vehicle that achieves the competitive tier (P5)
-- Getting started friction: always optimize toward fewer steps (P5, simpler over clever)
-- Error message quality: always require problem + cause + fix (P1, completeness)
+- Getting started friction: always optimize toward fewer steps (P5)
+- Error message quality: require the agent-ready error contract (P1, completeness)
 - API/CLI naming: consistency wins over cleverness (P5)
-- DX taste decisions (e.g., opinionated defaults vs flexibility): mark TASTE DECISION
+- DX taste decisions (opinionated defaults vs flexibility): mark TASTE DECISION
 - Dual voices: always run BOTH Claude subagent AND Codex if available (P6).
 
   **Bind phase input:** Run; use `snapshotPath` as `<DX_INPUT>` for both voices:
@@ -21,9 +21,11 @@ bun "<SNAPSHOT_TOOL>" create dx "<ACTIVE_PLAN>" "<RESTORE_PATH>" "<methodologyPa
 
   **Claude DX subagent** (native tool):
   Claude Code: set Agent `run_in_background: false` if its schema exposes it.
+  A launch receipt means it went background: await its completion notice.
   Other hosts: foreground; await completion when supported.
 
-  Send `nativeDispatchPrompt` verbatim: ONLY/FINAL tool call this response.
+  Read `snapshot.json` beside `<DX_INPUT>`. Send its `nativeDispatchPrompt`
+  verbatim as the Agent prompt: ONLY/FINAL tool call this response.
   Keep native Reads enabled. Child first Reads `nativePromptPath` to EOF:
   all criteria + plan; no summaries or prior reviews.
 
@@ -47,13 +49,13 @@ IMPORTANT: Do NOT read or execute any SKILL.md files or paths containing skills/
 
   You are a developer who has never seen this product. Evaluate:
   1. Time to hello world: how many steps from zero to working? Target is under 5 minutes.
-  2. Error messages: when something goes wrong, does the dev know what, why, and how to fix?
+  2. Errors, agent-ready (what, fix, recovery, code, context, trace, redaction, channel), capped per Pass 3 (CAP4/CAP6).
   3. API/CLI design: are names guessable? Are defaults sensible? Is it consistent?
   4. Docs: can a dev find what they need in under 2 minutes? Are examples copy-paste-complete?
   5. Upgrade path: can devs upgrade without fear? Migration guides? Deprecation warnings?
   Be adversarial. Think like a developer who is evaluating this against 3 competitors.
 
-Use Write to save the **complete prompt and context** in a private file. Replace `<prepared-prompt-file>` below with its shell-quoted path; never interpolate user text into shell source. Include actual plan/spec/source content. Request a final Recommendation: <action> because <specific reason> line, including an explicit no-findings rationale. A refusal is never completion.
+Write the **complete prompt and context**, including actual plan/spec/source, to a private file. Substitute its shell-quoted path for `<prepared-prompt-file>`; never interpolate user text into shell source. Request a severity (Critical, High, Medium or Low) per finding and a final Recommendation: <action> because <specific reason> line, including an explicit no-findings rationale.
 
 ```bash
 # GSTACK_ACTIVE_HOST names the harness, never the model.
@@ -73,30 +75,34 @@ trap 'rm -rf "$_OUTSIDE_TMP"' EXIT
 _OUTSIDE_INPUT="$_OUTSIDE_TMP/prompt"
 cat -- '<prepared-prompt-file>' >"$_OUTSIDE_INPUT" || exit 1
 
-source "$HOME/.claude/skills/gstack/bin/gstack-codex-probe" || exit 1
-_gstack_codex_timeout_wrapper 600 codex exec "$(cat "$_OUTSIDE_INPUT")" -C "$_REPO_ROOT" -s read-only -c "model=\"${GSTACK_CODEX_MODEL:-gpt-6-astra}\"" -c 'model_reasoning_effort="high"' -c 'web_search="cached"' < /dev/null >"$_OUTSIDE_TMP/text" 2>"$_OUTSIDE_TMP/stderr"
-_OUTSIDE_EXIT=$?
-# Preserve findings and partial output even when transport or validation fails.
-cat "$_OUTSIDE_TMP/text"
+_CODEX_PROBE="$HOME/.claude/skills/gstack/bin/gstack-codex-probe"
+export _CODEX_DEADLINE=$(($(date +%s)+540)); _CODEX_OUT=$("$_CODEX_PROBE" role-ready exec) || exit $?
+_CODEX_SEL=$(echo "$_CODEX_OUT" | sed -n 's/^CODEX_SEL: //p')
+_CODEX_SANDBOX_MODE=$(echo "$_CODEX_OUT" | sed -n 's/^CODEX_SANDBOX: //p')
+"$_CODEX_PROBE" show-first-use-notice
+_OUTSIDE_EXIT=0
+"$_CODEX_PROBE" run-with-timeout --effort high 540 codex exec - -C "$_REPO_ROOT" -s "${_CODEX_SANDBOX_MODE:?}" -c "model=\"${_CODEX_SEL:?}\"" -c skills.include_instructions=false -c 'web_search="cached"' --json -o "$_OUTSIDE_TMP/text" <"$_OUTSIDE_INPUT" >"$_OUTSIDE_TMP/events" 2>"$_OUTSIDE_TMP/stderr" || _OUTSIDE_EXIT=$?
+cat "$_OUTSIDE_TMP/text" 2>/dev/null || tail -n 20 "$_OUTSIDE_TMP/events"
 if [ "$_OUTSIDE_EXIT" -eq 124 ]; then
-  _gstack_codex_log_event "codex_timeout" "600"
-  _gstack_codex_log_hang "autoplan" "0"
+  "$_CODEX_PROBE" log-event codex_timeout "540" || true
+  "$_CODEX_PROBE" log-hang autoplan 0 || true
 fi
-cat "$_OUTSIDE_TMP/stderr" >&2
-if [ "$_OUTSIDE_EXIT" -ne 0 ]; then
-  echo 'Codex outside review unavailable: execution failed; missing coverage. Check the provider diagnosis above.' >&2
-  exit "$_OUTSIDE_EXIT"
-fi
-bun "$HOME/.claude/skills/gstack/lib/outside-review-result.ts" review "$_OUTSIDE_TMP/text" || exit 1
-
+cat "$_OUTSIDE_TMP/stderr" >&2 || { [ "$_OUTSIDE_EXIT" -ne 0 ] || _OUTSIDE_EXIT=1; }
+_OUTSIDE_RC=0
+bun --no-env-file --config=/dev/null "$HOME/.claude/skills/gstack/lib/outside-review-result.ts" --label 'Codex outside review' --exit "$_OUTSIDE_EXIT" --stderr "$_OUTSIDE_TMP/stderr" --events "$_OUTSIDE_TMP/events" review "$_OUTSIDE_TMP/text" || _OUTSIDE_RC=$?
+case "$_OUTSIDE_RC" in
+  0|3) ;;
+  4) echo 'OUTSIDE_STATUS: unverified provider=codex host=claude'; exit 4 ;;
+  *) [ "$_OUTSIDE_EXIT" -ne 0 ] && exit "$_OUTSIDE_EXIT"; exit 1 ;;
+esac
 echo 'OUTSIDE_STATUS: completed provider=codex host=claude'
 ```
 
-Show the full response in a `tool-output` fence. Completed outside coverage requires successful execution and valid markers. Refusal, empty/malformed output, missing score/severity/completion markers, timeout, or CLI failure means `outside_status: unavailable`. Follow this caller's fallback; missing coverage is never clean/PASS. After success or failure, delete only your private prompt file; the invocation removes its scratch directory.
+Use Bash `timeout: 600000`; show the full response in a `tool-output` fence. Require successful execution and valid markers. Refusal, empty/malformed output, missing score/severity/completion markers, timeout or CLI failure means `outside_status: unavailable`. P0/P1 findings block like native ones; `OUTSIDE_STATUS: unverified` is missing coverage. Use the caller's fallback; missing coverage is never clean/PASS. After either outcome, delete only your private prompt; scratch cleanup is automatic.
 
-Outer tool timeout: 720000ms. Failed/incomplete outside review → unavailable; disabled → skip outside. Both retain the native pass.
+Failed/incomplete outside review → unavailable; disabled → skip outside. Both keep the native pass.
 
-For this phase (dx), retain the historical review-log skill identifier. Add `"host":"claude","outside_provider":"codex","outside_status":"completed|unavailable|disabled|skipped","phase":"dx"`. Record each attempted pass separately when outcomes differ. Use `source:"codex"` only for completed external CLI output, and `source:"in-host"` for a native pass. Historical `source:"claude"` continues to mean a native Claude subagent. CLI availability or a native fallback does not count as outside completion. Preserve reported modelUsage, including multiple models; unknown model identity stays unknown.
+Retain the historical review-log skill ID; add `"host":"claude","outside_provider":"codex","outside_status":"completed|unavailable|disabled|skipped","phase":"dx"`. Record differing attempt outcomes separately. `source:"codex"` requires completed CLI output; native uses `source:"in-host"` (historical `source:"claude"`: native Claude). Availability/native fallback is not outside completion. Preserve all reported modelUsage; unknown model identity stays unknown. Under `GSTACK_CODEX_NO_SANDBOX=1` add `"codex_sandbox":"danger-full-access"`.
 
   Error handling: Phase 1 failure/degradation policy applies.
 
@@ -105,8 +111,10 @@ For this phase (dx), retain the historical review-log skill identifier. Add `"ho
 
 **Required execution checklist (DX):**
 
-1. Step 0 (DX Scope Assessment): Auto-detect product type. Map the developer journey.
-   Rate initial DX completeness 0-10. Assess TTHW.
+1. Step 0 (DX Investigation, 0A-0G): Auto-detect product type, then settle persona,
+   empathy narrative, competitive benchmark and TTHW target, and trace the developer
+   journey. Score only after this evidence exists; the initial DX score is the
+   pre-fix pass scores.
 
 2. Step 0.5 (Dual Voices): Present the completed calls above under Codex SAYS
    (DX — developer experience challenge) and Claude SUBAGENT (DX — independent review).
@@ -114,16 +122,13 @@ For this phase (dx), retain the historical review-log skill identifier. Add `"ho
 
 ```
 DX DUAL VOICES — CONSENSUS TABLE:
-═══════════════════════════════════════════════════════════════
   Dimension                           Claude  Codex  Consensus
-  ──────────────────────────────────── ─────── ─────── ─────────
   1. Getting started < 5 min?          —       —      —
   2. API/CLI naming guessable?         —       —      —
   3. Error messages actionable?        —       —      —
   4. Docs findable & complete?         —       —      —
   5. Upgrade path safe?                —       —      —
   6. Dev environment friction-free?    —       —      —
-═══════════════════════════════════════════════════════════════
 CONFIRMED = native + outside agree; primary cannot replace outside. DISAGREE → taste.
 Missing/disabled voice = N/A, never CONFIRMED. Flag any single-voice critical finding.
 ```
@@ -134,23 +139,17 @@ Missing/disabled voice = N/A, never CONFIRMED. Flag any single-voice critical fi
 4. DX Scorecard: Produce the full scorecard with all 8 dimensions scored.
 
 **Mandatory outputs from Phase 2.5:**
-- Developer journey map (9-stage table)
+- Developer journey map (6-stage table from Step 0F)
 - Developer empathy narrative (first-person perspective)
 - DX Scorecard with all 8 dimension scores
 - DX Implementation Checklist
 - TTHW assessment with target
 
-**Close this phase:** Reconcile full review → EVERY accepted requirement/condition/test
-in its block. Taste provisional; User Challenges keep original.
-```bash
-bun "<SNAPSHOT_TOOL>" amend dx "<ACTIVE_PLAN>" "<DX_INPUT>"
-```
-None: reason checks unchanged. Read back fully; retention ≠ approval/completeness/correctness.
-Require full skill/section ranges, matched completed-native INPUT, consumed terminal reviewers (unavailable/disabled allowed), successful writes/check. Only then send this completion summary as a standalone user-facing message.
-After sending it, load/create/dispatch the next phase:
+**Close this phase:**
 
-**Phase 2.5 complete.**
-DX overall: [N]/10. TTHW: [N] min → [target] min.
-Codex: [completed: N concerns / unavailable / disabled]. Claude subagent: [completed: N issues / unavailable].
-Consensus: [X/6 confirmed, Y disagreements → surfaced at gate].
-Passing to Phase 3 (Eng Review — the required gate reviews the final amended plan).
+The review work above ends here. Now load the shared close steps afresh, even if
+read earlier. Use phase `dx`, checkpoint `<DX_INPUT>`, and this phase's
+`methodologyPath`. Keep this checkpoint for this invocation; review exports do not replace it.
+
+> **STOP.** Before closing a review phase, after its reviews finish and before announcing completion or loading the next phase (read afresh at each exit), Read `~/.claude/skills/gstack/autoplan/sections/phase-close.md` and execute it
+> in full. Do not work from memory — that section is the source of truth for this step.

@@ -11,11 +11,35 @@ afterAll(()=>{if(root){for(const candidate of [volumeImage,image])try{if(candida
 suite('CSO Docker containment integration',()=>{
   test('hard fails when local daemon enforcement prerequisites are absent',async()=>{endpoint=await dockerEndpoint(root,{HOME:root,DOCKER_HOST:'unix:///var/run/docker.sock'});const info=await dockerProbe(endpoint,root);expect(info.security.some((x:string)=>x.includes('seccomp'))).toBe(true);});
   test('rejects image-declared writable volumes before container creation',async()=>{const dir=path.join(root,'volume-rejection');fs.mkdirSync(dir);const group=await DockerGroup.create(endpoint,`volume-${Date.now()}`,dir,Date.now()+60_000,image,watchdog);try{const before=exec('/usr/bin/docker',['--host',endpoint.uri,'volume','ls','--quiet']);await expect(group.createContainer({role:'app',image:volumeImage,command:['/bin/sleep','1']})).rejects.toThrow('declares writable volumes');expect(exec('/usr/bin/docker',['--host',endpoint.uri,'volume','ls','--quiet'])).toBe(before);}finally{await group.cleanup();}},120_000);
-  test('shares only loopback while denying egress, privileges, and daemon logs, and reads private source/policy mounts',async()=>{const dir=path.join(root,'group');fs.mkdirSync(dir);const group=await DockerGroup.create(endpoint,`integration-${Date.now()}`,dir,Date.now()+60_000,image,watchdog);let server='',client='';try{server=await group.createContainer({role:'app',image,command:['/server']});await group.start(server);client=await group.createContainer({role:'verifier',image,command:['/client']});const result=await group.startAttach(client);expect(result).toEqual({code:0,output:'CONTAINMENT_OK\n'});const sourceDir=path.join(dir,'private-source'),policy=path.join(dir,'verification.json');fs.mkdirSync(sourceDir,{mode:0o700});fs.writeFileSync(path.join(sourceDir,'source.txt'),'source\n',{mode:0o600});fs.writeFileSync(policy,'policy\n',{mode:0o600});const reader=await group.createContainer({role:'browser',image,source:sourceDir,command:['/reader'],readonlyFiles:[{host:policy,container:'/policy/verification.json'}]});expect(await group.startAttach(reader)).toEqual({code:0,output:'INPUTS_OK\n'});const raw=exec('/usr/bin/docker',['--host',endpoint.uri,'inspect',client]),inspect=JSON.parse(raw)[0];expect(inspect.HostConfig).toMatchObject({ReadonlyRootfs:true,NetworkMode:`container:${group.anchor}`,PidsLimit:32,ShmSize:8*1024*1024,LogConfig:{Type:'none',Config:{}}});expect(inspect.Config.User).toBe(`${process.getuid?.()}:${process.getgid?.()}`);expect(inspect.HostConfig.CapDrop).toEqual(['ALL']);expect(inspect.HostConfig.SecurityOpt).toContain('no-new-privileges:true');expect(inspect.HostConfig.PortBindings).toEqual({});expect(inspect.Mounts.every((m:any)=>m.Destination!=='/var/run/docker.sock')).toBe(true);}finally{await group.cleanup();}expect(spawnSync('/usr/bin/docker',['--host',endpoint.uri,'inspect',client],{timeout:30_000}).status).not.toBe(0);});
+  test('shares only loopback while denying egress, privileges, and daemon logs, and reads private source/policy mounts',async()=>{
+    const dir=path.join(root,'group');fs.mkdirSync(dir);
+    const group=await DockerGroup.create(endpoint,`integration-${Date.now()}`,dir,Date.now()+60_000,image,watchdog);
+    let server='',client='';
+    try{
+      server=await group.createContainer({role:'app',image,command:['/server']});await group.start(server);
+      client=await group.createContainer({role:'verifier',image,command:['/client']});
+      const result=await group.startAttach(client);expect(result).toEqual({code:0,output:'CONTAINMENT_OK\n'});
+      const sourceDir=path.join(dir,'private-source'),policy=path.join(dir,'verification.json');
+      fs.mkdirSync(sourceDir,{mode:0o700});fs.writeFileSync(path.join(sourceDir,'source.txt'),'source\n',{mode:0o600});fs.writeFileSync(policy,'policy\n',{mode:0o600});
+      const reader=await group.createContainer({role:'browser',image,source:sourceDir,command:['/reader'],readonlyFiles:[{host:policy,container:'/policy/verification.json'}]});
+      expect(await group.startAttach(reader)).toEqual({code:0,output:'INPUTS_OK\n'});
+      const readerInspect=JSON.parse(exec('/usr/bin/docker',['--host',endpoint.uri,'inspect',reader]))[0];
+      expect(readerInspect.HostConfig.Mounts).toHaveLength(2);
+      for(const [Source,Target] of [[sourceDir,'/source'],[policy,'/policy/verification.json']]){
+        expect(readerInspect.HostConfig.Mounts.find((mount:any)=>mount.Target===Target)).toMatchObject({Type:'bind',Source,Target,ReadOnly:true,BindOptions:{NonRecursive:true}});
+        expect(readerInspect.Mounts.find((mount:any)=>mount.Destination===Target)).toMatchObject({Type:'bind',Source,Destination:Target,RW:false});
+      }
+      const raw=exec('/usr/bin/docker',['--host',endpoint.uri,'inspect',client]),inspect=JSON.parse(raw)[0];
+      expect(inspect.HostConfig).toMatchObject({ReadonlyRootfs:true,NetworkMode:`container:${group.anchor}`,PidsLimit:32,ShmSize:8*1024*1024,LogConfig:{Type:'none',Config:{}}});
+      expect(inspect.Config.User).toBe(`${process.getuid?.()}:${process.getgid?.()}`);
+      expect(inspect.HostConfig.CapDrop).toEqual(['ALL']);expect(inspect.HostConfig.SecurityOpt).toContain('no-new-privileges:true');
+      expect(inspect.HostConfig.PortBindings).toEqual({});expect(inspect.Mounts.every((m:any)=>m.Destination!=='/var/run/docker.sock')).toBe(true);
+    }finally{await group.cleanup();}
+    expect(spawnSync('/usr/bin/docker',['--host',endpoint.uri,'inspect',client],{timeout:30_000}).status).not.toBe(0);
+  });
   test('machine-wide admission allows only two groups per endpoint',()=>{const a=admit(endpoint.uri,'a',Date.now()+60_000),b=admit(endpoint.uri,'b',Date.now()+60_000);try{expect(()=>admit(endpoint.uri,'c',Date.now()+60_000)).toThrow('Two reproduction groups');}finally{release(a);release(b);}});
-  test('staged runtime executes its trusted verifier and checks every declared tool version', async () => {
-    const staged = process.env.GSTACK_CSO_TEST_IMAGE;
-    if (!staged) return;
+  test.skipIf(!process.env.GSTACK_CSO_TEST_IMAGE)('staged runtime executes its trusted verifier and checks every declared tool version', async () => {
+    const staged = process.env.GSTACK_CSO_TEST_IMAGE!;
     expect(staged).toMatch(/@sha256:[a-f0-9]{64}$/);
     expect(process.env.GSTACK_CSO_TEST_PLATFORM).toBe(process.arch === 'arm64' ? 'linux/arm64' : 'linux/amd64');
     const versions = JSON.parse(process.env.GSTACK_CSO_EXPECTED_VERSIONS || '{}');
@@ -41,8 +65,13 @@ suite('CSO Docker containment integration',()=>{
     fs.writeFileSync(negativePath, JSON.stringify({...policy, legitimate: [{...policy.legitimate[0], expected: {status: 201, includes: 'CONTROL_OK'}}]}), {mode: 0o600});
     const group = await DockerGroup.create(endpoint, `staged-${Date.now()}`, dir, Date.now() + 90_000, staged, watchdog);
     try {
+      const verifier = await group.createContainer({
+        role: 'verifier', image: staged, command: ['/bin/sleep', '2147483647'],
+        readonlyFiles: [{host: positivePath, container: '/policy/positive.json'}, {host: negativePath, container: '/policy/broken-control.json'}],
+      });
+      await group.start(verifier);
       for (const [tool, version] of Object.entries(versions)) {
-        const result = await group.execAttach(group.anchor, stack[tool]);
+        const result = await group.execAttach(verifier, stack[tool]);
         expect(result.code).toBe(0);
         const expected = `${prefixes[tool]}${version}`.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         expect(result.output.trim()).toMatch(new RegExp(`^${expected}(?:$|\\s)`));
@@ -56,11 +85,6 @@ suite('CSO Docker containment integration',()=>{
       }
       const server = await group.createContainer({role: 'app', image, command: ['/http-server']});
       await group.start(server);
-      const verifier = await group.createContainer({
-        role: 'verifier', image: staged, command: ['/bin/sleep', '2147483647'],
-        readonlyFiles: [{host: positivePath, container: '/policy/positive.json'}, {host: negativePath, container: '/policy/broken-control.json'}],
-      });
-      await group.start(verifier);
       const positive = await group.execAttach(verifier, ['/opt/cso/verifier', '/policy/positive.json']);
       expect(positive.code).toBe(0);
       expect(JSON.parse(positive.output)).toMatchObject({booted: true, legitimate: true, security: 'pass'});

@@ -1,15 +1,19 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /** Trusted corpus preparation, producer receipt collection, and objective result accounting. */
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, readdirSync, realpathSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { readBoundedStable } from '../lib/cso/bounded-file';
-import { executable } from '../lib/cso/process';
+import { canonical } from '../lib/cso/contracts';
+import { validateRuntimeCatalog, type RuntimeCatalog } from '../lib/cso/runtime-catalog';
+import { EMPTY_GLOBAL_GIT_CONFIG, executable } from '../lib/cso/process';
 import { atomicWriteSync } from '../lib/fs-atomic';
-import { loadCorpusManifest, materializeCase, sourceFiles, STACKS, type CorpusManifest, type EvalStack, type EvalVariant } from '../test/fixtures/cso-eval/materialize';
+import { loadCorpusManifest, materializeCase, publicCorpus, STACKS, validateCorpusManifest, type CorpusManifest, type EvalCorpus, type EvalStack, type EvalVariant } from '../test/fixtures/cso-eval/materialize';
 import {
+  PRODUCER_PLATFORMS,
   producerArtifactInventoryHash,
+  producerExecution,
   producerInputHash,
   producerInstallationIdentityHash,
   producerProviderIdentityHash,
@@ -20,6 +24,7 @@ import {
   type ProducerHost,
   type ProducerInput,
   type ProducerInstallationIdentity,
+  type ProducerPlatform,
   type ProducerProviderIdentity,
   type ProducerReceipt,
   type ProducerReceiptIndex,
@@ -29,13 +34,53 @@ import {
 export type EvalVersion = 'v2' | 'v3';
 export type EvalMode = 'daily' | 'comprehensive';
 export type Outcome = 'passed' | 'failed' | 'blocked' | 'not_attempted';
+/**
+ * full: matched v2/v3 × 3 repetitions on one producer installation.
+ * release: v3 only, 1 repetition, each cell pinned to a native platform.
+ * baseline: v2 comprehensive only, 1 repetition; scored into a reusable EvalBaseline.
+ */
+export type EvalProfile = 'full' | 'release' | 'baseline';
+export type EvalPlatform = ProducerPlatform;
+type EvalCorpusManifest = CorpusManifest<string>;
 export interface EvalCell extends ProducerCell {
   id: string; caseId: string; stack: EvalStack; variant: EvalVariant; version: EvalVersion; mode: EvalMode;
-  repetition: 1 | 2 | 3; model: string; host: ProducerHost; budgetSeconds: number; sourceHash: string; skillHash: string;
+  repetition: 1 | 2 | 3; model: string; host: ProducerHost; budgetSeconds: number; sourceHash: string; skillHash: string; platform?: EvalPlatform;
 }
-export interface EvalMatrix {
+interface EvalMatrixBase {
   schemaVersion: 1; corpusVersion: string; corpusHash: string; model: string; host: ProducerHost;
-  budgets: { daily: number; comprehensive: number }; skillHashes: { v2: string; v3: string }; repetitions: 3; cells: EvalCell[];
+  budgets: { daily: number; comprehensive: number }; cells: EvalCell[];
+}
+export interface FullEvalMatrix extends EvalMatrixBase { profile?: undefined; skillHashes: { v2: string; v3: string }; repetitions: 3 }
+export interface ReleaseEvalMatrix extends EvalMatrixBase {
+  profile: 'release'; skillHashes: { v3: string }; repetitions: 1;
+  /** Daily cells run on one platform; each comprehensive case is fixed to one platform. */
+  platforms: { daily: EvalPlatform; comprehensive: Record<string, EvalPlatform> };
+  /** Pre-registered external v2 baseline, or null when the regression gate stays unmeasured. */
+  baselineHash: string | null;
+}
+export interface BaselineEvalMatrix extends EvalMatrixBase {
+  profile: 'baseline'; skillHashes: { v2: string }; repetitions: 1;
+  platforms: { comprehensive: Record<string, EvalPlatform> };
+}
+export type EvalMatrix = FullEvalMatrix | ReleaseEvalMatrix | BaselineEvalMatrix;
+interface EvalMatrixCommonOptions { model: string; host: ProducerHost; budgets?: { daily: number; comprehensive: number } }
+export interface FullEvalMatrixOptions extends EvalMatrixCommonOptions { profile?: 'full'; skillHashes: { v2: string; v3: string } }
+export interface ReleaseEvalMatrixOptions extends EvalMatrixCommonOptions { profile: 'release'; skillHashes: { v3: string }; platforms: ReleaseEvalMatrix['platforms']; baseline?: EvalBaseline }
+export interface BaselineEvalMatrixOptions extends EvalMatrixCommonOptions { profile: 'baseline'; skillHashes: { v2: string }; platforms: BaselineEvalMatrix['platforms'] }
+export type EvalMatrixOptions = FullEvalMatrixOptions | ReleaseEvalMatrixOptions | BaselineEvalMatrixOptions;
+/**
+ * A scored v2 comprehensive run, reused by release matrices while every bound
+ * input is unchanged. Release matrices pin its hash before results exist.
+ */
+export interface EvalBaseline {
+  schemaVersion: 1; version: 'v2';
+  corpusVersion: string; corpusHash: string; model: string; host: ProducerHost; budgetSeconds: number; skillHash: string;
+  platforms: Record<string, EvalPlatform>;
+  matrixHash: string; producerBatchHash: string; modelUsed: string;
+  provider: { family: ProducerProviderIdentity['family']; policyRevision: string; version: string };
+  /** One entry per corpus case, in manifest order: whether the vulnerable cell found the seeded issue. */
+  cases: Array<{ caseId: string; found: boolean }>;
+  baselineHash: string;
 }
 export interface PortableSkillFile {
   path: string;
@@ -53,8 +98,15 @@ export interface PortableSkillPayloadIdentity {
 }
 export interface EvalFinding {
   id: string; evidence: 'supported' | 'hypothesis' | 'legacy_review'; claimedTested: boolean;
-  /** Written only by the independent evaluator after reviewing the reported trace. */
-  judgment: 'correct' | 'incorrect' | 'unadjudicated'; matchedCaseId?: string;
+  /**
+   * Written only by the independent evaluator after reviewing the reported trace. `correct`: the seeded issue.
+   * `incidental`: a different issue a unanimous judge panel confirmed is real in this source; a precision true
+   * positive, never recall. `instrumentation`: it targets the evaluator's declared fixture instrumentation
+   * (canary overlay files, egress probe), so precision leaves it out of both terms.
+   */
+  judgment: 'correct' | 'incidental' | 'instrumentation' | 'incorrect' | 'unadjudicated'; matchedCaseId?: string;
+  /** `incidental` only: the evaluator's opaque key for the confirmed issue, so restatements count once per cell. */
+  incidentalKey?: string;
   /**
    * Written only by the independent evaluator.  A producer's tested claim is
    * valid only when this finding, rather than merely another finding in the
@@ -66,10 +118,22 @@ export interface EvalFinding {
     recheck: Outcome;
     recheckEvidenceHash?: string;
   };
+  /**
+   * Written only by the independent evaluator, for a tested claim on an `incidental` finding: the result of
+   * replaying the helper's signed repair bundle for that finding against the trusted source. `passed` (with the
+   * replay's evidence hash) certifies the claim; `failed` or `missing` (no bound bundle) leaves it falsely tested.
+   * It never counts toward recall, repair or held-out rates, which need the seeded issue.
+   */
+  trustedReplay?: { result: 'passed' | 'failed' | 'missing'; replayEvidenceHash?: string };
 }
 export interface EvalResult {
   cellId: string; sourceHash: string; skillHash: string; model: string; host: string; budgetSeconds: number;
-  reportPresent: boolean; reportComplete: boolean; findings: EvalFinding[];
+  /**
+   * `reportFinished`: the helper report's status is `finished`; its findings and runtime outcomes count whatever its
+   * completeness, and the report gates require it. `reportComplete`: it is also `complete` (no gap, every domain
+   * assessed), measured as its own ungated rate because the corpus fixtures carry gaps by design.
+   */
+  reportPresent: boolean; reportFinished: boolean; reportComplete: boolean; findings: EvalFinding[];
   setup: Outcome; reproduction: Outcome; repair: Outcome; recheck: Outcome;
   /** Hash of trusted private observations; never a producer's claimed verification status. */
   oracleEvidenceHash?: string;
@@ -125,6 +189,8 @@ export interface ProducerBatch {
     groups: ProducerGroupSummary[];
     note: string;
   };
+  /** Present only when platforms embedded catalogs that differ in qualification time alone; see assertPlatformIdentities. */
+  embeddedCatalogs?: RuntimeCatalog[];
   batchHash: string;
 }
 export const REQUIRED_CONTAINMENT = [
@@ -266,19 +332,22 @@ function initializeFixtureRepository(path: string): void {
   const nullPath = process.platform === 'win32' ? 'NUL' : '/dev/null';
   const env = {
     PATH: process.env.PATH ?? '', LANG: 'C', LC_ALL: 'C',
-    GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: nullPath, GIT_ATTR_NOSYSTEM: '1',
+    GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: EMPTY_GLOBAL_GIT_CONFIG, GIT_ATTR_NOSYSTEM: '1',
     GIT_AUTHOR_NAME: 'CSO Eval', GIT_AUTHOR_EMAIL: 'cso-eval@invalid',
     GIT_COMMITTER_NAME: 'CSO Eval', GIT_COMMITTER_EMAIL: 'cso-eval@invalid',
   };
   const git = executable('git');
-  execFileSync(git, ['init', '--quiet', '--initial-branch=main'], { cwd: path, env, stdio: 'ignore' });
-  const safe = ['-c', `core.hooksPath=${nullPath}`, '-c', `core.attributesFile=${nullPath}`, '-c', `core.excludesFile=${nullPath}`];
+  // Prepared sources are copied immediately. A detached auto-maintenance child
+  // can remove .git/objects/maintenance.lock while that copy is in progress.
+  const safe = ['-c', 'maintenance.auto=false', '-c', 'gc.auto=0',
+    '-c', `core.hooksPath=${nullPath}`, '-c', `core.attributesFile=${nullPath}`, '-c', `core.excludesFile=${nullPath}`];
+  execFileSync(git, [...safe, 'init', '--quiet', '--initial-branch=main'], { cwd: path, env, stdio: 'ignore' });
   execFileSync(git, [...safe, 'add', '--all'], { cwd: path, env, stdio: 'ignore' });
   execFileSync(git, [...safe, 'commit', '--quiet', '-m', 'immutable evaluation fixture'], { cwd: path, env, stdio: 'ignore' });
 }
 
-function sourceEntries(caseId: string, variant: EvalVariant): ProducerSourceEntry[] {
-  return Object.entries(sourceFiles(caseId, variant)).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0).map(([path, contents]) => ({ path, sha256: sha256(contents), bytes: Buffer.byteLength(contents) }));
+function sourceEntries(corpus: EvalCorpus, caseId: string, variant: EvalVariant): ProducerSourceEntry[] {
+  return Object.entries(corpus.sourceFiles(caseId, variant)).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0).map(([path, contents]) => ({ path, sha256: sha256(contents), bytes: Buffer.byteLength(contents) }));
 }
 
 /**
@@ -286,10 +355,15 @@ function sourceEntries(caseId: string, variant: EvalVariant): ProducerSourceEntr
  * evaluator metadata; transfer one job at a time and never give the schedule
  * or sibling jobs to the producing agent.
  */
-export function prepareEvalJobs(matrix: EvalMatrix, payloads: { v2: string; v3: string }, destination: string, selectedCellIds?: string[]): PreparedEvalSchedule {
-  validateMatrix(matrix);
-  validatePortableSkillPayload(payloads.v2, 'v2'); validatePortableSkillPayload(payloads.v3, 'v3');
-  if (sha256(payloads.v2) !== matrix.skillHashes.v2 || sha256(payloads.v3) !== matrix.skillHashes.v3) throw new Error('EVAL_SKILL_HASH_MISMATCH');
+export function prepareEvalJobs(matrix: EvalMatrix, payloads: Partial<Record<EvalVersion, string>>, destination: string, selectedCellIds?: string[], corpus: EvalCorpus = publicCorpus()): PreparedEvalSchedule {
+  validateMatrix(matrix, corpus.manifest);
+  const skillHashes: Partial<Record<EvalVersion, string>> = matrix.skillHashes;
+  const versions = (['v2', 'v3'] as const).filter(version => skillHashes[version] !== undefined);
+  if (!payloads || Object.keys(payloads).sort().join(',') !== versions.join(',')) throw new Error('EVAL_SKILL_HASH_MISMATCH');
+  for (const version of versions) {
+    validatePortableSkillPayload(payloads[version]!, version);
+    if (sha256(payloads[version]!) !== skillHashes[version]) throw new Error('EVAL_SKILL_HASH_MISMATCH');
+  }
   const root = resolve(destination);
   if (existsSync(root)) throw new Error('EVAL_DESTINATION_EXISTS');
   const parent = dirname(root);
@@ -305,10 +379,10 @@ export function prepareEvalJobs(matrix: EvalMatrix, payloads: { v2: string; v3: 
   const jobs: PreparedEvalSchedule['jobs'] = [];
   for (const cell of selected) {
     const jobRoot = join(jobsRoot, cell.id); mkdirSync(jobRoot, { mode: 0o700 });
-    const source = materializeCase(cell.caseId, cell.variant, join(jobRoot, 'source'));
+    const source = materializeCase(cell.caseId, cell.variant, join(jobRoot, 'source'), corpus);
     if (source.sourceHash !== cell.sourceHash) throw new Error('CORPUS_INTEGRITY_MISMATCH');
     initializeFixtureRepository(source.path);
-    const input: ProducerInput = { schemaVersion: 1, cell, skill: payloads[cell.version], source: sourceEntries(cell.caseId, cell.variant) };
+    const input: ProducerInput = { schemaVersion: 2, cellRef: cell.id, skill: payloads[cell.version]!, source: sourceEntries(corpus, cell.caseId, cell.variant), execution: producerExecution(cell) };
     const inputHash = producerInputHash(input);
     safeWriteNew(join(jobRoot, 'producer-input.json'), input);
     jobs.push({ cellId: cell.id, relativePath: `jobs/${cell.id}`, inputHash });
@@ -329,7 +403,7 @@ function validateSchedule(matrix: EvalMatrix, schedule: PreparedEvalSchedule): v
 }
 
 function validateReceipt(receipt: ProducerReceipt, cell: EvalCell, inputHash: string): void {
-  if (receipt?.schemaVersion !== 1 || JSON.stringify(receipt.cell) !== JSON.stringify(cell) || receipt.inputHash !== inputHash || receipt.requestedModel !== cell.model || !['succeeded', 'failed'].includes(receipt.status) || typeof receipt.modelUsed !== 'string' || !receipt.modelUsed || !['provider_reported', 'requested_pin'].includes(receipt.modelIdentitySource) || (receipt.modelIdentitySource === 'requested_pin' && receipt.modelUsed !== receipt.requestedModel) || (receipt.modelIdentitySource === 'provider_reported' && receipt.modelUsed === receipt.requestedModel) || !validNumber(receipt.durationMs) || receipt.firstUsefulResultMs !== null || !Number.isSafeInteger(receipt.toolCalls) || receipt.toolCalls < 0 || typeof receipt.output !== 'string' || receipt.outputHash !== sha256(receipt.output) || !HEX.test(receipt.receiptHash)) throw new Error('INVALID_PRODUCER_RECEIPT');
+  if (receipt?.schemaVersion !== 2 || receipt.cellRef !== cell.id || 'cell' in receipt || receipt.inputHash !== inputHash || receipt.requestedModel !== cell.model || !['succeeded', 'failed'].includes(receipt.status) || typeof receipt.modelUsed !== 'string' || !receipt.modelUsed || !['provider_reported', 'requested_pin'].includes(receipt.modelIdentitySource) || (receipt.modelIdentitySource === 'requested_pin' && receipt.modelUsed !== receipt.requestedModel) || (receipt.modelIdentitySource === 'provider_reported' && receipt.modelUsed === receipt.requestedModel) || !validNumber(receipt.durationMs) || receipt.firstUsefulResultMs !== null || !Number.isSafeInteger(receipt.toolCalls) || receipt.toolCalls < 0 || typeof receipt.output !== 'string' || receipt.outputHash !== sha256(receipt.output) || !HEX.test(receipt.receiptHash)) throw new Error('INVALID_PRODUCER_RECEIPT');
   const { receiptHash, ...withoutHash } = receipt;
   if (producerReceiptHash(withoutHash) !== receiptHash) throw new Error('INVALID_PRODUCER_RECEIPT');
   const started = Date.parse(receipt.startedAt), finished = Date.parse(receipt.finishedAt);
@@ -340,6 +414,8 @@ function validateReceipt(receipt: ProducerReceipt, cell: EvalCell, inputHash: st
   validateInstallationIdentity(receipt.installationIdentity, 'INVALID_PRODUCER_RECEIPT');
   validateProviderIdentity(receipt.providerIdentity, cell.host === 'codex' ? 'gpt' : cell.host, 'INVALID_PRODUCER_RECEIPT');
   validateArtifactInventory(receipt.artifacts, 'INVALID_PRODUCER_RECEIPT');
+  const timeline = receipt.toolTimeline;
+  if (timeline !== undefined && (!Array.isArray(timeline) || timeline.length > 4096 || timeline.some(entry => !entry || !Number.isSafeInteger(entry.atMs) || entry.atMs < 0 || (entry.endMs !== undefined && (!Number.isSafeInteger(entry.endMs) || entry.endMs < entry.atMs)) || typeof entry.tool !== 'string' || !/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(entry.tool) || !['main', 'subagent'].includes(entry.agent) || Object.keys(entry).some(key => !['atMs', 'endMs', 'tool', 'agent'].includes(key))))) throw new Error('INVALID_PRODUCER_RECEIPT');
 }
 
 function validateInstallationIdentity(identity: ProducerInstallationIdentity, error: string): void {
@@ -359,14 +435,16 @@ function validateProviderIdentity(identity: ProducerProviderIdentity, family: 'c
   if (producerProviderIdentityHash(withoutHash) !== identityHash) throw new Error(error);
 }
 
+/** Paths are unique; their order is whatever the producer bound into identityHash (1.91.75 producers sorted by locale). */
 function validateArtifactInventory(inventory: ProducerArtifactInventory, error: string): void {
   if (!inventory || inventory.schemaVersion !== 1 || inventory.root !== 'security/cso' || !Array.isArray(inventory.entries) || inventory.entries.length > 4096 ||
       !Number.isSafeInteger(inventory.totalBytes) || inventory.totalBytes < 0 || inventory.totalBytes > 128 * 1024 * 1024 || !HEX.test(inventory.identityHash)) throw new Error(error);
-  let previous = '', total = 0;
+  const paths = new Set<string>();
+  let total = 0;
   for (const entry of inventory.entries) {
     if (!entry || typeof entry.path !== 'string' || entry.path.length > 1024 || !/^[A-Za-z0-9._/-]+$/.test(entry.path) || entry.path.split('/').some(part => !part || part === '.' || part === '..') ||
-        entry.path <= previous || !HEX.test(entry.sha256) || !Number.isSafeInteger(entry.bytes) || entry.bytes < 0 || entry.bytes > 32 * 1024 * 1024) throw new Error(error);
-    previous = entry.path; total += entry.bytes;
+        paths.has(entry.path) || !HEX.test(entry.sha256) || !Number.isSafeInteger(entry.bytes) || entry.bytes < 0 || entry.bytes > 32 * 1024 * 1024) throw new Error(error);
+    paths.add(entry.path); total += entry.bytes;
   }
   if (total !== inventory.totalBytes) throw new Error(error);
   const { identityHash, ...withoutHash } = inventory;
@@ -374,7 +452,7 @@ function validateArtifactInventory(inventory: ProducerArtifactInventory, error: 
 }
 
 function validateReceiptIndex(receipt: ProducerReceiptIndex, cell: EvalCell): void {
-  if (!receipt || receipt.schemaVersion !== 1 || JSON.stringify(receipt.cell) !== JSON.stringify(cell) || !HEX.test(receipt.inputHash) || receipt.requestedModel !== cell.model || !receipt.modelUsed || !['provider_reported', 'requested_pin'].includes(receipt.modelIdentitySource) || (receipt.modelIdentitySource === 'requested_pin' && receipt.modelUsed !== receipt.requestedModel) || (receipt.modelIdentitySource === 'provider_reported' && receipt.modelUsed === receipt.requestedModel) || !['succeeded', 'failed'].includes(receipt.status) || !HEX.test(receipt.outputHash) || !HEX.test(receipt.receiptHash) || !validNumber(receipt.durationMs) || receipt.firstUsefulResultMs !== null || !Number.isSafeInteger(receipt.toolCalls) || receipt.toolCalls < 0 || !receipt.usage) throw new Error('INVALID_PRODUCER_BATCH');
+  if (!receipt || receipt.schemaVersion !== 2 || receipt.cellRef !== cell.id || JSON.stringify(receipt.cell) !== JSON.stringify(cell) || !HEX.test(receipt.inputHash) || receipt.requestedModel !== cell.model || !receipt.modelUsed || !['provider_reported', 'requested_pin'].includes(receipt.modelIdentitySource) || (receipt.modelIdentitySource === 'requested_pin' && receipt.modelUsed !== receipt.requestedModel) || (receipt.modelIdentitySource === 'provider_reported' && receipt.modelUsed === receipt.requestedModel) || !['succeeded', 'failed'].includes(receipt.status) || !HEX.test(receipt.outputHash) || !HEX.test(receipt.receiptHash) || !validNumber(receipt.durationMs) || receipt.firstUsefulResultMs !== null || !Number.isSafeInteger(receipt.toolCalls) || receipt.toolCalls < 0 || !receipt.usage) throw new Error('INVALID_PRODUCER_BATCH');
   const started = Date.parse(receipt.startedAt), finished = Date.parse(receipt.finishedAt);
   if (!Number.isFinite(started) || !Number.isFinite(finished) || finished < started || !['inputTokens', 'outputTokens', 'cachedTokens', 'estimatedCostUSD'].every(field => receipt.usage[field as keyof typeof receipt.usage] === null || validNumber(receipt.usage[field as keyof typeof receipt.usage])) || ((receipt.status === 'failed') !== !!receipt.error) || (receipt.error && !receipt.error.code)) throw new Error('INVALID_PRODUCER_BATCH');
   validateInstallationIdentity(receipt.installationIdentity, 'INVALID_PRODUCER_BATCH');
@@ -383,32 +461,82 @@ function validateReceiptIndex(receipt: ProducerReceiptIndex, cell: EvalCell): vo
 }
 
 const matchedPairKey = (cell: EvalCell): string => [cell.caseId, cell.variant, cell.mode, cell.repetition, cell.model, cell.host, cell.budgetSeconds, cell.sourceHash].join('|');
+const PROFILE_GROUPS: Record<EvalProfile, ReadonlyArray<readonly [EvalVersion, EvalMode]>> = {
+  full: [['v2', 'daily'], ['v2', 'comprehensive'], ['v3', 'daily'], ['v3', 'comprehensive']],
+  release: [['v3', 'daily'], ['v3', 'comprehensive']],
+  baseline: [['v2', 'comprehensive']],
+};
+const profileOf = (matrix: EvalMatrix): EvalProfile => matrix.profile ?? 'full';
+const expectedMatchedPairs = (matrix: EvalMatrix): number => profileOf(matrix) === 'full' ? matrix.cells.length / 2 : 0;
 
-export function collectProducerReceipts(matrix: EvalMatrix, schedule: PreparedEvalSchedule, receipts: ProducerReceipt[]): ProducerBatch {
-  validateMatrix(matrix); validateSchedule(matrix, schedule);
+type IdentityBearing = Pick<ProducerReceiptIndex, 'cell' | 'installationIdentity' | 'providerIdentity'>;
+/**
+ * Each platform has exactly one producer installation and provider binary.
+ * Platforms differ only in native binaries: the embedded catalogs and the
+ * reviewed provider policy must be identical across them. Evaluation units that
+ * generated their catalog once per platform embed copies differing only in each
+ * runtime's `qualifiedAt` and the evidence digest over it; `bodies`, the catalogs
+ * as embedded, prove that, each hashing to its platform's runtimeSha256.
+ */
+function assertPlatformIdentities(receipts: IdentityBearing[], bodies: RuntimeCatalog[] = []): void {
+  const byPlatform = new Map<string, IdentityBearing[]>();
+  for (const receipt of receipts) {
+    const key = receipt.cell.platform ?? 'unpinned', list = byPlatform.get(key) ?? [];
+    list.push(receipt); byPlatform.set(key, list);
+  }
+  for (const list of byPlatform.values()) {
+    if (new Set(list.map(receipt => receipt.installationIdentity.identityHash)).size > 1) throw new Error('UNMATCHED_PRODUCER_INSTALLATIONS');
+    if (new Set(list.map(receipt => receipt.providerIdentity.identityHash)).size > 1) throw new Error('UNMATCHED_PRODUCER_PROVIDERS');
+  }
+  const representatives = [...byPlatform.values()].map(list => list[0]);
+  if (representatives.length < 2) return;
+  if (new Set(representatives.map(receipt => receipt.installationIdentity.identityHash)).size !== representatives.length) throw new Error('UNMATCHED_PRODUCER_PLATFORMS');
+  const catalogs = (receipt: IdentityBearing) => JSON.stringify(receipt.installationIdentity.embeddedCatalogs);
+  const policy = ({ providerIdentity: { family, policyRevision, version, argsPrefix } }: IdentityBearing) => JSON.stringify({ family, policyRevision, version, argsPrefix });
+  if (new Set(representatives.map(catalogs)).size !== 1 && !catalogsDifferOnlyInQualificationTime(representatives, bodies)) throw new Error('UNMATCHED_PRODUCER_INSTALLATIONS');
+  if (new Set(representatives.map(policy)).size !== 1) throw new Error('UNMATCHED_PRODUCER_PROVIDERS');
+}
+
+function catalogsDifferOnlyInQualificationTime(representatives: IdentityBearing[], bodies: RuntimeCatalog[]): boolean {
+  if (!Array.isArray(bodies) || bodies.length !== representatives.length) return false;
+  const timeless = (body: RuntimeCatalog) => canonical({ ...body, evaluation: { ...body.evaluation, evidenceDigest: null }, runtimes: body.runtimes.map(({ qualifiedAt: _qualifiedAt, ...runtime }) => runtime) });
+  const shared = ({ runtimeSha256: _runtimeSha256, ...rest }: ProducerInstallationIdentity['embeddedCatalogs']) => JSON.stringify(rest);
+  const matched = representatives.map(receipt => bodies.find(body => sha256(JSON.stringify(body)) === receipt.installationIdentity.embeddedCatalogs.runtimeSha256));
+  if (matched.some(body => !body) || new Set(matched).size !== bodies.length) return false;
+  try { for (const body of bodies) validateRuntimeCatalog(body); } catch { return false; }
+  return new Set(representatives.map(receipt => shared(receipt.installationIdentity.embeddedCatalogs))).size === 1 && new Set(bodies.map(timeless)).size === 1 &&
+    bodies.every(body => body.revision === representatives[0].installationIdentity.embeddedCatalogs.runtimeRevision && body.evaluation);
+}
+
+/** `embeddedCatalogs`: the runtime catalog each platform's producer unit embedded, required only when those differ (see assertPlatformIdentities). */
+export function collectProducerReceipts(matrix: EvalMatrix, schedule: PreparedEvalSchedule, receipts: ProducerReceipt[], corpus: EvalCorpusManifest = loadCorpusManifest(), embeddedCatalogs: RuntimeCatalog[] = []): ProducerBatch {
+  validateMatrix(matrix, corpus); validateSchedule(matrix, schedule);
   if (!Array.isArray(receipts)) throw new Error('INVALID_PRODUCER_RECEIPTS');
   const cells = new Map(matrix.cells.map(cell => [cell.id, cell]));
   const jobs = new Map(schedule.jobs.map(job => [job.cellId, job]));
   const seen = new Set<string>();
   for (const receipt of receipts) {
-    const cell = cells.get(receipt?.cell?.id), job = jobs.get(receipt?.cell?.id);
+    const cell = cells.get(receipt?.cellRef), job = jobs.get(receipt?.cellRef);
     if (!cell || !job || seen.has(cell.id)) throw new Error('UNKNOWN_OR_DUPLICATE_PRODUCER_RECEIPT');
     validateReceipt(receipt, cell, job.inputHash); seen.add(cell.id);
   }
-  if (new Set(receipts.map(receipt => receipt.installationIdentity.identityHash)).size > 1) throw new Error('UNMATCHED_PRODUCER_INSTALLATIONS');
-  if (new Set(receipts.map(receipt => receipt.providerIdentity.identityHash)).size > 1) throw new Error('UNMATCHED_PRODUCER_PROVIDERS');
-  const pairs = new Map<string, Partial<Record<EvalVersion, ProducerReceipt>>>();
-  for (const receipt of receipts) {
+  // Receipts name only the opaque cellRef; the trusted matrix supplies the cell.
+  const bound = receipts.map(receipt => ({ ...receipt, cell: cells.get(receipt.cellRef)! }));
+  assertPlatformIdentities(bound, embeddedCatalogs);
+  const platformCatalogs = new Set(bound.map(receipt => receipt.installationIdentity.embeddedCatalogs.runtimeSha256)).size > 1 ? embeddedCatalogs : undefined;
+  const pairs = new Map<string, Partial<Record<EvalVersion, (typeof bound)[number]>>>();
+  if (profileOf(matrix) === 'full') for (const receipt of bound) {
     const key = matchedPairKey(receipt.cell as EvalCell);
     const pair = pairs.get(key) ?? {}; pair[receipt.cell.version] = receipt; pairs.set(key, pair);
   }
-  const completePairs = [...pairs.entries()].filter(([, pair]) => pair.v2 && pair.v3) as Array<[string, { v2: ProducerReceipt; v3: ProducerReceipt }]>;
+  else if (new Set(bound.map(receipt => receipt.modelUsed)).size > 1) throw new Error('UNMATCHED_EFFECTIVE_MODELS: single-version cells used different normalized model identities');
+  const completePairs = [...pairs.entries()].filter(([, pair]) => pair.v2 && pair.v3) as Array<[string, { v2: (typeof bound)[number]; v3: (typeof bound)[number] }]>;
   const modelMismatches = completePairs.filter(([, pair]) => pair.v2.modelUsed !== pair.v3.modelUsed).map(([pair, value]) => ({ pair: digest(pair), v2: value.v2.modelUsed, v3: value.v3.modelUsed }));
   if (modelMismatches.length) throw new Error(`UNMATCHED_EFFECTIVE_MODELS: ${modelMismatches.length} matched v2/v3 pair(s) used different normalized model identities`);
   const groups: ProducerGroupSummary[] = [];
-  for (const version of ['v2', 'v3'] as const) for (const mode of ['daily', 'comprehensive'] as const) {
+  for (const [version, mode] of PROFILE_GROUPS[profileOf(matrix)]) {
     const expected = matrix.cells.filter(cell => cell.version === version && cell.mode === mode);
-    const submitted = receipts.filter(receipt => receipt.cell.version === version && receipt.cell.mode === mode);
+    const submitted = bound.filter(receipt => receipt.cell.version === version && receipt.cell.mode === mode);
     const tokens = submitted.flatMap(receipt => receipt.usage.inputTokens === null || receipt.usage.outputTokens === null ? [] : [receipt.usage.inputTokens + receipt.usage.outputTokens]);
     const costs = submitted.flatMap(receipt => receipt.usage.estimatedCostUSD === null ? [] : [receipt.usage.estimatedCostUSD]);
     groups.push({ version, mode, scheduled: expected.length, submitted: submitted.length, missing: expected.length - submitted.length, succeeded: submitted.filter(receipt => receipt.status === 'succeeded').length, failed: submitted.filter(receipt => receipt.status === 'failed').length,
@@ -418,37 +546,107 @@ export function collectProducerReceipts(matrix: EvalMatrix, schedule: PreparedEv
       estimatedCost: { measured: costs.length, denominator: expected.length, totalUSD: costs.length ? costs.reduce((sum, value) => sum + value, 0) : null, source: 'pricing-table-estimate' },
     });
   }
-  const indexes: ProducerReceiptIndex[] = receipts.map(({ output: _output, error, ...receipt }) => ({ ...receipt, ...(error ? { error: { code: error.code } } : {}) }));
+  const indexes: ProducerReceiptIndex[] = bound.map(({ output: _output, toolTimeline: _toolTimeline, error, ...receipt }) => ({ ...receipt, ...(error ? { error: { code: error.code } } : {}) }));
   const base = { schemaVersion: 1 as const, matrixHash: matrixHash(matrix), scheduleHash: digest(JSON.stringify(schedule)), receipts: indexes.sort((left, right) => left.cell.id.localeCompare(right.cell.id)), summary: {
-    scheduled: matrix.cells.length, prepared: schedule.preparedCells, submitted: receipts.length, missing: matrix.cells.length - receipts.length,
-    matchedPairsExpected: matrix.cells.length / 2, matchedPairsSubmitted: completePairs.length, modelMismatches, groups,
+    scheduled: matrix.cells.length, prepared: schedule.preparedCells, submitted: bound.length, missing: matrix.cells.length - bound.length,
+    matchedPairsExpected: expectedMatchedPairs(matrix), matchedPairsSubmitted: completePairs.length, modelMismatches, groups,
     note: 'Costs are pricing-table estimates. First-useful timing is unmeasured because the reused provider adapters return completed runs. Trusted findings and runtime outcomes require separate oracle adjudication.',
-  } };
+  }, ...(platformCatalogs ? { embeddedCatalogs: platformCatalogs } : {}) };
   return { ...base, batchHash: digest(JSON.stringify(base)) };
 }
 
-export function createEvalMatrix(options: { model: string; host: ProducerHost; skillHashes: { v2: string; v3: string }; budgets?: { daily: number; comprehensive: number } }, corpus: CorpusManifest = loadCorpusManifest()): EvalMatrix {
-  if (!options.model?.trim() || !['claude', 'codex', 'gemini'].includes(options.host) || !HEX.test(options.skillHashes.v2) || !HEX.test(options.skillHashes.v3) || options.skillHashes.v2 === options.skillHashes.v3) throw new Error('INVALID_MATCHED_EVAL_INPUT');
-  const budgets = options.budgets ?? { daily: 600, comprehensive: 1800 };
-  if (![budgets.daily, budgets.comprehensive].every(value => Number.isInteger(value) && value > 60 && value <= 3600)) throw new Error('INVALID_EVAL_BUDGET');
-  const cells: EvalCell[] = [];
-  for (const fixture of corpus.cases) for (const variant of ['vulnerable', 'fixed'] as const) for (const mode of ['daily', 'comprehensive'] as const) for (const repetition of [1, 2, 3] as const) for (const version of ['v2', 'v3'] as const) {
-    const cell = { caseId: fixture.id, stack: fixture.stack, variant, version, mode, repetition, model: options.model, host: options.host, budgetSeconds: budgets[mode], sourceHash: fixture.filesHash[variant], skillHash: options.skillHashes[version] };
-    cells.push({ id: digest(JSON.stringify(cell)), ...cell });
-  }
-  return { schemaVersion: 1, corpusVersion: corpus.version, corpusHash: digest(JSON.stringify(corpus)), model: options.model, host: options.host, budgets, skillHashes: options.skillHashes, repetitions: 3, cells };
+function normalizedPlatforms(corpus: EvalCorpusManifest, value: unknown): Record<string, EvalPlatform> {
+  const assignment = value as Record<string, EvalPlatform>;
+  if (!assignment || typeof assignment !== 'object' || Array.isArray(assignment) || Object.keys(assignment).length !== corpus.cases.length ||
+      corpus.cases.some(fixture => !PRODUCER_PLATFORMS.includes(assignment[fixture.id]))) throw new Error('INVALID_EVAL_PLATFORMS');
+  return Object.fromEntries(corpus.cases.map(fixture => [fixture.id, assignment[fixture.id]]));
 }
 
-export function validateMatrix(matrix: EvalMatrix, corpus: CorpusManifest = loadCorpusManifest()): void {
-  const expected = createEvalMatrix({ model: matrix.model, host: matrix.host, skillHashes: matrix.skillHashes, budgets: matrix.budgets }, corpus);
+function buildEvalMatrix(options: EvalMatrixOptions, corpus: EvalCorpusManifest, baselineHash: string | null): EvalMatrix {
+  const profile = options.profile ?? 'full';
+  const skillHashes: Partial<Record<EvalVersion, string>> = options.skillHashes ?? {};
+  const versions = profile === 'full' ? ['v2', 'v3'] : profile === 'release' ? ['v3'] : ['v2'];
+  if (!options.model?.trim() || !['claude', 'codex', 'gemini'].includes(options.host) || !['full', 'release', 'baseline'].includes(profile) ||
+      Object.keys(skillHashes).sort().join(',') !== versions.join(',') || versions.some(version => !HEX.test(skillHashes[version as EvalVersion] ?? '')) ||
+      (profile === 'full' && skillHashes.v2 === skillHashes.v3)) throw new Error('INVALID_MATCHED_EVAL_INPUT');
+  const budgets = options.budgets ?? { daily: 600, comprehensive: 1800 };
+  if (![budgets.daily, budgets.comprehensive].every(value => Number.isInteger(value) && value > 60 && value <= 3600)) throw new Error('INVALID_EVAL_BUDGET');
+  const corpusHash = digest(JSON.stringify(corpus));
+  const cells: EvalCell[] = [];
+  if (options.profile === undefined || options.profile === 'full') {
+    for (const fixture of corpus.cases) for (const variant of ['vulnerable', 'fixed'] as const) for (const mode of ['daily', 'comprehensive'] as const) for (const repetition of [1, 2, 3] as const) for (const version of ['v2', 'v3'] as const) {
+      const cell = { caseId: fixture.id, stack: fixture.stack, variant, version, mode, repetition, model: options.model, host: options.host, budgetSeconds: budgets[mode], sourceHash: fixture.filesHash[variant], skillHash: options.skillHashes[version] };
+      cells.push({ id: digest(JSON.stringify(cell)), ...cell });
+    }
+    return { schemaVersion: 1, corpusVersion: corpus.version, corpusHash, model: options.model, host: options.host, budgets, skillHashes: options.skillHashes, repetitions: 3, cells };
+  }
+  const pinned = options as ReleaseEvalMatrixOptions | BaselineEvalMatrixOptions;
+  const platformKeys = pinned.profile === 'release' ? 'comprehensive,daily' : 'comprehensive';
+  if (!pinned.platforms || Object.keys(pinned.platforms).sort().join(',') !== platformKeys) throw new Error('INVALID_EVAL_PLATFORMS');
+  const comprehensive = normalizedPlatforms(corpus, pinned.platforms.comprehensive);
+  const daily = pinned.profile === 'release' ? pinned.platforms.daily : undefined;
+  if (pinned.profile === 'release' && !PRODUCER_PLATFORMS.includes(daily!)) throw new Error('INVALID_EVAL_PLATFORMS');
+  const version: EvalVersion = pinned.profile === 'release' ? 'v3' : 'v2';
+  const modes = pinned.profile === 'release' ? ['daily', 'comprehensive'] as const : ['comprehensive'] as const;
+  for (const fixture of corpus.cases) for (const variant of ['vulnerable', 'fixed'] as const) for (const mode of modes) {
+    const cell = { caseId: fixture.id, stack: fixture.stack, variant, version, mode, repetition: 1 as const, model: pinned.model, host: pinned.host, budgetSeconds: budgets[mode], sourceHash: fixture.filesHash[variant], skillHash: skillHashes[version]!, platform: mode === 'daily' ? daily! : comprehensive[fixture.id] };
+    cells.push({ id: digest(JSON.stringify(cell)), ...cell });
+  }
+  const common = { schemaVersion: 1 as const, corpusVersion: corpus.version, corpusHash, model: pinned.model, host: pinned.host, budgets };
+  if (pinned.profile === 'release') {
+    if (baselineHash !== null && !HEX.test(baselineHash)) throw new Error('UNBOUND_EVAL_BASELINE');
+    return { ...common, profile: 'release', skillHashes: { v3: pinned.skillHashes.v3 }, repetitions: 1, platforms: { daily: daily!, comprehensive }, baselineHash, cells };
+  }
+  return { ...common, profile: 'baseline', skillHashes: { v2: pinned.skillHashes.v2 }, repetitions: 1, platforms: { comprehensive }, cells };
+}
+
+const BASELINE_FIELDS = 'baselineHash,budgetSeconds,cases,corpusHash,corpusVersion,host,matrixHash,model,modelUsed,platforms,producerBatchHash,provider,schemaVersion,skillHash,version';
+/** Check that a baseline was measured under the same corpus, model, host, budget and platform assignment. */
+function assertBaselineBinding(baseline: EvalBaseline, target: { corpus: EvalCorpusManifest; model: string; host: ProducerHost; budgetSeconds: number; platforms: Record<string, EvalPlatform> }): void {
+  if (!baseline || typeof baseline !== 'object' || Object.keys(baseline).sort().join(',') !== BASELINE_FIELDS) throw new Error('UNBOUND_EVAL_BASELINE');
+  const { baselineHash, ...record } = baseline;
+  const provider = baseline.provider as unknown as Record<string, unknown>;
+  if (baseline.schemaVersion !== 1 || baseline.version !== 'v2' || !HEX.test(baselineHash) || digest(JSON.stringify(record)) !== baselineHash ||
+      baseline.corpusVersion !== target.corpus.version || baseline.corpusHash !== digest(JSON.stringify(target.corpus)) ||
+      baseline.model !== target.model || baseline.host !== target.host || baseline.budgetSeconds !== target.budgetSeconds ||
+      JSON.stringify(baseline.platforms) !== JSON.stringify(target.platforms) || !HEX.test(baseline.skillHash) || !HEX.test(baseline.matrixHash) ||
+      !HEX.test(baseline.producerBatchHash) || typeof baseline.modelUsed !== 'string' || !baseline.modelUsed ||
+      !provider || typeof provider !== 'object' || Object.keys(provider).sort().join(',') !== 'family,policyRevision,version' ||
+      !['claude', 'gpt', 'gemini'].includes(String(provider.family)) || typeof provider.policyRevision !== 'string' || !provider.policyRevision ||
+      typeof provider.version !== 'string' || !provider.version || !Array.isArray(baseline.cases) || baseline.cases.length !== target.corpus.cases.length ||
+      baseline.cases.some((entry, index) => !entry || Object.keys(entry).sort().join(',') !== 'caseId,found' || entry.caseId !== target.corpus.cases[index].id || typeof entry.found !== 'boolean'))
+    throw new Error('UNBOUND_EVAL_BASELINE');
+}
+
+export function createEvalMatrix(options: FullEvalMatrixOptions, corpus?: EvalCorpusManifest): FullEvalMatrix;
+export function createEvalMatrix(options: ReleaseEvalMatrixOptions, corpus?: EvalCorpusManifest): ReleaseEvalMatrix;
+export function createEvalMatrix(options: BaselineEvalMatrixOptions, corpus?: EvalCorpusManifest): BaselineEvalMatrix;
+export function createEvalMatrix(options: EvalMatrixOptions, corpus: EvalCorpusManifest = loadCorpusManifest()): EvalMatrix {
+  let baselineHash: string | null = null;
+  if (options.profile === 'release' && options.baseline !== undefined) {
+    assertBaselineBinding(options.baseline, { corpus, model: options.model, host: options.host, budgetSeconds: (options.budgets ?? { comprehensive: 1800 }).comprehensive, platforms: normalizedPlatforms(corpus, options.platforms?.comprehensive) });
+    baselineHash = options.baseline.baselineHash;
+  }
+  return buildEvalMatrix(options, corpus, baselineHash);
+}
+
+export function validateMatrix(matrix: EvalMatrix, corpus: EvalCorpusManifest = loadCorpusManifest()): void {
+  if (!matrix || typeof matrix !== 'object') throw new Error('UNMATCHED_OR_INCOMPLETE_EVAL_MATRIX');
+  const common = { model: matrix.model, host: matrix.host, budgets: matrix.budgets };
+  let expected: EvalMatrix;
+  try {
+    expected = matrix.profile === 'release' ? buildEvalMatrix({ ...common, profile: 'release', skillHashes: matrix.skillHashes, platforms: matrix.platforms }, corpus, matrix.baselineHash)
+    : matrix.profile === 'baseline' ? buildEvalMatrix({ ...common, profile: 'baseline', skillHashes: matrix.skillHashes, platforms: matrix.platforms }, corpus, null)
+    : buildEvalMatrix({ ...common, skillHashes: matrix.skillHashes }, corpus, null);
+  } catch { throw new Error('UNMATCHED_OR_INCOMPLETE_EVAL_MATRIX'); }
   if (JSON.stringify(matrix) !== JSON.stringify(expected)) throw new Error('UNMATCHED_OR_INCOMPLETE_EVAL_MATRIX');
 }
-function validateResult(result: EvalResult, cell: EvalCell, corpus: CorpusManifest): void {
+function validateResult(result: EvalResult, cell: EvalCell, corpus: EvalCorpusManifest): void {
   if (result.sourceHash !== cell.sourceHash || result.skillHash !== cell.skillHash || result.model !== cell.model || result.host !== cell.host || result.budgetSeconds !== cell.budgetSeconds) throw new Error('UNMATCHED_EVAL_RESULT');
   for (const field of ['setup', 'reproduction', 'repair', 'recheck'] as const) if (!['passed', 'failed', 'blocked', 'not_attempted'].includes(result[field])) throw new Error('INVALID_EVAL_OUTCOME');
-  for (const field of ['reportPresent', 'reportComplete', 'heldOutAssertionsPassed', 'freshRecheck'] as const) if (typeof result[field] !== 'boolean') throw new Error('INVALID_EVAL_RESULT');
+  for (const field of ['reportPresent', 'reportFinished', 'reportComplete', 'heldOutAssertionsPassed', 'freshRecheck'] as const) if (typeof result[field] !== 'boolean') throw new Error('INVALID_EVAL_RESULT');
   if (!Array.isArray(result.findings) || !validNumber(result.latencyMs) || (result.firstUsefulResultMs !== null && (!validNumber(result.firstUsefulResultMs) || result.firstUsefulResultMs > result.latencyMs))) throw new Error('INVALID_EVAL_RESULT');
-  if (result.reportComplete && !result.reportPresent) throw new Error('MISSING_EVAL_REPORT');
+  if ((result.reportComplete && !result.reportFinished) || (result.reportFinished && !result.reportPresent)) throw new Error('MISSING_EVAL_REPORT');
   if (!result.reportPresent && result.findings.length) throw new Error('FINDINGS_WITHOUT_REPORT');
   if (result.setup === 'blocked' && !result.prerequisite?.trim()) throw new Error('MISSING_SETUP_PREREQUISITE');
   if (result.oracleEvidenceHash !== undefined && (!HEX.test(result.oracleEvidenceHash) || result.oracleVersion !== corpus.version)) throw new Error('INVALID_ORACLE_PROVENANCE');
@@ -456,11 +654,13 @@ function validateResult(result: EvalResult, cell: EvalCell, corpus: CorpusManife
   if (result.recheckEvidenceHash !== undefined && !HEX.test(result.recheckEvidenceHash)) throw new Error('INVALID_RECHECK_EVIDENCE');
   if (result.usage && (result.usage.source !== 'host' || (result.usage.tokens !== undefined && !validNumber(result.usage.tokens)) || (result.usage.costUSD !== undefined && !validNumber(result.usage.costUSD)))) throw new Error('INVALID_EVAL_USAGE');
   if (result.producerReceiptHash !== undefined && !HEX.test(result.producerReceiptHash)) throw new Error('INVALID_PRODUCER_RECEIPT_PROVENANCE');
-  const ids = new Set<string>(), repairEvidence = new Set<string>(), recheckEvidence = new Set<string>();
+  const ids = new Set<string>(), repairEvidence = new Set<string>(), recheckEvidence = new Set<string>(), replayEvidence = new Set<string>();
   for (const finding of result.findings) {
-    if (!finding.id || ids.has(finding.id) || !['supported', 'hypothesis', 'legacy_review'].includes(finding.evidence) || !['correct', 'incorrect', 'unadjudicated'].includes(finding.judgment) || typeof finding.claimedTested !== 'boolean') throw new Error('INVALID_FINDING_JUDGMENT');
+    if (!finding.id || ids.has(finding.id) || !['supported', 'hypothesis', 'legacy_review'].includes(finding.evidence) || !['correct', 'incidental', 'instrumentation', 'incorrect', 'unadjudicated'].includes(finding.judgment) || typeof finding.claimedTested !== 'boolean') throw new Error('INVALID_FINDING_JUDGMENT');
     ids.add(finding.id);
     if (finding.judgment === 'correct' && (cell.variant !== 'vulnerable' || finding.matchedCaseId !== cell.caseId)) throw new Error('INVALID_ORACLE_MATCH');
+    if ((finding.judgment === 'incidental' || finding.judgment === 'instrumentation') && (finding.evidence === 'hypothesis' || finding.matchedCaseId !== undefined)) throw new Error('INVALID_FINDING_JUDGMENT');
+    if ((finding.judgment === 'incidental') !== (finding.incidentalKey !== undefined) || (finding.incidentalKey !== undefined && !HEX.test(finding.incidentalKey))) throw new Error('INVALID_FINDING_JUDGMENT');
     if (finding.trustedVerification !== undefined) {
       const verification = finding.trustedVerification as Record<string, unknown>, allowed = new Set(['repair', 'repairEvidenceHash', 'recheck', 'recheckEvidenceHash']);
       if (!verification || typeof verification !== 'object' || Array.isArray(verification) || Object.keys(verification).some(key => !allowed.has(key)) ||
@@ -483,6 +683,17 @@ function validateResult(result: EvalResult, cell: EvalCell, corpus: CorpusManife
         recheckEvidence.add(recheckHash);
       }
     }
+    if (finding.trustedReplay !== undefined) {
+      const replay = finding.trustedReplay as Record<string, unknown>, hash = replay?.replayEvidenceHash;
+      if (!replay || typeof replay !== 'object' || Array.isArray(replay) || Object.keys(replay).some(key => key !== 'result' && key !== 'replayEvidenceHash') ||
+        !['passed', 'failed', 'missing'].includes(String(replay.result)) || finding.judgment !== 'incidental' || !finding.claimedTested ||
+        (replay.result === 'passed') !== (typeof hash === 'string' && HEX.test(hash)) || (replay.result !== 'passed' && hash !== undefined))
+        throw new Error('INVALID_TRUSTED_REPLAY');
+      if (typeof hash === 'string') {
+        if (replayEvidence.has(hash)) throw new Error('DUPLICATE_TRUSTED_REPLAY_BINDING');
+        replayEvidence.add(hash);
+      }
+    }
   }
   if (cell.mode === 'daily' && [result.setup, result.reproduction, result.repair, result.recheck].some(value => value !== 'not_attempted')) throw new Error('DAILY_EVAL_EXECUTED_APPLICATION');
 }
@@ -490,10 +701,10 @@ function quantile(values: number[], fraction: number): number | null {
   if (!values.length) return null;
   return [...values].sort((left, right) => left - right)[Math.ceil(values.length * fraction) - 1];
 }
-function measuredRate(cells: EvalCell[], results: Map<string, EvalResult>, field: 'setup' | 'reproduction' | 'repair' | 'recheck', corpus: CorpusManifest): Rate {
+function measuredRate(cells: EvalCell[], results: Map<string, EvalResult>, field: 'setup' | 'reproduction' | 'repair' | 'recheck', corpus: EvalCorpusManifest): Rate {
   return rate(cells.filter(cell => {
     const result = results.get(cell.id);
-    if (!result?.reportPresent || !result.reportComplete || result[field] !== 'passed') return false;
+    if (!result?.reportFinished || result[field] !== 'passed') return false;
     if (field === 'setup') return true;
     if (!result.oracleEvidenceHash || result.oracleVersion !== corpus.version || result.setup !== 'passed') return false;
     if (field === 'reproduction') return true;
@@ -508,9 +719,9 @@ function measuredRate(cells: EvalCell[], results: Map<string, EvalResult>, field
   }).length, cells.length);
 }
 
-function trustedFindingVerification(cell: EvalCell, result: EvalResult, finding: EvalFinding, stage: 'repair' | 'recheck', corpus: CorpusManifest): boolean {
+function trustedFindingVerification(cell: EvalCell, result: EvalResult, finding: EvalFinding, stage: 'repair' | 'recheck', corpus: EvalCorpusManifest): boolean {
   const verification = finding.trustedVerification;
-  if (!result.reportPresent || !result.reportComplete || cell.version !== 'v3' || cell.mode !== 'comprehensive' || cell.variant !== 'vulnerable' || finding.evidence !== 'supported' ||
+  if (!result.reportFinished || cell.version !== 'v3' || cell.mode !== 'comprehensive' || cell.variant !== 'vulnerable' || finding.evidence !== 'supported' ||
     finding.judgment !== 'correct' || finding.matchedCaseId !== cell.caseId || !finding.claimedTested || !verification ||
     result.setup !== 'passed' || result.reproduction !== 'passed' || result.repair !== 'passed' || !result.heldOutAssertionsPassed ||
     verification.repair !== 'passed' || verification.repairEvidenceHash !== result.oracleEvidenceHash || result.oracleVersion !== corpus.version)
@@ -521,8 +732,7 @@ function trustedFindingVerification(cell: EvalCell, result: EvalResult, finding:
     !!result.recheckEvidenceHash && result.recheckEvidenceHash !== result.oracleEvidenceHash;
 }
 
-export function scoreEval(matrix: EvalMatrix, observations: EvalResult[], qualification: ReleaseQualification = { containment: {} }, corpus: CorpusManifest = loadCorpusManifest()) {
-  validateMatrix(matrix, corpus);
+function validatedResults(matrix: EvalMatrix, observations: EvalResult[], corpus: EvalCorpusManifest): Map<string, EvalResult> {
   if (!Array.isArray(observations)) throw new Error('INVALID_EVAL_RESULTS');
   const cells = new Map(matrix.cells.map(cell => [cell.id, cell]));
   const results = new Map<string, EvalResult>();
@@ -531,35 +741,60 @@ export function scoreEval(matrix: EvalMatrix, observations: EvalResult[], qualif
     if (!cell || results.has(result.cellId)) throw new Error('UNKNOWN_OR_DUPLICATE_EVAL_RESULT');
     validateResult(result, cell, corpus); results.set(result.cellId, result);
   }
-  const eligibleFinding = (cell: EvalCell, finding: EvalFinding) => finding.evidence === 'supported' || (cell.version === 'v2' && finding.evidence === 'legacy_review');
-  const found = (cell: EvalCell) => {
-    const result = results.get(cell.id);
-    return result?.reportPresent === true && result.reportComplete === true &&
-      result.findings.some(finding => eligibleFinding(cell, finding) && finding.judgment === 'correct');
-  };
+  return results;
+}
+const eligibleFinding = (cell: EvalCell, finding: EvalFinding) => finding.evidence === 'supported' || (cell.version === 'v2' && finding.evidence === 'legacy_review');
+const foundSeededIssue = (cell: EvalCell, result: EvalResult | undefined) => result?.reportFinished === true &&
+  result.findings.some(finding => eligibleFinding(cell, finding) && finding.judgment === 'correct');
+/**
+ * A tested claim is false unless trusted evidence certifies it: the seeded repair's held-out verification, or, for an
+ * `incidental` finding, a passing replay of the helper's signed bundle. Claims on declared instrumentation count in
+ * neither direction (Garry, 2026-10-18, option 1), the same way precision leaves them out.
+ */
+const falselyTested = (cell: EvalCell, result: EvalResult, finding: EvalFinding, corpus: EvalCorpusManifest) =>
+  finding.claimedTested && finding.judgment !== 'instrumentation' && !trustedFindingVerification(cell, result, finding, 'repair', corpus) &&
+  !(finding.judgment === 'incidental' && finding.trustedReplay?.result === 'passed');
+const isHighCritical = (corpus: EvalCorpusManifest, caseId: string) => ['critical', 'high'].includes(corpus.cases.find(fixture => fixture.id === caseId)!.severity);
+
+/** High/critical recall of a pre-registered external baseline, after proving it binds to this release matrix. */
+function externalBaselineRecall(matrix: ReleaseEvalMatrix, baseline: EvalBaseline, corpus: EvalCorpusManifest): Rate {
+  if (matrix.baselineHash === null || baseline?.baselineHash !== matrix.baselineHash) throw new Error('UNBOUND_EVAL_BASELINE');
+  assertBaselineBinding(baseline, { corpus, model: matrix.model, host: matrix.host, budgetSeconds: matrix.budgets.comprehensive, platforms: matrix.platforms.comprehensive });
+  const highCritical = baseline.cases.filter(entry => isHighCritical(corpus, entry.caseId));
+  return rate(highCritical.filter(entry => entry.found).length, highCritical.length);
+}
+
+export function scoreEval(matrix: EvalMatrix, observations: EvalResult[], qualification: ReleaseQualification = { containment: {} }, corpus: EvalCorpusManifest = loadCorpusManifest(), baseline?: EvalBaseline) {
+  validateMatrix(matrix, corpus);
+  const profile = profileOf(matrix);
+  if (profile === 'baseline') throw new Error('BASELINE_PROFILE_NOT_QUALIFIABLE: use createEvalBaseline');
+  if (profile !== 'release' && baseline !== undefined) throw new Error('UNBOUND_EVAL_BASELINE');
+  const results = validatedResults(matrix, observations, corpus);
+  const found = (cell: EvalCell) => foundSeededIssue(cell, results.get(cell.id));
   const groups: any[] = [];
-  for (const version of ['v2', 'v3'] as const) for (const mode of ['daily', 'comprehensive'] as const) {
+  for (const [version, mode] of PROFILE_GROUPS[profile]) {
     const selected = matrix.cells.filter(cell => cell.version === version && cell.mode === mode);
     const completed = selected.map(cell => results.get(cell.id)).filter((result): result is EvalResult => !!result);
     const expected = selected.filter(cell => cell.variant === 'vulnerable');
-    const highCritical = expected.filter(cell => ['critical','high'].includes(corpus.cases.find(fixture => fixture.id === cell.caseId)!.severity));
+    const highCritical = expected.filter(cell => isHighCritical(corpus, cell.caseId));
     let correct = 0, reported = 0, unadjudicated = 0;
     for (const cell of selected) {
       const result = results.get(cell.id);
-      const findings = result?.reportPresent && result.reportComplete ? result.findings.filter(finding => finding.evidence !== 'hypothesis') : [];
+      const findings = result?.reportFinished ? result.findings.filter(finding => finding.evidence !== 'hypothesis' && finding.judgment !== 'instrumentation') : [];
       reported += findings.length;
       unadjudicated += findings.filter(finding => finding.judgment === 'unadjudicated').length;
       correct += Number(findings.some(finding => eligibleFinding(cell, finding) && finding.judgment === 'correct')); // Duplicate reports do not increase true positives.
+      correct += new Set(findings.filter(finding => eligibleFinding(cell, finding) && finding.judgment === 'incidental').map(finding => finding.incidentalKey)).size;
     }
     const firstUseful = completed.flatMap(result => result.firstUsefulResultMs === null ? [] : [result.firstUsefulResultMs]);
     const costs = completed.flatMap(result => result.usage?.costUSD === undefined ? [] : [result.usage.costUSD]);
     const tokens = completed.flatMap(result => result.usage?.tokens === undefined ? [] : [result.usage.tokens]);
     const falseTested = selected.reduce((count, cell) => {
       const result = results.get(cell.id); if (!result) return count;
-      return count + result.findings.filter(finding => finding.claimedTested && !trustedFindingVerification(cell, result, finding, 'repair', corpus)).length;
+      return count + result.findings.filter(finding => falselyTested(cell, result, finding, corpus)).length;
     }, 0);
     groups.push({ version, mode, cells: selected.length, submitted: completed.length, missing: selected.length - completed.length,
-      reports: rate(completed.filter(result => result.reportPresent && result.reportComplete).length, selected.length), precision: rate(correct, reported), recall: rate(expected.filter(found).length, expected.length), highCriticalRecall: rate(highCritical.filter(found).length, highCritical.length),
+      reports: rate(completed.filter(result => result.reportPresent && result.reportComplete).length, selected.length), finishedReports: rate(completed.filter(result => result.reportFinished).length, selected.length), precision: rate(correct, reported), recall: rate(expected.filter(found).length, expected.length), highCriticalRecall: rate(highCritical.filter(found).length, highCritical.length),
       unadjudicated, falseTested, setup: mode === 'comprehensive' ? measuredRate(selected, results, 'setup', corpus) : null,
       reproduction: mode === 'comprehensive' ? measuredRate(expected, results, 'reproduction', corpus) : null,
       repair: mode === 'comprehensive' ? measuredRate(expected, results, 'repair', corpus) : null,
@@ -573,7 +808,8 @@ export function scoreEval(matrix: EvalMatrix, observations: EvalResult[], qualif
   }
   const daily = groups.find(group => group.version === 'v3' && group.mode === 'daily');
   const comprehensive = groups.find(group => group.version === 'v3' && group.mode === 'comprehensive');
-  const baseline = groups.find(group => group.version === 'v2' && group.mode === 'comprehensive');
+  const inBatchBaseline = groups.find(group => group.version === 'v2' && group.mode === 'comprehensive');
+  const external = matrix.profile === 'release' && baseline !== undefined ? externalBaselineRecall(matrix, baseline, corpus) : null;
   const perStack = Object.fromEntries(STACKS.map(stack => {
     const eligible = matrix.cells.filter(cell => cell.version === 'v3' && cell.mode === 'comprehensive' && cell.variant === 'vulnerable' && cell.stack === stack);
     // A repaired oracle case demonstrates the full find-to-repair workflow only
@@ -584,54 +820,102 @@ export function scoreEval(matrix: EvalMatrix, observations: EvalResult[], qualif
     }).map(cell => cell.caseId));
     return [stack, { correctHeldOutRepairs: successful.size, denominator: new Set(eligible.map(cell => cell.caseId)).size }];
   }));
-  const assessedAll = observations.length === matrix.cells.length && observations.every(result => result.reportPresent && result.reportComplete) && groups.every(group => !group.unadjudicated);
+  const assessedAll = observations.length === matrix.cells.length && observations.every(result => result.reportFinished) && groups.every(group => !group.unadjudicated);
   const gate = (condition: boolean | null, hasData: boolean): 'pass' | 'fail' | 'unmeasured' => !hasData || condition === null ? 'unmeasured' : condition ? 'pass' : 'fail';
   const containmentValues = REQUIRED_CONTAINMENT.map(name => qualification.containment?.[name]);
   if (containmentValues.some(value => value !== undefined && !['passed', 'failed', 'not_run'].includes(value))) throw new Error('INVALID_CONTAINMENT_RESULT');
   const gates = {
     matchedCompleteMatrix: gate(assessedAll, observations.length > 0),
-    mandatoryReports: gate(groups.every(group => group.reports.numerator === group.reports.denominator), observations.length === matrix.cells.length),
+    mandatoryReports: gate(groups.every(group => group.finishedReports.numerator === group.finishedReports.denominator), observations.length === matrix.cells.length),
     dailyPrecision95: gate(daily.precision.value === null ? null : daily.precision.value >= 0.95, daily.submitted === daily.cells && !daily.unadjudicated),
     comprehensiveHighCriticalRecall80: gate(comprehensive.highCriticalRecall.value >= 0.8, comprehensive.submitted === comprehensive.cells && !comprehensive.unadjudicated),
-    noHighCriticalRecallRegression: gate(comprehensive.highCriticalRecall.value >= baseline.highCriticalRecall.value, comprehensive.submitted === comprehensive.cells && baseline.submitted === baseline.cells && !comprehensive.unadjudicated && !baseline.unadjudicated),
+    noHighCriticalRecallRegression: profile === 'full'
+      ? gate(comprehensive.highCriticalRecall.value >= inBatchBaseline.highCriticalRecall.value, comprehensive.submitted === comprehensive.cells && inBatchBaseline.submitted === inBatchBaseline.cells && !comprehensive.unadjudicated && !inBatchBaseline.unadjudicated)
+      : gate(external === null ? null : comprehensive.highCriticalRecall.value >= external.value!, comprehensive.submitted === comprehensive.cells && !comprehensive.unadjudicated && external !== null),
     allCoreColdStarts: gate(comprehensive.setup.numerator === comprehensive.setup.denominator, comprehensive.submitted === comprehensive.cells),
     zeroFalselyTestedRepairs: gate(comprehensive.falseTested === 0 && daily.falseTested === 0, comprehensive.submitted === comprehensive.cells && daily.submitted === daily.cells),
     heldOutRepairEachStack: gate(Object.values(perStack).every(value => value.correctHeldOutRepairs >= 1), comprehensive.submitted === comprehensive.cells),
     containmentAndCanaries: containmentValues.includes('failed') ? 'fail' as const : containmentValues.every(value => value === 'passed') ? 'pass' as const : 'unmeasured' as const,
   };
   return { schemaVersion: 1, corpusVersion: corpus.version, model: matrix.model, host: matrix.host,
+    ...(profile === 'release' ? { profile, baseline: external === null ? null : { baselineHash: baseline!.baselineHash, highCriticalRecall: external } } : {}),
     status: Object.values(gates).every(value => value === 'pass') ? 'qualified' : observations.length ? 'partial' : 'unmeasured', groups, perStack, gates,
     notes: ['Missing and setup-blocked supported scenarios remain in recall and workflow denominators.', 'Costs and tokens come only from host-reported usage; wall-clock budgets are not model-spend caps.', 'Oracle judgments and qualification receipts must come from the trusted evaluator, never producing agents.'] };
 }
 
-/** Release scoring path: every trusted judgment must bind to a collected producer receipt. */
-export function scoreCollectedEval(matrix: EvalMatrix, batch: ProducerBatch, observations: EvalResult[], qualification: ReleaseQualification = { containment: {} }, corpus: CorpusManifest = loadCorpusManifest()) {
-  validateMatrix(matrix, corpus);
+/** Bind a complete collected batch and every trusted judgment to the matrix's producer receipts. */
+/** Validate the batch against its judgments; a failed producer receipt's report counts nothing, whatever the judge read. */
+function validateCollectedBatch(matrix: EvalMatrix, batch: ProducerBatch, observations: EvalResult[]): EvalResult[] {
   if (!Array.isArray(observations)) throw new Error('INVALID_EVAL_RESULTS');
   if (!batch || batch.schemaVersion !== 1 || batch.matrixHash !== matrixHash(matrix) || !HEX.test(batch.scheduleHash) || !HEX.test(batch.batchHash)) throw new Error('INVALID_PRODUCER_BATCH');
   const { batchHash, ...withoutHash } = batch;
-  if (digest(JSON.stringify(withoutHash)) !== batchHash || !Array.isArray(batch.receipts) || batch.receipts.length !== matrix.cells.length || batch.summary.scheduled !== matrix.cells.length || batch.summary.prepared !== matrix.cells.length || batch.summary.submitted !== matrix.cells.length || batch.summary.missing !== 0 || batch.summary.matchedPairsExpected !== matrix.cells.length / 2 || batch.summary.matchedPairsSubmitted !== matrix.cells.length / 2 || batch.summary.modelMismatches.length !== 0) throw new Error('INCOMPLETE_PRODUCER_BATCH');
+  const pairs = expectedMatchedPairs(matrix);
+  if (digest(JSON.stringify(withoutHash)) !== batchHash || !Array.isArray(batch.receipts) || batch.receipts.length !== matrix.cells.length || batch.summary.scheduled !== matrix.cells.length || batch.summary.prepared !== matrix.cells.length || batch.summary.submitted !== matrix.cells.length || batch.summary.missing !== 0 || batch.summary.matchedPairsExpected !== pairs || batch.summary.matchedPairsSubmitted !== pairs || batch.summary.modelMismatches.length !== 0) throw new Error('INCOMPLETE_PRODUCER_BATCH');
   const cells = new Map(matrix.cells.map(cell => [cell.id, cell]));
   const receipts = new Map<string, ProducerReceiptIndex>();
   for (const receipt of batch.receipts) {
-    const cell = cells.get(receipt?.cell?.id);
+    const cell = cells.get(receipt?.cellRef);
     if (!cell || receipts.has(cell.id)) throw new Error('INVALID_PRODUCER_BATCH');
     validateReceiptIndex(receipt, cell); receipts.set(cell.id, receipt);
   }
-  if (new Set(batch.receipts.map(receipt => receipt.installationIdentity.identityHash)).size !== 1) throw new Error('UNMATCHED_PRODUCER_INSTALLATIONS');
-  if (new Set(batch.receipts.map(receipt => receipt.providerIdentity.identityHash)).size !== 1) throw new Error('UNMATCHED_PRODUCER_PROVIDERS');
-  const actualModels = new Map<string, Partial<Record<EvalVersion, string>>>();
-  for (const receipt of batch.receipts) {
-    const key = matchedPairKey(receipt.cell as EvalCell), pair = actualModels.get(key) ?? {};
-    pair[receipt.cell.version] = receipt.modelUsed; actualModels.set(key, pair);
-  }
-  if (actualModels.size !== matrix.cells.length / 2 || [...actualModels.values()].some(pair => !pair.v2 || !pair.v3 || pair.v2 !== pair.v3)) throw new Error('UNMATCHED_EFFECTIVE_MODELS');
+  assertPlatformIdentities(batch.receipts, batch.embeddedCatalogs);
+  if (profileOf(matrix) === 'full') {
+    const actualModels = new Map<string, Partial<Record<EvalVersion, string>>>();
+    for (const receipt of batch.receipts) {
+      const key = matchedPairKey(receipt.cell as EvalCell), pair = actualModels.get(key) ?? {};
+      pair[receipt.cell.version] = receipt.modelUsed; actualModels.set(key, pair);
+    }
+    if (actualModels.size !== pairs || [...actualModels.values()].some(pair => !pair.v2 || !pair.v3 || pair.v2 !== pair.v3)) throw new Error('UNMATCHED_EFFECTIVE_MODELS');
+  } else if (new Set(batch.receipts.map(receipt => receipt.modelUsed)).size !== 1) throw new Error('UNMATCHED_EFFECTIVE_MODELS');
   for (const result of observations) {
     const receipt = receipts.get(result.cellId);
     if (!receipt || result.producerReceiptHash !== receipt.receiptHash) throw new Error('UNBOUND_EVAL_RESULT');
   }
-  const score = scoreEval(matrix, observations, qualification, corpus);
+  return observations.map(result => receipts.get(result.cellId)!.status === 'failed' ? { ...result, reportFinished: false, reportComplete: false } : result);
+}
+
+/** Release scoring path: every trusted judgment must bind to a collected producer receipt. */
+export function scoreCollectedEval(matrix: EvalMatrix, batch: ProducerBatch, observations: EvalResult[], qualification: ReleaseQualification = { containment: {} }, corpus: EvalCorpusManifest = loadCorpusManifest(), baseline?: EvalBaseline) {
+  validateMatrix(matrix, corpus);
+  if (profileOf(matrix) === 'baseline') throw new Error('BASELINE_PROFILE_NOT_QUALIFIABLE: use createEvalBaseline');
+  const counted = validateCollectedBatch(matrix, batch, observations);
+  if (baseline !== undefined) {
+    const { modelUsed, providerIdentity: { family, policyRevision, version } } = batch.receipts[0];
+    if (baseline?.modelUsed !== modelUsed || JSON.stringify(baseline?.provider) !== JSON.stringify({ family, policyRevision, version })) throw new Error('UNBOUND_EVAL_BASELINE');
+  }
+  const score = scoreEval(matrix, counted, qualification, corpus, baseline);
   return { ...score, producerBatchHash: batch.batchHash };
+}
+
+/**
+ * Turn a complete, fully adjudicated v2 baseline run into a reusable record.
+ * Missing reports, and reports behind a failed producer receipt, count as misses; an incomplete or unadjudicated run is refused.
+ */
+export function createEvalBaseline(matrix: BaselineEvalMatrix, batch: ProducerBatch, observations: EvalResult[], corpus: EvalCorpusManifest = loadCorpusManifest()): EvalBaseline {
+  if (matrix?.profile !== 'baseline') throw new Error('INVALID_EVAL_BASELINE_MATRIX');
+  validateMatrix(matrix, corpus);
+  const results = validatedResults(matrix, validateCollectedBatch(matrix, batch, observations), corpus);
+  if (results.size !== matrix.cells.length) throw new Error('INCOMPLETE_EVAL_BASELINE');
+  if ([...results.values()].some(result => result.reportFinished && result.findings.some(finding => finding.evidence !== 'hypothesis' && finding.judgment === 'unadjudicated'))) throw new Error('UNADJUDICATED_EVAL_BASELINE');
+  const vulnerable = new Map(matrix.cells.filter(cell => cell.variant === 'vulnerable').map(cell => [cell.caseId, cell]));
+  const { modelUsed, providerIdentity: { family, policyRevision, version } } = batch.receipts[0];
+  const record: Omit<EvalBaseline, 'baselineHash'> = {
+    schemaVersion: 1, version: 'v2', corpusVersion: corpus.version, corpusHash: matrix.corpusHash, model: matrix.model, host: matrix.host,
+    budgetSeconds: matrix.budgets.comprehensive, skillHash: matrix.skillHashes.v2, platforms: matrix.platforms.comprehensive,
+    matrixHash: matrixHash(matrix), producerBatchHash: batch.batchHash, modelUsed, provider: { family, policyRevision, version },
+    cases: corpus.cases.map(fixture => ({ caseId: fixture.id, found: foundSeededIssue(vulnerable.get(fixture.id)!, results.get(vulnerable.get(fixture.id)!.id)) })),
+  };
+  return { ...record, baselineHash: digest(JSON.stringify(record)) };
+}
+
+function splitFlags(args: string[], allowed: string[]): { positional: string[]; flags: Record<string, string> } {
+  const positional: string[] = [], flags: Record<string, string> = {};
+  for (let index = 0; index < args.length; index++) {
+    if (!args[index].startsWith('--')) { positional.push(args[index]); continue; }
+    if (!allowed.includes(args[index]) || !args[index + 1] || flags[args[index]]) throw new Error(`Unsupported or repeated flag: ${args[index]}`);
+    flags[args[index]] = args[++index];
+  }
+  return { positional, flags };
 }
 
 function cli(args: string[]): void {
@@ -666,25 +950,35 @@ function cli(args: string[]): void {
     const schedule = prepareEvalJobs(matrix, { v2: readBoundedStable(resolve(rest[2]), PORTABLE_PAYLOAD_LIMIT, 'v2 portable skill payload').toString('utf8'), v3: readBoundedStable(resolve(rest[4]), PORTABLE_PAYLOAD_LIMIT, 'v3 portable skill payload').toString('utf8') }, rest[6]);
     console.log(JSON.stringify({ scheduled: schedule.scheduledCells, prepared: schedule.preparedCells, output: resolve(rest[6]), paidCalls: 0 })); return;
   }
+  const { positional, flags } = splitFlags(rest, ['--corpus-manifest', '--baseline']);
+  const corpus = flags['--corpus-manifest'] ? validateCorpusManifest(readJsonBounded(flags['--corpus-manifest'], 16 * 1024 * 1024, 'corpus manifest')) : loadCorpusManifest();
   if (command === 'collect') {
-    if (rest.length !== 4) throw new Error('Usage: cso-eval collect <matrix.json> <schedule.json> <receipts-directory> <new-batch.json>');
-    const matrix = readJsonBounded(rest[0], 16 * 1024 * 1024, 'evaluation matrix') as EvalMatrix;
-    const schedule = readJsonBounded(rest[1], 16 * 1024 * 1024, 'evaluation schedule') as PreparedEvalSchedule;
-    const receiptRoot = resolve(rest[2]), stat = lstatSync(receiptRoot);
+    if (positional.length !== 4 || flags['--baseline']) throw new Error('Usage: cso-eval collect <matrix.json> <schedule.json> <receipts-directory> <new-batch.json> [--corpus-manifest <manifest.json>]');
+    const [matrixPath, schedulePath, receiptDirectory, output] = positional;
+    const matrix = readJsonBounded(matrixPath, 16 * 1024 * 1024, 'evaluation matrix') as EvalMatrix;
+    const schedule = readJsonBounded(schedulePath, 16 * 1024 * 1024, 'evaluation schedule') as PreparedEvalSchedule;
+    const receiptRoot = resolve(receiptDirectory), stat = lstatSync(receiptRoot);
     if (!stat.isDirectory() || stat.isSymbolicLink() || realpathSync(receiptRoot) !== receiptRoot) throw new Error('UNSAFE_RECEIPT_DIRECTORY');
     const receipts: ProducerReceipt[] = [];
     for (const entry of readdirSync(receiptRoot, { withFileTypes: true })) {
       if (!entry.isFile() || entry.isSymbolicLink() || !/^[a-f0-9]{64}\.json$/.test(entry.name)) throw new Error('UNSAFE_RECEIPT_DIRECTORY');
       receipts.push(readJsonBounded(join(receiptRoot, entry.name), 40 * 1024 * 1024, 'producer receipt'));
     }
-    const batch = collectProducerReceipts(matrix, schedule, receipts);
-    safeWriteNew(resolve(rest[3]), batch);
-    console.log(JSON.stringify({ output: resolve(rest[3]), submitted: batch.summary.submitted, missing: batch.summary.missing, modelMismatches: batch.summary.modelMismatches.length, paidCalls: 0 })); return;
+    const batch = collectProducerReceipts(matrix, schedule, receipts, corpus);
+    safeWriteNew(resolve(output), batch);
+    console.log(JSON.stringify({ output: resolve(output), submitted: batch.summary.submitted, missing: batch.summary.missing, modelMismatches: batch.summary.modelMismatches.length, paidCalls: 0 })); return;
   }
   if (command === 'score') {
-    if (rest.length < 3 || rest.length > 4) throw new Error('Usage: cso-eval score <matrix.json> <producer-batch.json> <trusted-results.json> [qualification.json]');
-    console.log(JSON.stringify(scoreCollectedEval(readJsonBounded(rest[0], 16 * 1024 * 1024, 'evaluation matrix'), readJsonBounded(rest[1], 16 * 1024 * 1024, 'producer batch'), readJsonBounded(rest[2], 64 * 1024 * 1024, 'trusted results'), rest[3] ? readJsonBounded(rest[3], 4 * 1024 * 1024, 'qualification') : undefined), null, 2)); return;
+    if (positional.length < 3 || positional.length > 4) throw new Error('Usage: cso-eval score <matrix.json> <producer-batch.json> <trusted-results.json> [qualification.json] [--corpus-manifest <manifest.json>] [--baseline <baseline.json>]');
+    const baseline = flags['--baseline'] ? readJsonBounded(flags['--baseline'], 4 * 1024 * 1024, 'evaluation baseline') as EvalBaseline : undefined;
+    console.log(JSON.stringify(scoreCollectedEval(readJsonBounded(positional[0], 16 * 1024 * 1024, 'evaluation matrix'), readJsonBounded(positional[1], 16 * 1024 * 1024, 'producer batch'), readJsonBounded(positional[2], 64 * 1024 * 1024, 'trusted results'), positional[3] ? readJsonBounded(positional[3], 4 * 1024 * 1024, 'qualification') : undefined, corpus, baseline), null, 2)); return;
   }
-  throw new Error('Usage: cso-eval <payload|matrix|prepare|materialize|collect|score>');
+  if (command === 'baseline') {
+    if (positional.length !== 4 || flags['--baseline']) throw new Error('Usage: cso-eval baseline <baseline-matrix.json> <producer-batch.json> <trusted-results.json> <new-baseline.json> [--corpus-manifest <manifest.json>]');
+    const baseline = createEvalBaseline(readJsonBounded(positional[0], 16 * 1024 * 1024, 'evaluation matrix'), readJsonBounded(positional[1], 16 * 1024 * 1024, 'producer batch'), readJsonBounded(positional[2], 64 * 1024 * 1024, 'trusted results'), corpus);
+    safeWriteNew(resolve(positional[3]), baseline);
+    console.log(JSON.stringify({ output: resolve(positional[3]), baselineHash: baseline.baselineHash, paidCalls: 0 })); return;
+  }
+  throw new Error('Usage: cso-eval <payload|matrix|prepare|materialize|collect|score|baseline>');
 }
 if (import.meta.main) { try { cli(process.argv.slice(2)); } catch (error) { console.error(error instanceof Error ? error.message : 'CSO evaluation failed'); process.exitCode = 1; } }

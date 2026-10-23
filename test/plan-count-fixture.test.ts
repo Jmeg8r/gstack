@@ -5,9 +5,8 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { createPlanCountFixture } from './helpers/plan-count-fixture';
+import { createNativeReviewState, createPlanCountFixture } from './helpers/plan-count-fixture';
 import { getHermeticDirs } from './helpers/hermetic-env';
-
 const ROOT = path.resolve(import.meta.dir, '..');
 const PROMPT = '# Seeded settings plan\n\nReview each issue separately.\n' +
   'Literal text: "quotes" \'single quotes\' `touch never` $(touch never)\n';
@@ -65,6 +64,47 @@ describe('plan-count fixtures', () => {
     }
     expect(fs.existsSync(second.env.GSTACK_HOME)).toBe(false);
   });
+
+  test('a preconfigured review actor declines only unrelated first-use preferences in owned state', () => {
+    const shared = getHermeticDirs().gstackHome;
+    const before = fs.readFileSync(path.join(shared, 'config.yaml'), 'utf8');
+    const ordinary = createPlanCountFixture(PROMPT, { nativeReviewOnly: true });
+    const configured = createPlanCountFixture(PROMPT, { nativeReviewOnly: true, preconfiguredReviewActor: true });
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'configured-review-home-'));
+    try {
+      const env = { PATH: process.env.PATH!, HOME: home, ...configured.env };
+      const config = (key: string) => spawnSync('bash', [path.join(ROOT, 'bin/gstack-config'), 'get', key],
+        { cwd: configured.cwd, env, encoding: 'utf8', timeout: 10_000 });
+      for (const [key, value] of [['routing_declined', 'true'], ['cross_project_learnings', 'false'],
+        ['codex_reviews', 'disabled'], ['question_tuning', 'false']]) {
+        const result = config(key);
+        expect(result.status, result.stderr).toBe(0);
+        expect(result.stdout).toBe(value);
+      }
+      const start = spawnSync('bash', [path.join(ROOT, 'bin/gstack-skill-start'), '--skill', 'plan-ceo-review'],
+        { cwd: configured.cwd, env, encoding: 'utf8', timeout: 30_000 });
+      expect(start.status, start.stderr).toBe(0);
+      expect(start.stdout).toContain('SESSION_KIND: interactive');
+      expect(start.stdout).toContain('HAS_ROUTING: no');
+      expect(start.stdout).toContain('ROUTING_DECLINED: true');
+      expect(start.stdout).not.toContain('GSTACK_INSTRUCTION_BEGIN: routing-injection ');
+      expect(start.stdout).toContain('QUESTION_TUNING: false');
+      expect(fs.readFileSync(path.join(configured.cwd, 'PLAN.md'), 'utf8')).toBe(PROMPT);
+      expect(fs.readFileSync(path.join(configured.cwd, 'CLAUDE.md'), 'utf8'))
+        .toBe(fs.readFileSync(path.join(ordinary.cwd, 'CLAUDE.md'), 'utf8'));
+      expect(fs.existsSync(path.join(configured.cwd, 'TODOS.md'))).toBe(false);
+      expect(fs.readFileSync(path.join(ordinary.env.GSTACK_HOME, 'config.yaml'), 'utf8'))
+        .toBe(before.replace(/^codex_reviews:.*(?:\r?\n|$)/gm, '') + '\ncodex_reviews: disabled\n');
+      expect(fs.readFileSync(path.join(shared, 'config.yaml'), 'utf8')).toBe(before);
+      expect(() => createPlanCountFixture(PROMPT, { preconfiguredReviewActor: true }))
+        .toThrow('Preconfigured review actor requires owned native review state');
+    } finally {
+      ordinary.cleanup();
+      configured.cleanup();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+    expect(fs.existsSync(configured.env.GSTACK_HOME)).toBe(false);
+  }, 40_000);
 
   test('concurrent fixtures have independent content and cleanup owns only its directory', () => {
     const first = createPlanCountFixture('first plan');
@@ -166,13 +206,16 @@ try {
       const cases = [
         { name: 'design', skillName: 'plan-design-review', prompt: PROMPT, mode: 'complete', files: { 'DESIGN.md': '# Approved design\nKeep the existing layout.\n' } },
         { name: 'design-direct', skillName: 'plan-design-review', prompt: PROMPT, mode: 'direct-finding' },
+        { name: 'design-named-target', skillName: 'plan-design-review', prompt: fs.readFileSync(path.join(ROOT, 'test/fixtures/plans/ui-heavy-feature.md'), 'utf8'), mode: 'direct-finding', namedTarget: true },
+        { name: 'design-tool-diagnostic', skillName: 'plan-design-review', prompt: PROMPT, mode: 'direct-finding', toolDiagnostic: true },
+        { name: 'design-gate-positive', skillName: 'plan-design-review', prompt: PROMPT, mode: 'direct-finding', gateFilter: true },
         { name: 'design-batched', skillName: 'plan-design-review', prompt: PROMPT, mode: 'batched-finding' },
         { name: 'failed-native', skillName: 'plan-design-review', prompt: PROMPT, mode: 'failed-call' },
         { name: 'native-permission-policy', skillName: 'plan-eng-review', prompt: PROMPT, mode: 'native-permission-policy', report: path.join(dir, 'native-policy-report.md') },
         { name: 'permission-lifecycle', skillName: 'plan-design-review', prompt: PROMPT, mode: 'permission-lifecycle' },
         { name: 'permission', skillName: 'plan-design-review', prompt: PROMPT, mode: 'permission' },
         { name: 'missing-transcript', skillName: 'plan-design-review', prompt: PROMPT, mode: 'missing-transcript' },
-        { name: 'ceo', skillName: 'plan-ceo-review', prompt: '# Independent CEO plan\nUnique product context.', mode: 'complete' },
+        { name: 'ceo', skillName: 'plan-ceo-review', prompt: '# Independent CEO plan\nUnique product context.', mode: 'complete', preconfiguredReviewActor: true },
         { name: 'exited', skillName: 'plan-eng-review', prompt: '# Early-exit plan\nStill clean up.', mode: 'exit' },
         { name: 'skip-first', skillName: 'plan-devex-review', prompt: '# Native DX plan', mode: 'prerequisite', skipIndex: 1 },
         { name: 'skip-second', skillName: 'plan-devex-review', prompt: '# Native DX plan', mode: 'prerequisite', skipIndex: 2 },
@@ -235,6 +278,7 @@ record({
   type: 'startup', pid: process.pid, cwd: process.cwd(), argv: process.argv.slice(2),
   stateRoot: process.env.GSTACK_STATE_ROOT, gstackHome: process.env.GSTACK_HOME,
   codexReviews: config('codex_reviews'), explainLevel: config('explain_level'),
+  routingDeclined: config('routing_declined'), crossProjectLearnings: config('cross_project_learnings'),
   onboarding: fs.readdirSync(process.env.GSTACK_HOME).filter(name => name.startsWith('.')),
   gitRoot: spawnSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8', timeout: 10_000 }).stdout.trim(),
   plan: fs.existsSync(planPath) ? fs.readFileSync(planPath, 'utf8') : null,
@@ -414,6 +458,13 @@ process.stdin.on('data', (data) => {
   }
   firstInput = false;
   if (process.env.FIXTURE_MODE === 'exit') process.exit(7);
+  if (process.env.FIXTURE_TOOL_DIAGNOSTIC === 'true') render('Unknown command: --help\n');
+  if (process.env.FIXTURE_GATE_FILTER === 'true') {
+    ask([questionMetadata('Focus', 'D2 — Review all 7 design dimensions, or focus on specific areas?', ['All 7 dimensions', 'Choose areas'])]);
+    answer();
+    ask([questionMetadata('Outside voices', 'D3 — Want outside design voices before the detailed review?\nA fresh reviewer checks completeness. <gstack-qid:outside-voices-design>', ['Yes, run outside voices (recommended)', 'No, proceed without'])]);
+    answer();
+  }
   if (process.env.FIXTURE_MODE === 'damaged-menu') {
     render('☐Stripe event types\nWhich event should the handler accept?\n❯1.Specify one canonical event\n2.Accept all events\n' +
       '·'.repeat(4200) + '\nMinimum required test cases:\n1.Happy path\n2.Email failure\n3.DB timeout\n4.Unknown event\n5.Unknown user\n❯1\n');
@@ -443,7 +494,8 @@ process.stdin.on('data', (data) => {
       ask([questionMetadata('Missing answer', 'Should the save retry be idempotent?', ['Yes', 'No'])]);
       native('user', [{ type: 'tool_result', tool_use_id: 'question-' + callId, is_error: true, content: 'Question rejected' }]);
     }
-    const questions = [questionMetadata('Button style', 'D1 — How should the four header buttons differ? <gstack-qid:plan-design-review-button-hierarchy>', ['Filled primary', 'Ghost buttons'])];
+    const detail = process.env.FIXTURE_GATE_FILTER === 'true' ? ' Specify the primary button treatment.'.repeat(30) : '';
+    const questions = [questionMetadata('Button style', 'D1 — How should the four header buttons differ?' + detail + ' <gstack-qid:plan-design-review-button-hierarchy>', ['Filled primary', 'Ghost buttons'])];
     if (process.env.FIXTURE_MODE === 'batched-finding') questions.push(questionMetadata('Loading', 'D2 — Define the loading state <gstack-qid:plan-design-review-loading>', ['Add spinner', 'Keep blank']));
     ask(questions);
     render('\r☐Buttonstyle\r│D1—Howshouldthe4headerbuttonsbedifferentiated?<gstack-qid:plan-design-review-butn-hierarchy>\r❯1.Filledprimary\r2.Ghostbuttons\r');
@@ -480,17 +532,27 @@ process.on('SIGINT', () => {
   process.exit(0);
 });
 process.stdin.resume();
+process.stdout.write('\x1b7PTY_READY:' + process.env.FIXTURE_RECORD + '\x1b8\x1b[J');
 `);
       fs.chmodSync(fakePath, 0o755);
       const runnerUrl = pathToFileURL(path.join(ROOT, 'test/helpers/claude-pty-runner.ts')).href;
       const hermeticUrl = pathToFileURL(path.join(ROOT, 'test/helpers/hermetic-env.ts')).href;
-      const devexUrl = pathToFileURL(path.join(ROOT, 'test/helpers/devex-count-fixture.ts')).href;
       fs.writeFileSync(workerPath, `
-import { runPlanSkillCounting, designFirstReviewAUQ } from ${JSON.stringify(runnerUrl)};
+import { runPlanSkillCounting } from ${JSON.stringify(runnerUrl)};
 import { getHermeticDirs } from ${JSON.stringify(hermeticUrl)};
-import { devexReviewModePick } from ${JSON.stringify(devexUrl)};
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+// Caller-owned policies for the fake's fixed questions; the runner is the subject.
+const questionText = fp => fp.nativeCall ? fp.nativeCall.questions.map(q => q.header + ' ' + q.question).join('\\n') : fp.promptSnippet;
+const designFinding = fp => /<gstack-qid:\\s*plan-design-review-/i.test(questionText(fp)) && /D\\s*\\d+\\s*[—–-]/.test(questionText(fp));
+const answeredDesignFinding = fp => Boolean(fp.nativeCall?.answered && !fp.nativeCall.failed && designFinding(fp));
+const devexPolishPick = fp => {
+  if (fp.nativeCall && fp.nativeCall.questions.length !== 1) return null;
+  if (!/<gstack-qid:plan-devex-review-mode>/i.test(questionText(fp))) return null;
+  const modes = fp.options.map(o => ({ index: o.index, mode: /DX(POLISH|EXPANSION|TRIAGE)/.exec(o.label.replace(/\\s+/g, '').toUpperCase())?.[1] }));
+  if (!['POLISH', 'EXPANSION', 'TRIAGE'].every(m => modes.filter(o => o.mode === m).length === 1)) return null;
+  return modes.find(o => o.mode === 'POLISH').index;
+};
 const shared = getHermeticDirs().gstackHome;
 fs.appendFileSync(path.join(shared, 'config.yaml'), 'codex_reviews: enabled\\nexplain_level: beginner\\n');
 const sharedBefore = fs.readFileSync(path.join(shared, 'config.yaml'), 'utf8');
@@ -500,23 +562,26 @@ const results = await Promise.all(cases.map(async (item) => ({
   name: item.name,
   observation: await runPlanSkillCounting({
     skillName: item.skillName,
-    slashCommand: '/' + item.skillName,
+    slashCommand: '/' + item.skillName + (item.namedTarget ? ' PLAN.md' : ''),
     followUpPrompt: item.prompt,
+    startupReadyMarker: 'PTY_READY:' + item.record,
     fixtureFiles: item.files,
+    preconfiguredReviewActor: item.preconfiguredReviewActor,
     expectedPlanPath: item.report,
-    isLastStep0AUQ: () => false,
-    isFirstReviewAUQ: ['direct-finding', 'batched-finding', 'failed-call'].includes(item.mode) ? designFirstReviewAUQ : undefined,
-    isReviewAUQ: item.custom ? fp => fp.promptSnippet.includes('routing-proof-after-240') : undefined,
+    isLastStep0AUQ: item.gateFilter ? fp => fp.nativeCall?.questions[0]?.header === 'Focus' : () => false,
+    isFirstReviewAUQ: ['direct-finding', 'batched-finding', 'failed-call'].includes(item.mode) ? designFinding : undefined,
+    isReviewAUQ: item.gateFilter ? answeredDesignFinding : item.custom ? fp => fp.promptSnippet.includes('routing-proof-after-240') : undefined,
     pickAUQ: item.mode === 'native-permission-policy' ? () => 2
-      : ['late-mode', 'batched-mode'].includes(item.mode) ? devexReviewModePick
+      : ['late-mode', 'batched-mode'].includes(item.mode) ? devexPolishPick
       : item.custom ? fp => fp.promptSnippet.includes('routing-proof-after-240') ? 1 : null : undefined,
-    reviewCountCeiling: 8,
+    reviewCountCeiling: item.gateFilter ? 1 : 8,
     timeoutMs: item.mode === 'permission-lifecycle' ? 35000 : 28000,
     firstAUQPick: () => ['late-mode', 'batched-mode'].includes(item.mode) ? 1 : 2,
     env: {
       FIXTURE_RECORD: item.record, FIXTURE_SKILL: item.skillName, FIXTURE_MODE: item.mode,
       FIXTURE_EXPECTED_REPORT: item.report ?? '',
       FIXTURE_CUSTOM: String(item.custom ?? false),
+      FIXTURE_TOOL_DIAGNOSTIC: String(item.toolDiagnostic ?? false), FIXTURE_GATE_FILTER: String(item.gateFilter ?? false),
       FIXTURE_SKIP_INDEX: String(item.skipIndex ?? ''), FIXTURE_CONFIG_BIN: ${JSON.stringify(path.join(ROOT, 'bin/gstack-config'))},
       FIXTURE_SKIP_LABEL: item.skipLabel ?? '',
       GSTACK_HOME: ${JSON.stringify(hostState)}, GSTACK_STATE_ROOT: ${JSON.stringify(hostState)},
@@ -564,6 +629,8 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({ results, onboard
           expect(startup.stateRoot).not.toBe(hostState);
           expect(startup.codexReviews).toBe('disabled');
           expect(startup.explainLevel).toBe('beginner');
+          expect(startup.routingDeclined).toBe(item.preconfiguredReviewActor ? 'true' : 'false');
+          expect(startup.crossProjectLearnings).toBe(item.preconfiguredReviewActor ? 'false' : '');
           expect(startup.onboarding).toEqual(report.onboarding);
           expect(startup.plan).toBe(item.prompt);
           expect(startup.context).toContain('PLAN.md');
@@ -575,7 +642,7 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({ results, onboard
           expect(startup.skill).toContain(`name: ${item.skillName}`);
           expect(startup.sections).toBe(fs.readFileSync(path.join(ROOT, item.skillName, 'sections/review-sections.md'), 'utf8'));
           expect(events.filter((event) => event.type === 'input').map((event) => event.data).join(''))
-            .toBe(`/${item.skillName}\r` + (item.mode === 'prerequisite' ? `${item.custom ? '1\r' : '2'}${item.skipIndex}`
+            .toBe(`/${item.skillName}${item.namedTarget ? ' PLAN.md' : ''}\r` + (item.mode === 'prerequisite' ? `${item.custom ? '1\r' : '2'}${item.skipIndex}`
               : item.mode === 'permission-lifecycle' ? '1\r1\r2'
               : item.mode === 'damaged-submit' ? '\x1b[Z2\r\r'
               : item.mode === 'batched-finding' ? '2\r1\r' : item.mode === 'batched-mode' ? '1\r'
@@ -586,7 +653,7 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({ results, onboard
           expect(() => process.kill(startup.pid, 0)).toThrow();
           const result = results.find((result) => result.name === item.name);
           expect(result.observation.outcome, `${item.name}: ${JSON.stringify(result.observation)}`).toBe(item.mode === 'exit' ? 'exited'
-            : ['missing-transcript', 'failed-call'].includes(item.mode) ? 'transcript_unavailable' : 'completion_summary');
+            : ['missing-transcript', 'failed-call'].includes(item.mode) ? 'transcript_unavailable' : item.gateFilter ? 'ceiling_reached' : 'completion_summary');
           const artifacts = result.observation.artifactDir;
           expect(result.observation.artifactError).toBeUndefined();
           expect(fs.existsSync(artifacts)).toBe(true); // Survives the temporary fixture's cleanup.
@@ -595,11 +662,19 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({ results, onboard
           expect(captured.capture.cwd).toBe(startup.cwd);
           expect(fs.readFileSync(path.join(artifacts, 'terminal.raw.log'), 'utf8')).toContain(item.mode === 'exit' ? 'STARTUP_DIAGNOSTIC' : 'GSTACK REVIEW REPORT');
           expect(fs.readFileSync(path.join(artifacts, 'terminal.visible.log'), 'utf8')).toContain(item.mode === 'exit' ? 'STARTUP_DIAGNOSTIC' : 'GSTACK REVIEW REPORT');
-          if (['direct-finding', 'batched-finding', 'failed-call'].includes(item.mode)) {
+          if (['direct-finding', 'batched-finding', 'failed-call'].includes(item.mode) && !item.gateFilter) {
             expect(result.observation.reviewCount).toBe(1);
             expect(result.observation.step0Count).toBe(0);
             expect(result.observation.fingerprints).toHaveLength(1);
             expect(result.observation.fingerprints[0].nativeCall.questions).toHaveLength(item.mode === 'batched-finding' ? 2 : 1);
+          }
+          if (item.gateFilter) {
+            expect(result.observation.reviewCount).toBe(1);
+            expect(result.observation.step0Count).toBe(2);
+            expect(result.observation.fingerprints.map(fp => fp.preReview)).toEqual([true, true, false]);
+            expect(result.observation.fingerprints.at(-1).nativeCall.questions[0].header).toBe('Button style');
+            const finding = result.observation.fingerprints.at(-1);
+            expect(finding.promptSnippet.length).toBe(240);
           }
           if (item.mode === 'damaged-menu') {
             expect(events.filter(event => event.type === 'input-during-prose')).toEqual([]);
@@ -683,4 +758,35 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify({ results, onboard
     },
     40_000,
   );
+});
+
+test('native sequencing config reaches the real CLI reader without changing shared state', () => {
+  const shared = getHermeticDirs().gstackHome;
+  const before = fs.readFileSync(path.resolve(shared, 'config.yaml'), 'utf8');
+  const first = createNativeReviewState();
+  const second = createNativeReviewState();
+  try {
+    expect(first.env.GSTACK_HOME).not.toBe(shared);
+    expect(first.env.GSTACK_HOME).not.toBe(second.env.GSTACK_HOME);
+    expect(first.env.GSTACK_STATE_ROOT).toBe(first.env.GSTACK_HOME);
+    const result = spawnSync('bash', [path.resolve(ROOT, 'bin/gstack-config'), 'get', 'codex_reviews'], {
+      cwd: ROOT, env: { ...process.env, ...first.env }, encoding: 'utf8', timeout: 5000,
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout.trim()).toBe('disabled');
+    for (const marker of fs.readdirSync(shared).filter(name => name === '.activated' ||
+      /^\..*(?:-seen|-prompted|-shown)$/.test(name) || name.startsWith('.feature-prompted-'))) {
+      expect(fs.readFileSync(path.resolve(first.env.GSTACK_HOME!, marker), 'utf8'))
+        .toBe(fs.readFileSync(path.resolve(shared, marker), 'utf8'));
+    }
+    first.cleanup();
+    first.cleanup();
+    expect(fs.existsSync(first.env.GSTACK_HOME!)).toBe(false);
+    expect(fs.existsSync(second.env.GSTACK_HOME!)).toBe(true);
+    expect(fs.readFileSync(path.resolve(shared, 'config.yaml'), 'utf8')).toBe(before);
+  } finally {
+    first.cleanup();
+    second.cleanup();
+  }
+  expect(fs.existsSync(second.env.GSTACK_HOME!)).toBe(false);
 });

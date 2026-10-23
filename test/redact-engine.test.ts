@@ -234,6 +234,71 @@ describe("MEDIUM demoted credential-shaped patterns (TENSION-1)", () => {
     expect(ids(`authToken: ${v}`)).toContain("env.kv"); // (iv) credential camel
     expect(ids(`clientSecret: ${v}`)).toContain("env.kv"); // (iv) credential camel
   });
+  // #3208: a catalog entry whose whole name is a data-model word plus `_key`
+  // and whose value is a lowercase identifier names a field, not a credential.
+  // Either side alone is not enough: an entropic value, a longer name or a
+  // credential name still fires, in every config format.
+  test("env.kv skips schema field identifiers only when name and value both say so (#3208)", () => {
+    const v = "8Fk2pQ9vXz4wL7mN3rT6yB1cD5eG0hJ";
+    expect(ids('{\n  "input_key": "expected_media_rate_bits_per_second_ingress",\n  "unit": "bps"\n}')).not.toContain("env.kv");
+    for (const line of ["input_key: expected_media_rate_bits_per_second_ingress", '"output_key": "bits.per.second.egress"', "cache-key: user-profile-v2", "sort_key = created_at_desc"])
+      expect(ids(line)).not.toContain("env.kv");
+    for (const line of [
+      `input_key: ${v}`, `INPUT_KEY=${v}`, `input_key: expectedMediaRateBitsPerSecond`, "input_key: abcdefghijkmnop",
+      `cosmosdb_primary_key=${v}`, `cosmosdb_primary_key: ${v}`, `{\n  "cosmosdb_primary_key": "${v}"\n}`, `cosmosdb_primary_key = "${v}"`,
+      `primary_key: ${v}`, `api_cache_key: ${v}`, "api_key: expected_media_rate_bits_per_second_ingress", "cosmosdb_primary_key: expected_media_rate_bits_per_second",
+    ])
+      expect(ids(line)).toContain("env.kv");
+  });
+  // #3048 — in a TS/JSX file an unquoted value after `:` is a type or an
+  // expression, and a JSX brace of names is an expression. Decided by file
+  // context: the same shapes in .env/YAML (or with no path) are literals.
+  test("env.kv skips TS/JSX source syntax by file context, never by value shape (#3048)", () => {
+    const kv = (text: string, sourcePath?: string) =>
+      scan(text, { repoVisibility: "private", ...(sourcePath ? { sourcePath } : {}) }).findings.some((f) => f.id === "env.kv");
+    const v = "8Fk2pQ9vXz4wL7mN3rT6yB1cD5eG0hJ";
+    const signature = "export async function issueServerCoachItem(\n  db: Pool,\n  session: SessionState,\n  item: IssuedCoachItem,\n): Promise<void> {}";
+    for (const [code, file] of [
+      [signature, "src/coach.ts"],
+      ["interface Props {\n  session: SessionState;\n}", "src/props.ts"],
+      ["key={turn.requestId + turn.role + index}", "src/Turn.tsx"],
+      ["apiKey={settings.apiKey}", "src/Settings.jsx"],
+    ] as const) expect({ code, kv: kv(code, file) }).toEqual({ code, kv: false });
+    for (const [literal, file] of [
+      ["API_KEY=VelvetRiverOrbitSunset;", ".env"],
+      ["password: {RiverStoneAmberCedar}", "config/app.yml"],
+      [signature, undefined],
+      ["  session: SessionState,", "deploy/values.yaml"],
+      [`session: "${v}",`, "src/a.ts"], [`key={${v}}`, "src/A.tsx"], [`API_KEY={${v}}`, "src/A.tsx"],
+      [`key={settings.apiKey + "${v}"}`, "src/A.tsx"], [`key="${v}"`, "src/A.tsx"], [`api_key: ${v}`, ".env"],
+    ] as const) expect({ literal, file, kv: kv(literal, file) }).toEqual({ literal, file, kv: true });
+    const jwt = ["eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiIxMjM0NTY3ODkwIn0", "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"].join(".");
+    expect(scan(`token: ${jwt},`, { repoVisibility: "private", sourcePath: "src/auth.ts" }).findings.map((f) => f.id)).toContain("jwt");
+  });
+  // #2912 — a line that READS a secret from the environment holds no secret;
+  // it must not fire (and so must not be masked or withhold a /cso source file).
+  test("env.kv skips exact environment reads (#2912)", () => {
+    for (const line of [
+      'api_key=os.environ["AGENTOPS_API_KEY"]',
+      '        api_key=os.environ["AGENTOPS_API_KEY"]',
+      "LIVEKIT_API_KEY = os.getenv('LIVEKIT_API_KEY')",
+      'token = os.environ.get("GH_TOKEN")',
+      "API_KEY=process.env.OPENAI_API_KEY",
+      "SECRET_KEY=getenv(\"APP_SECRET_KEY\")",
+    ]) {
+      expect(ids(line)).not.toContain("env.kv");
+      expect(redactFindingSpans(`x=1\n${line}\n`, {})).toBe(`x=1\n${line}\n`);
+    }
+  });
+  test("env.kv still fires on real high-entropy keys beside or instead of an env read (#2912 negative controls)", () => {
+    const v = "Zq8vR2mN5tYb7Lc3Wd9K";
+    expect(ids(`SECRET_KEY = os.getenv('DJANGO_SECRET', '${v}')`)).toContain("env.kv");
+    expect(ids(`API_KEY=process.env.OPENAI_API_KEY||"${v}"`)).toContain("env.kv");
+    expect(ids(`API_KEY=os.environ["X"]+"${v}"`)).toContain("env.kv");
+    expect(ids(`API_KEY=os.environ_${v}`)).toContain("env.kv");
+    expect(ids(`API_KEY=getenv${v}`)).toContain("env.kv");
+    expect(ids(`API_KEY="${v}"`)).toContain("env.kv");
+  });
   test("env.kv stays MEDIUM (calibration: generic net, not a blocker)", () => {
     const f = scan("api_key=8Fk2pQ9vXz4wL7mN3rT6yB1cD5eG0hJ", { repoVisibility: "private" })
       .findings.find((x) => x.id === "env.kv");
@@ -573,20 +638,10 @@ describe("redactFindingSpans — machine-egress masking (#1947)", () => {
     expect(out).toBe("first <REDACTED-aws.access_key> then <REDACTED-github.pat> end");
   });
 
-  test("fails closed (null) when a span cannot be relocated — never raw passthrough", () => {
-    // env.kv's span (the value) starts well past the regex match start (the
-    // var name), so locateSpan's rewind-2 re-exec misses it. The contract is
-    // null → caller drops the whole payload. The one thing that must never
-    // happen is the secret surviving in the output.
+  test("masks an anchored env.kv value rather than withholding the whole payload", () => {
     const secret = "8Fk2pQ9vXz4wL7mN3rT6yB1cD5eG0hJq";
     const out = redactFindingSpans(`API_KEY=${secret}`, { repoVisibility: "private" });
-    if (out !== null) {
-      // If locateSpan ever learns to find context-prefixed spans, masking
-      // must actually mask.
-      expect(out).not.toContain(secret);
-    } else {
-      expect(out).toBeNull();
-    }
+    expect(out).toBe("API_KEY=<REDACTED-env.kv>");
   });
 
   test("line/col at boundaries: line start, after blank lines, first char, last unterminated line", () => {
@@ -603,7 +658,7 @@ describe("redactFindingSpans — machine-egress masking (#1947)", () => {
     expect(redactFindingSpans(`a\nb\n${token} x`, { repoVisibility: "private" })).toBe("a\nb\n<REDACTED-github.pat> x");
   });
 
-  test("multiline input redacts a finding past the first line (locateSpan line/col path)", () => {
+  test("multiline input redacts a finding past the first line (original span map)", () => {
     const token = "ghp_" + "1234567890abcdefghijklmnopqrstuvwxyz";
     const out = redactFindingSpans(`line one\nline two has ${token}\nline three`, {
       repoVisibility: "private",
@@ -651,5 +706,24 @@ describe("taxonomy integrity", () => {
     for (const p of PATTERNS) {
       if (p.autoRedactable) expect(p.redactToken).toBeTruthy();
     }
+  });
+});
+
+describe("#3048: gstack-redact --from-file passes the file's path as scan context", () => {
+  test("the same line is source syntax in a .ts file and a literal in YAML", () => {
+    const fs = require("node:fs") as typeof import("node:fs");
+    const os = require("node:os") as typeof import("node:os");
+    const path = require("node:path") as typeof import("node:path");
+    const { spawnSync } = require("node:child_process") as typeof import("node:child_process");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "redact-from-file-"));
+    try {
+      const kv = (name: string) => {
+        fs.writeFileSync(path.join(dir, name), "  session: SessionState,\n");
+        const r = spawnSync("bun", [path.join(import.meta.dir, "..", "bin", "gstack-redact"), "--from-file", path.join(dir, name), "--json"], { encoding: "utf8", timeout: 30_000 });
+        return (JSON.parse(r.stdout).findings as Array<{ id: string }>).some((f) => f.id === "env.kv");
+      };
+      expect(kv("coach.ts")).toBe(false);
+      expect(kv("values.yaml")).toBe(true);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
 });
