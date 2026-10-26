@@ -53,6 +53,51 @@ def parse_bun_fails(test_file, output):
     return names
 
 
+TIMEOUT_EXIT = 124
+BUN_COMPLETED = re.compile(r"^Ran \d+ tests? across ", re.M)
+BUN_ERRORS = re.compile(r"^\s*(\d+) errors?$", re.M)
+
+
+def parse_bun_run(test_file, exit_code, output):
+    """Failing tests from one standalone `bun test <file>` run, refusing any run that
+    did not finish. A timeout, a missing `Ran N tests` line, or a failing exit with no
+    named failure means the run is no evidence either way, so it must not count as a
+    clean observation. Unhandled errors between tests count as a failure of their own."""
+    if exit_code == TIMEOUT_EXIT:
+        raise SyncError(f"`bun test {test_file}` timed out; an unfinished run cannot be classified")
+    if not BUN_COMPLETED.search(output):
+        raise SyncError(f"`bun test {test_file}` exited {exit_code} without bun's `Ran N tests` line; it did not complete")
+    names = parse_bun_fails(test_file, output)
+    errors = sum(int(n) for n in BUN_ERRORS.findall(output))
+    if errors:
+        names.add(f"{test_file} :: <unhandled error>")
+    if exit_code != 0 and not names:
+        raise SyncError(f"`bun test {test_file}` exited {exit_code} but named no failing test; refusing to read it as clean")
+    return names
+
+
+def blocking_dirty(porcelain_lines):
+    """`git status --porcelain` lines that mean the worktree differs from its commit.
+    Untracked top-level dot entries (tool state: .serena/, .context/, .DS_Store) are
+    not source and are ignored; any other change or untracked file blocks."""
+    out = []
+    for line in porcelain_lines:
+        if not line.strip():
+            continue
+        path = line[3:]
+        if line.startswith("?? ") and path.startswith(".") and "/" not in path.rstrip("/"):
+            continue
+        out.append(line)
+    return out
+
+
+def split_attributable(listed, is_repo_file):
+    """Free-runner failure entries split into repo test files (rerunnable) and the
+    rest: `(unattributed)` or temp-path files from nested runs, which cannot be."""
+    files = sorted(p for p in listed if is_repo_file(p))
+    return files, sorted(set(listed) - set(files))
+
+
 def classify(merge_runs, upstream_runs, baseline_runs):
     """Classify every test that failed in a merge or upstream run.
 
@@ -154,7 +199,9 @@ class State:
 def render_report(r):
     """Markdown report; problems first so the reason for a stop is the first thing read."""
     lines = [f"# Fork sync to upstream v{r.get('upstream_version', '?')}", ""]
-    if r.get("stopped"):
+    if r.get("stopped") and r.get("pushed"):
+        lines += [f"**Stopped at stage `{r['stopped']}` after the push:** {r['pushed']} is on the forge (mirroring and CI may have started). Fix the items below, then re-run fork-sync to finish.", ""]
+    elif r.get("stopped"):
         lines += [f"**Stopped at stage `{r['stopped']}`.** Nothing was pushed. Fix the items below in the merge worktree, then re-run fork-sync to resume.", ""]
     if r.get("problems"):
         lines += ["## Problems", ""] + [f"- {p}" for p in r["problems"]] + [""]

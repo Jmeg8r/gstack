@@ -129,12 +129,23 @@ class Sync:
         text = lib.render_report({
             "upstream_version": self.pins["version"],
             "stopped": stopped,
+            "pushed": self.state.data.get("pushed"),
             "problems": list(problems),
             "sections": [(title, sections[s]) for s, title in REPORT_TITLES if s in sections],
         })
         path = self.run_dir / "report.md"
         path.write_text(text)
         return path
+
+    def ensure_clean(self, stage):
+        """Evidence must describe the commit that gets pushed, so the merge worktree may
+        hold no uncommitted change. Top-level dot-directories (tool state such as
+        .serena/ or .context/) are ignored; every other untracked file counts."""
+        if not self.merge_wt.exists():
+            return
+        dirty = lib.blocking_dirty(git(self.merge_wt, "status", "--porcelain").splitlines())
+        if dirty:
+            raise Stop(stage, [f"uncommitted changes in `{self.merge_wt}`; commit them (or discard them) so the evidence matches what is pushed:\n```\n" + "\n".join(dirty) + "\n```"])
 
     # -- stages --------------------------------------------------------------
 
@@ -188,9 +199,7 @@ class Sync:
                 raise Stop("merge", problems)
         if not git_ok(self.merge_wt, "merge-base", "--is-ancestor", github_sha, "HEAD"):
             raise Stop("merge", [f"`{branch}` HEAD does not contain upstream `{github_sha[:9]}`"])
-        dirty = git(self.merge_wt, "status", "--porcelain", "--untracked-files=no")
-        if dirty:
-            raise Stop("merge", [f"uncommitted changes in `{self.merge_wt}`:\n```\n{dirty}\n```"])
+        self.ensure_clean("merge")
         self.passed("merge", f"`{branch}` at `{self.merge_head()[:9]}` merges upstream `{github_sha[:9]}` (v{self.pins['version']}) into forge `{self.pins['origin'][:9]}` with `--no-ff`.")
 
     def fork_delta(self):
@@ -247,8 +256,12 @@ class Sync:
         return wt
 
     def run_file(self, wt, test_file, tag):
-        _, out = run(["bun", "test", test_file], wt, log=self.logs / "suite-files" / f"{tag}.log", timeout=SUITE_FILE_TIMEOUT_S)
-        return lib.parse_bun_fails(test_file, out)
+        log = self.logs / "suite-files" / f"{tag}.log"
+        code, out = run(["bun", "test", test_file], wt, log=log, timeout=SUITE_FILE_TIMEOUT_S)
+        try:
+            return lib.parse_bun_run(test_file, code, out)
+        except lib.SyncError as e:
+            raise Stop("suite", [f"{e} (in `{wt.name}`; see `{log}`)"]) from e
 
     def suite(self):
         say("full free suite on the merge (about 35 minutes)")
@@ -259,8 +272,11 @@ class Sync:
             listed = lib.parse_free_log(out)
         except lib.SyncError as e:
             raise Stop("suite", [str(e)]) from e
-        files = sorted(f for f in listed if (self.merge_wt / f).is_file())
-        unattributed = sorted(set(listed) - set(files))
+        files, unattributed = lib.split_attributable(listed, lambda f: (self.merge_wt / f).is_file())
+        if unattributed and not self.args.accept_unattributed:
+            self.section("suite", f"Full free suite failed with {len(unattributed)} failure line(s) that name no repo test file:\n" + "\n".join(f"- `{u}`" for u in unattributed))
+            raise Stop("suite", [f"failure not attributable to a repo test file, so it cannot be compared with upstream: `{u}`" for u in unattributed]
+                       + [f"Inspect `{log}`; if these are known nested-run artifacts, re-run with `--accept-unattributed`."])
         if code != 0 and not listed:
             raise Stop("suite", [f"`bun run test` exited {code} with no attributable failures; see `{log}`"])
         summary = next((ln for ln in reversed(out.splitlines()) if ln.startswith("Ran ")), "")
@@ -289,7 +305,7 @@ class Sync:
             if by[c]:
                 lines.append(f"\n**{c}:**\n" + "\n".join(f"- `{n}`" for n in by[c]))
         if unattributed:
-            lines.append(f"\n{len(unattributed)} failure line(s) named temp-path files (nested runs) and could not be rerun:\n" + "\n".join(f"- `{u}`" for u in unattributed))
+            lines.append(f"\n{len(unattributed)} unattributable failure line(s), passed on purpose with --accept-unattributed:\n" + "\n".join(f"- `{u}`" for u in unattributed))
         text = "\n".join(lines)
         self.section("suite", text + f"\n\nGlobal hooks after the suite: {self.hooks_verify('suite')}")
         if by["fork-caused"]:
@@ -350,6 +366,8 @@ class Sync:
         code, out = run(["git", "push", "-u", "origin", branch], self.merge_wt, log=self.logs / "pr.log")
         if code != 0:
             raise Stop("pr", [f"`git push -u origin {branch}` failed:\n```\n{out.strip()[-1200:]}\n```"])
+        self.state.data["pushed"] = f"`{branch}` at `{self.merge_head()[:9]}`"
+        self.state.save()
         slug = lib.remote_slug(git(self.repo, "remote", "get-url", "origin"))
         self.section("pr", "The forge ai-review gate refuses sync PRs over its 400 KB broker budget by design, so merging needs an explicit decision. "
                            "After merging: discard the generated `name:` lines in the live checkout, fast-forward it, then `./setup --prefix`.")
@@ -447,6 +465,7 @@ def main():
     ap.add_argument("--run-dir", type=Path, help=f"run directory (default {RUN_ROOT}/v<upstream VERSION>, or the one unfinished run)")
     ap.add_argument("--mirror", default=os.environ.get("FORK_SYNC_MIRROR", DEFAULT_MIRROR), help="push-mirror URL that must match forge main")
     ap.add_argument("--accept-dropped", action="append", metavar="PATH", help="fork-changed file the merge may drop on purpose (repeatable)")
+    ap.add_argument("--accept-unattributed", action="store_true", help="continue past suite failures that name no repo test file (recorded in the report)")
     args = ap.parse_args()
     if args.reruns < 1:
         ap.error("--reruns must be at least 1")
@@ -472,6 +491,10 @@ def main():
     lock = acquire_lock(run_dir) if run_dir else None
     try:
         state_exists = run_dir is not None and (run_dir / "state.json").exists()
+        if state_exists and not lib.State.load(run_dir / "state.json").passed("preflight"):
+            state_exists = False
+            say(f"{run_dir} stopped before preflight passed; re-reading the remotes")
+            (run_dir / "state.json").unlink()
         pins = None
         if not state_exists:
             p = pin(repo, args.mirror)
@@ -503,6 +526,8 @@ def drive(sync, args, start, fresh):
                 raise Stop("preflight", [f"forge already has branch `{sync.pins['branch']}`; this version was synced or is in review"])
             sync.passed("preflight", f"Forge main `{sync.pins['origin'][:9]}` = mirror main. Upstream main `{sync.pins['github'][:9]}` is v{sync.pins['version']}.")
         for stage in lib.STAGES[1:until + 1]:
+            if lib.STAGES.index(stage) > lib.STAGES.index("merge"):
+                sync.ensure_clean(stage)
             if sync.done(stage):
                 continue
             say(f"stage {stage}")
@@ -524,7 +549,8 @@ def drive(sync, args, start, fresh):
                 sync.pr(start)
     except Stop as s:
         path = sync.write_report(stopped=s.stage, problems=s.problems)
-        say(f"STOPPED at {s.stage}: nothing was pushed. Report: {path}")
+        pushed = sync.state.data.get("pushed")
+        say(f"STOPPED at {s.stage}: " + (f"{pushed} WAS pushed to the forge." if pushed else "nothing was pushed.") + f" Report: {path}")
         for p in s.problems:
             say(f"  - {p.splitlines()[0]}")
         return EXIT_STOPPED

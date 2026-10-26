@@ -51,6 +51,46 @@ class ParseBunFails(unittest.TestCase):
         })
 
 
+class ParseBunRun(unittest.TestCase):
+    COMPLETE = "(fail) g > a [1.00ms]\n 3 pass\n 1 fail\nRan 4 tests across 1 file. [20.00ms]"
+
+    def test_completed_run_returns_its_failures(self):
+        self.assertEqual(lib.parse_bun_run("t.ts", 1, self.COMPLETE), {"t.ts :: g > a"})
+
+    def test_failing_exit_without_a_completion_line_is_incomplete(self):
+        with self.assertRaises(lib.SyncError):
+            lib.parse_bun_run("t.ts", 1, "error: Cannot find module './gone'\n")
+
+    def test_timeout_is_incomplete_even_with_partial_results(self):
+        with self.assertRaises(lib.SyncError):
+            lib.parse_bun_run("t.ts", 124, "(fail) g > a\n[fork-sync] timed out after 600s\n")
+
+    def test_nonzero_exit_with_no_named_failure_is_incomplete(self):
+        with self.assertRaises(lib.SyncError):
+            lib.parse_bun_run("t.ts", 1, " 4 pass\n 0 fail\nRan 4 tests across 1 file.")
+
+    def test_unhandled_errors_count_as_a_named_failure(self):
+        out = "# Unhandled error between tests\n 4 pass\n 0 fail\n 1 error\nRan 4 tests across 1 file."
+        self.assertEqual(lib.parse_bun_run("t.ts", 1, out), {"t.ts :: <unhandled error>"})
+
+
+class BlockingDirty(unittest.TestCase):
+    def test_tool_state_dot_entries_are_ignored_and_everything_else_blocks(self):
+        lines = ["?? .serena/", "?? .DS_Store", " M lib/x.ts", "?? lib/new.ts", "?? .forgejo/scripts/new", ""]
+        self.assertEqual(lib.blocking_dirty(lines), [" M lib/x.ts", "?? lib/new.ts", "?? .forgejo/scripts/new"])
+
+    def test_modified_tracked_dot_file_still_blocks(self):
+        self.assertEqual(lib.blocking_dirty([" M .gitignore"]), [" M .gitignore"])
+
+
+class SplitAttributable(unittest.TestCase):
+    def test_entries_that_are_not_repo_files_are_unattributable(self):
+        listed = {"test/a.test.ts", "(unattributed)", "var/folders/x/T/nested.test.ts"}
+        files, other = lib.split_attributable(listed, lambda p: p == "test/a.test.ts")
+        self.assertEqual(files, ["test/a.test.ts"])
+        self.assertEqual(other, ["(unattributed)", "var/folders/x/T/nested.test.ts"])
+
+
 class Classify(unittest.TestCase):
     def runs(self, *sets):
         return [set(s) for s in sets]
@@ -156,6 +196,13 @@ class Report(unittest.TestCase):
         self.assertIn("1.91.300.0", text)
         self.assertLess(text.index("CONFLICT: lib/x.ts"), text.index("## Merge"))
         self.assertIn("Stopped at stage `merge`", text)
+        self.assertIn("Nothing was pushed", text)
+
+    def test_a_stop_after_the_push_says_the_branch_reached_the_forge(self):
+        text = lib.render_report({"upstream_version": "1", "stopped": "pr", "problems": ["forge-pr create failed"],
+                                  "pushed": "upgrade/sync-v1 at abc1234"})
+        self.assertNotIn("Nothing was pushed", text)
+        self.assertIn("upgrade/sync-v1 at abc1234", text)
 
 
 def git(cwd, *args, env=None):
@@ -284,6 +331,27 @@ class Integration(unittest.TestCase):
         self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
         self.assertIn("mirror", (self.run_dir / "report.md").read_text().lower())
         self.assertFalse((self.run_dir / "merge").exists())
+
+    def test_resuming_a_preflight_stop_rechecks_the_mirror_instead_of_crashing(self):
+        other = self.root / "mirror.git"
+        git(self.root, "clone", "-q", "--bare", str(self.upstream), str(other), env=self.env)
+        self.commit_fork({"fork.txt": "fork only\n"})
+        self.commit_upstream({"other.txt": "new\n"}, "1.1.0.0")
+        first = subprocess.run(
+            [sys.executable, str(CLI), "--repo", str(self.repo), "--run-dir", str(self.run_dir), "--mirror", str(other), "--until", "merge"],
+            capture_output=True, text=True, env=self.env, timeout=120)
+        self.assertEqual(first.returncode, 10, first.stdout + first.stderr)
+        r = self.run_cli("--until", "merge")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_uncommitted_change_in_the_merge_worktree_stops_a_cached_resume(self):
+        self.commit_upstream({"other.txt": "new\n"}, "1.1.0.0")
+        self.assertEqual(self.run_cli("--until", "fork-delta").returncode, 0)
+        (self.run_dir / "merge" / "fork.txt").write_text("edited, not committed\n")
+        r = self.run_cli("--until", "fork-delta")
+        self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+        self.assertIn("uncommitted", (self.run_dir / "report.md").read_text().lower())
 
     def test_second_run_while_locked_exits_3(self):
         self.run_dir.mkdir(parents=True)
