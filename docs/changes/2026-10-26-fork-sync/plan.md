@@ -85,3 +85,12 @@ Nothing under upstream's paths changes, so future syncs cannot conflict on this 
 - **Opening a draft PR on problems.** James chose stop-before-push.
 - **Auto-restoring `~/.git-hooks`.** Restoring hides that something wrote there; stopping surfaces it.
 - **Scheduling it (launchd).** Out of scope per the intent.
+
+## Deviations
+
+- **`--accept-dropped PATH`** (new option). The fork-delta stage would otherwise stop forever on a deliberate drop, like PR #16's removal of the fork's gate when upstream shipped its own. A drop not named this way still stops the run; a named one is listed in the report as dropped on purpose.
+- **Fork-delta "adopted" class.** A fork-changed file that matches upstream because upstream took the fork's exact bytes is reported as adopted, not dropped. The plan's "every fork file must still differ from upstream" would have stopped on it falsely.
+- **Head-bound stage freshness.** Every stage from `merge` on records the merge worktree's HEAD it passed at, and is re-run when HEAD differs. A fix committed during a stop therefore re-runs `fork-delta`, `checks`, `suite` and `codex` instead of trusting stale passes.
+- **Default run directory resumes the unfinished run.** Without `--run-dir`, the script resumes the single unfinished run if there is one, rather than keying only on the current upstream version. An upstream release landing mid-fix would otherwise start a second sync. More than one unfinished run is a usage error.
+- **`--until fork-delta`** added to the stage choices, for the integration tests and for checking a hand-resolved merge without running the build.
+- **Hooks checked twice:** right after the suite (recorded in the suite section), and as its own stage before the push.

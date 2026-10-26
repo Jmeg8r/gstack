@@ -1,0 +1,544 @@
+#!/usr/bin/env python3
+# WHAT: Sync the jfcadm/gstack fork with upstream garrytan/gstack, up to (never past)
+#       the merge decision: merge in a scratch worktree, prove the fork's changes and
+#       the tests survived, run the Codex review, then push a branch and open a forge PR.
+# WHY:  /gstack-upgrade only fast-forwards from origin (the forge), so the fork has to
+#       be synced by hand, and the hand syncs repeated the same hour of steps. Every
+#       problem stops the run BEFORE anything reaches the forge; a re-run resumes.
+#       Design: docs/changes/2026-10-26-fork-sync/plan.md. Usage: README.md here.
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fork_sync_lib as lib  # noqa: E402
+
+EXIT_OK = 0
+EXIT_USAGE = 2
+EXIT_LOCKED = 3
+EXIT_STOPPED = 10
+
+DEFAULT_MIRROR = "https://github.com/Jmeg8r/gstack.git"
+DEFAULT_RERUNS = 3
+SUITE_FILE_TIMEOUT_S = 600
+CODEX_TIMEOUT_S = 330
+UNTIL_CHOICES = ["merge", "fork-delta", "checks", "suite", "codex", "pr"]
+# Stages at or after this one are only skipped when they passed at the merge
+# worktree's current HEAD, so a fix committed during a stop re-runs them.
+FIRST_HEAD_BOUND_STAGE = "merge"
+RUN_ROOT = Path.home() / ".gstack-dev" / "fork-sync"
+SKILL_ROOT = Path(os.environ.get("GSTACK_SKILL_ROOT", Path.home() / ".claude" / "skills" / "gstack"))
+
+
+class Stop(Exception):
+    """A problem the operator must fix before the sync may continue."""
+
+    def __init__(self, stage, problems):
+        super().__init__("; ".join(problems))
+        self.stage = stage
+        self.problems = problems
+
+
+def say(msg):
+    print(f"[fork-sync] {msg}", flush=True)
+
+
+def run(cmd, cwd, log=None, timeout=None):
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    try:
+        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
+        out, code = p.stdout + p.stderr, p.returncode
+    except subprocess.TimeoutExpired as e:
+        out = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+        out += f"\n[fork-sync] timed out after {timeout}s\n"
+        code = 124
+    if log:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a") as f:
+            f.write(f"$ {' '.join(map(str, cmd))}  (cwd {cwd})\n{out}\n[exit {code}]\n\n")
+    return code, out
+
+
+def git(cwd, *args):
+    code, out = run(["git", *args], cwd)
+    if code != 0:
+        raise lib.SyncError(f"git {' '.join(args)} failed in {cwd}: {out.strip()}")
+    return out.strip()
+
+
+def git_ok(cwd, *args):
+    return run(["git", *args], cwd)[0] == 0
+
+
+def blob(cwd, rev, path):
+    code, out = run(["git", "rev-parse", "--verify", "-q", f"{rev}:{path}"], cwd)
+    return out.strip() if code == 0 else None
+
+
+def live_snapshot(repo):
+    return {
+        "head": git(repo, "rev-parse", "HEAD"),
+        "branch": git(repo, "branch", "--show-current"),
+        "status": git(repo, "status", "--porcelain"),
+    }
+
+
+class Sync:
+    def __init__(self, args, repo, run_dir, pins):
+        self.args = args
+        self.repo = repo
+        self.run_dir = run_dir
+        self.logs = run_dir / "logs"
+        self.state = lib.State.load(run_dir / "state.json")
+        if pins:
+            self.state.data.setdefault("pins", pins)
+        self.pins = self.state.data["pins"]
+        self.merge_wt = run_dir / "merge"
+
+    # -- bookkeeping ---------------------------------------------------------
+
+    def merge_head(self):
+        return git(self.merge_wt, "rev-parse", "HEAD") if self.merge_wt.exists() else None
+
+    def done(self, stage):
+        if not self.state.passed(stage):
+            return False
+        if lib.STAGES.index(stage) < lib.STAGES.index(FIRST_HEAD_BOUND_STAGE):
+            return True
+        return self.state.data["passed"][stage] == self.merge_head()
+
+    def passed(self, stage, section=None):
+        if section is not None:
+            self.state.data.setdefault("sections", {})[stage] = section
+        self.state.mark_passed(stage, sha=self.merge_head() if lib.STAGES.index(stage) >= lib.STAGES.index(FIRST_HEAD_BOUND_STAGE) else None)
+
+    def section(self, stage, text):
+        self.state.data.setdefault("sections", {})[stage] = text
+        self.state.save()
+
+    def write_report(self, stopped=None, problems=()):
+        sections = self.state.data.get("sections", {})
+        text = lib.render_report({
+            "upstream_version": self.pins["version"],
+            "stopped": stopped,
+            "problems": list(problems),
+            "sections": [(title, sections[s]) for s, title in REPORT_TITLES if s in sections],
+        })
+        path = self.run_dir / "report.md"
+        path.write_text(text)
+        return path
+
+    # -- stages --------------------------------------------------------------
+
+    def hooks_backup(self):
+        code, out = run(["git", "config", "--global", "--get", "core.hooksPath"], self.repo)
+        hooks = Path(os.path.expanduser(out.strip())) if code == 0 and out.strip() else None
+        if hooks is None or not hooks.is_dir():
+            self.state.data["hooks"] = None
+            self.passed("hooks-backup", "No global `core.hooksPath` directory; hooks checks skipped.")
+            return
+        backup = self.run_dir / "hooks-backup"
+        backup.mkdir(parents=True, exist_ok=True)
+        for f in hooks.iterdir():
+            if f.is_file():
+                shutil.copy2(f, backup / f.name)
+        manifest = lib.hooks_manifest(hooks)
+        (self.run_dir / "hooks.sha256.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        self.state.data["hooks"] = str(hooks)
+        self.passed("hooks-backup", f"Backed up `{hooks}` ({len(manifest)} files) to `{backup}` with sha256 per file.")
+
+    def hooks_verify(self, stage):
+        hooks = self.state.data.get("hooks")
+        if not hooks:
+            return "skipped (no global hooks directory)"
+        before = json.loads((self.run_dir / "hooks.sha256.json").read_text())
+        diff = lib.hooks_diff(before, lib.hooks_manifest(Path(hooks)))
+        if any(diff.values()):
+            backup = self.run_dir / "hooks-backup"
+            raise Stop(stage, [
+                f"`{hooks}` changed during the run: added {diff['added']}, removed {diff['removed']}, changed {diff['changed']}. Not restored automatically.",
+                f"Restore with: `cp -p {backup}/* {hooks}/` and remove any added file after checking what it is.",
+            ])
+        return f"`{hooks}` matches the pre-run sha256 manifest."
+
+    def merge(self):
+        github_sha, branch = self.pins["github"], self.pins["branch"]
+        if not self.merge_wt.exists():
+            if git_ok(self.repo, "rev-parse", "--verify", "-q", f"refs/heads/{branch}"):
+                raise Stop("merge", [f"local branch `{branch}` already exists without this run's worktree; delete it or pass the run dir that owns it"])
+            git(self.repo, "worktree", "add", "-q", "-b", branch, str(self.merge_wt), self.pins["origin"])
+        head = self.merge_head()
+        if git_ok(self.merge_wt, "rev-parse", "-q", "--verify", "MERGE_HEAD"):
+            unresolved = git(self.merge_wt, "diff", "--name-only", "--diff-filter=U").split()
+            raise Stop("merge", [f"merge in progress in `{self.merge_wt}`; unresolved: {unresolved or 'none, commit the merge'}"])
+        if head == self.pins["origin"]:
+            code, out = run(["git", "merge", "--no-ff", "--no-edit", github_sha], self.merge_wt, log=self.logs / "merge.log")
+            if code != 0:
+                conflicts = git(self.merge_wt, "diff", "--name-only", "--diff-filter=U").split()
+                problems = [f"CONFLICT: `{p}`" for p in conflicts] or [f"git merge failed: {out.strip()[-500:]}"]
+                self.section("merge", f"Merging upstream `{github_sha[:9]}` into `{branch}` stopped with {len(conflicts)} conflict(s). Resolve per hunk in `{self.merge_wt}` (never a whole-file `--ours`/`--theirs`), commit the merge, re-run.")
+                raise Stop("merge", problems)
+        if not git_ok(self.merge_wt, "merge-base", "--is-ancestor", github_sha, "HEAD"):
+            raise Stop("merge", [f"`{branch}` HEAD does not contain upstream `{github_sha[:9]}`"])
+        dirty = git(self.merge_wt, "status", "--porcelain", "--untracked-files=no")
+        if dirty:
+            raise Stop("merge", [f"uncommitted changes in `{self.merge_wt}`:\n```\n{dirty}\n```"])
+        self.passed("merge", f"`{branch}` at `{self.merge_head()[:9]}` merges upstream `{github_sha[:9]}` (v{self.pins['version']}) into forge `{self.pins['origin'][:9]}` with `--no-ff`.")
+
+    def fork_delta(self):
+        o, g = self.pins["origin"], self.pins["github"]
+        base = git(self.repo, "merge-base", o, g)
+        files = [f for f in git(self.repo, "diff", "--no-renames", "--name-only", base, o).splitlines() if f]
+        head = self.merge_head()
+        result = lib.fork_delta({f: (blob(self.repo, o, f), blob(self.repo, g, f), blob(self.merge_wt, head, f)) for f in files})
+        accepted = set(self.args.accept_dropped or [])
+        dropped = [f for f in result["dropped"] if f not in accepted]
+        intentional = [f for f in result["dropped"] if f in accepted]
+        touched = git(self.repo, "log", "--oneline", "--no-merges", f"{base}..{g}", "--", *files) if files else ""
+        lines = [f"The fork changed {len(files)} file(s) since its last common commit with upstream (`{base[:9]}`)."]
+        for label, items in [("Kept", result["kept"]), ("Adopted by upstream", result["adopted"]), ("Dropped on purpose (--accept-dropped)", intentional), ("DROPPED", dropped)]:
+            if items:
+                lines.append(f"\n**{label}** ({len(items)}):\n" + "\n".join(f"- `{f}`" for f in items))
+        if touched:
+            shown = touched.splitlines()
+            lines.append(f"\n**Review these** (upstream commits that touch fork-changed files, {len(shown)}):\n```\n" + "\n".join(shown[:50]) + ("\n…" if len(shown) > 50 else "") + "\n```")
+        text = "\n".join(lines)
+        if dropped:
+            self.section("fork-delta", text)
+            raise Stop("fork-delta", [f"fork change dropped by the merge (file now matches upstream, upstream never took the fork's version): `{f}`" for f in dropped]
+                       + ["If a drop is intended (upstream replaced the fork's change), re-run with `--accept-dropped <path>`."])
+        self.passed("fork-delta", text)
+
+    def checks(self):
+        log = self.logs / "checks.log"
+        for cmd in (["bun", "install"], ["bun", "run", "build:cso"], ["bun", "run", "gen:skill-docs"]):
+            code, out = run(cmd, self.merge_wt, log=log)
+            if code != 0:
+                raise Stop("checks", [f"`{' '.join(cmd)}` exited {code}; see `{log}`:\n```\n{out.strip()[-1500:]}\n```"])
+        drift = git(self.merge_wt, "status", "--porcelain", "--untracked-files=no")
+        if drift:
+            raise Stop("checks", [f"`gen:skill-docs` changed generated files (template/output drift):\n```\n{drift}\n```"])
+        code, out = run(["bun", "run", "typecheck"], self.merge_wt, log=log)
+        if code != 0:
+            raise Stop("checks", [f"`bun run typecheck` exited {code}:\n```\n{out.strip()[-1500:]}\n```"])
+        code, out = run(["bun", "run", "typecheck:test"], self.merge_wt, log=log)
+        if code != 0 or "none new" not in out:
+            raise Stop("checks", [f"`bun run typecheck:test` reported new diagnostics (exit {code}):\n```\n{out.strip()[-1500:]}\n```"])
+        ratchet = next((ln.strip() for ln in out.splitlines() if "none new" in ln), "")
+        self.passed("checks", f"`bun install`, `build:cso`, `gen:skill-docs` (no drift), `typecheck` clean, test typecheck ratchet: {ratchet}")
+
+    def prepared_worktree(self, name, rev):
+        wt = self.run_dir / name
+        if not wt.exists():
+            git(self.repo, "worktree", "add", "-q", "--detach", str(wt), rev)
+        log = self.logs / f"{name}-prep.log"
+        for cmd in (["bun", "install"], ["bun", "run", "build:cso"]):
+            code, _ = run(cmd, wt, log=log)
+            if code != 0:
+                raise Stop("suite", [f"`{' '.join(cmd)}` failed preparing the {name} worktree; see `{log}`"])
+        return wt
+
+    def run_file(self, wt, test_file, tag):
+        _, out = run(["bun", "test", test_file], wt, log=self.logs / "suite-files" / f"{tag}.log", timeout=SUITE_FILE_TIMEOUT_S)
+        return lib.parse_bun_fails(test_file, out)
+
+    def suite(self):
+        say("full free suite on the merge (about 35 minutes)")
+        log = self.logs / "suite.log"
+        log.unlink(missing_ok=True)
+        code, out = run(["bun", "run", "test", "--verbose"], self.merge_wt, log=log)
+        try:
+            listed = lib.parse_free_log(out)
+        except lib.SyncError as e:
+            raise Stop("suite", [str(e)]) from e
+        files = sorted(f for f in listed if (self.merge_wt / f).is_file())
+        unattributed = sorted(set(listed) - set(files))
+        if code != 0 and not listed:
+            raise Stop("suite", [f"`bun run test` exited {code} with no attributable failures; see `{log}`"])
+        summary = next((ln for ln in reversed(out.splitlines()) if ln.startswith("Ran ")), "")
+        if not files:
+            self.passed("suite", f"Full free suite clean ({summary}).")
+            return
+        say(f"{len(files)} file(s) had failures; rerunning each alone on merge, upstream and pre-sync fork")
+        trees = {"merge": self.merge_wt, "upstream": self.prepared_worktree("upstream", self.pins["github"]),
+                 "baseline": self.prepared_worktree("baseline", self.pins["origin"])}
+        verdicts = {}
+        for i, f in enumerate(files, 1):
+            key = f.replace("/", "_")
+            runs = {side: [self.run_file(wt, f, f"{key}.{side}.0")] for side, wt in trees.items()}
+            if runs["merge"][0] - runs["upstream"][0]:
+                for n in range(1, self.args.reruns + 1):
+                    for side, wt in trees.items():
+                        runs[side].append(self.run_file(wt, f, f"{key}.{side}.{n}"))
+            verdicts.update(lib.classify(runs["merge"], runs["upstream"], runs["baseline"]))
+            say(f"  [{i}/{len(files)}] {f}")
+        (self.run_dir / "classification.json").write_text(json.dumps(verdicts, indent=2, sort_keys=True) + "\n")
+        by = {c: sorted(n for n, v in verdicts.items() if v == c) for c in ("fork-caused", "pre-existing", "flaky", "upstream")}
+        lines = [f"Full free suite: {summary}. {len(files)} file(s) with failures, each rerun alone on the merge, pure upstream and the pre-sync fork ({self.args.reruns} extra reruns where the merge failed more than upstream).",
+                 "", "| Class | Tests | Blocks |", "|---|---|---|"]
+        lines += [f"| {c} | {len(by[c])} | {'yes' if c == 'fork-caused' else 'no'} |" for c in by]
+        for c in ("fork-caused", "pre-existing", "flaky"):
+            if by[c]:
+                lines.append(f"\n**{c}:**\n" + "\n".join(f"- `{n}`" for n in by[c]))
+        if unattributed:
+            lines.append(f"\n{len(unattributed)} failure line(s) named temp-path files (nested runs) and could not be rerun:\n" + "\n".join(f"- `{u}`" for u in unattributed))
+        text = "\n".join(lines)
+        self.section("suite", text + f"\n\nGlobal hooks after the suite: {self.hooks_verify('suite')}")
+        if by["fork-caused"]:
+            raise Stop("suite", [f"fork-caused failure (fails on the merge every run, never on upstream or the pre-sync fork): `{n}`" for n in by["fork-caused"]])
+        self.passed("suite")
+
+    def codex(self):
+        probe = SKILL_ROOT / "bin" / "gstack-codex-probe"
+        review_log = SKILL_ROOT / "bin" / "gstack-review-log"
+        validator = SKILL_ROOT / "lib" / "outside-review-result.ts"
+        for p in (probe, review_log, validator):
+            if not p.exists():
+                raise Stop("codex", [f"gstack install is missing `{p}`; set GSTACK_SKILL_ROOT or run ./setup"])
+        _, token = run([str(review_log), "--start", "codex-review"], self.merge_wt)
+        code, sel = run([str(probe), "select-model", "review"], self.merge_wt, log=self.logs / "codex.log")
+        model = next((ln.split(": ", 1)[1] for ln in sel.splitlines() if ln.startswith("CODEX_SEL: ")), None)
+        sandbox = next((ln.split(": ", 1)[1] for ln in sel.splitlines() if ln.startswith("CODEX_SANDBOX: ")), None)
+        if code != 0 or not model or not sandbox:
+            raise Stop("codex", [f"`gstack-codex-probe select-model review` failed (exit {code}):\n```\n{sel.strip()[-800:]}\n```"])
+        out_file, err_file = self.logs / "codex.out", self.logs / "codex.err"
+        cmd = [str(probe), "run-with-timeout", "--user-invoked", "--effort", "high", "--request-effort", "", str(CODEX_TIMEOUT_S),
+               "codex", "review", "--base", self.pins["github"], "-c", f'sandbox_mode="{sandbox}"', "-c", f'review_model="{model}"',
+               "-c", f'model="{model}"', "-c", "skills.include_instructions=false", "-c", 'web_search="cached"']
+        say(f"Codex review of the fork delta ({model})")
+        with out_file.open("w") as fo, err_file.open("w") as fe:
+            codex_exit = subprocess.run(cmd, cwd=self.merge_wt, stdin=subprocess.DEVNULL, stdout=fo, stderr=fe, timeout=CODEX_TIMEOUT_S + 60).returncode
+        vcode, verdict = run(["bun", "--no-env-file", "--config=/dev/null", str(validator), "--label", "Codex review", "--exit", str(codex_exit),
+                              "--stderr", str(err_file), "structured", str(out_file)], self.merge_wt)
+        gate = {0: "PASS", 4: "UNVERIFIED", 3: "FAIL"}.get(vcode, "FAIL")
+        head = self.merge_head()
+        entry = {"skill": "codex-review", "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                 "status": "clean" if gate == "PASS" else "issues_found", "gate": "pass" if gate == "PASS" else "fail",
+                 "findings": 0, "findings_fixed": 0, "commit": head[:9], "completed": False, "converged": False}
+        if token.strip():
+            run([str(review_log), json.dumps(entry), "--finish", token.strip().splitlines()[-1]], self.merge_wt)
+        self.state.data["codex"] = {"gate": gate, "model": model, "head": head, "verdict": verdict.strip(), "exit": codex_exit}
+        body = out_file.read_text()
+        text = (f"`codex review --base <upstream>` ({model}, read-only sandbox) on the fork's delta at `{head[:9]}`: **GATE: {gate}**.\n\n"
+                f"```\n{verdict.strip()}\n```\nFull output is posted verbatim as a PR comment.")
+        self.section("codex", text)
+        if gate == "FAIL":
+            raise Stop("codex", [f"Codex gate FAIL (validator exit {vcode}, codex exit {codex_exit}):\n```codex-review\n{body.strip()[-3000:]}\n```"])
+        self.passed("codex")
+
+    def pr(self, start_snapshot):
+        if live_snapshot(self.repo) != start_snapshot:
+            raise Stop("pr", [f"the live checkout `{self.repo}` changed during this run (HEAD, branch or status); check it before pushing"])
+        origin_now = git(self.repo, "ls-remote", "origin", "refs/heads/main").split()[0]
+        mirror_now = git(self.repo, "ls-remote", self.args.mirror, "refs/heads/main").split()[0]
+        if origin_now != self.pins["origin"]:
+            raise Stop("pr", [f"forge main moved from `{self.pins['origin'][:9]}` to `{origin_now[:9]}` during the run; start a fresh run"])
+        if mirror_now != origin_now:
+            raise Stop("pr", [f"forge main `{origin_now[:9]}` and mirror main `{mirror_now[:9]}` differ; a push would force-mirror the forge over GitHub (L45)"])
+        forge_pr = shutil.which("forge-pr")
+        if not forge_pr:
+            raise Stop("pr", ["`forge-pr` is not on PATH"])
+        branch = self.pins["branch"]
+        code, out = run(["git", "push", "-u", "origin", branch], self.merge_wt, log=self.logs / "pr.log")
+        if code != 0:
+            raise Stop("pr", [f"`git push -u origin {branch}` failed:\n```\n{out.strip()[-1200:]}\n```"])
+        slug = lib.remote_slug(git(self.repo, "remote", "get-url", "origin"))
+        self.section("pr", "The forge ai-review gate refuses sync PRs over its 400 KB broker budget by design, so merging needs an explicit decision. "
+                           "After merging: discard the generated `name:` lines in the live checkout, fast-forward it, then `./setup --prefix`.")
+        body = self.write_report()
+        if not self.state.data.get("pr_url"):
+            code, out = run([forge_pr, "--repo", slug, "create", "--base", "main", "--head", branch,
+                             "--title", f"chore(upstream): sync fork to garrytan/gstack v{self.pins['version']}", "--body-file", str(body)], self.merge_wt, log=self.logs / "pr.log")
+            url = next((w for w in out.split() if "/pulls/" in w), None)
+            if code != 0 or not url:
+                raise Stop("pr", [f"`forge-pr create` failed (exit {code}):\n```\n{out.strip()[-800:]}\n```"])
+            self.state.data["pr_url"] = url
+            self.state.save()
+        self.post_codex_comment(forge_pr, slug)
+        if git(self.repo, "ls-remote", self.args.mirror, "refs/heads/main").split()[0] != origin_now:
+            say("WARNING: mirror main changed after the push; check the forge push mirror")
+        self.state.data["finished"] = True
+        self.passed("pr")
+
+    def post_codex_comment(self, forge_pr, slug):
+        c = self.state.data.get("codex")
+        if not c or self.state.data.get("codex_comment_posted") == c["head"]:
+            return
+        loader = importlib.machinery.SourceFileLoader("forge_pr", forge_pr)
+        spec = importlib.util.spec_from_loader("forge_pr", loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        api = mod.ForgeAPI(os.environ.get("FORGE_API", mod.DEFAULT_API), mod.read_token())
+        number = self.state.data["pr_url"].rstrip("/").split("/")[-1]
+        raw = (self.logs / "codex.out").read_text().strip()
+        text = (f"## Codex review: GATE: {c['gate']}\n\nModel {c['model']}, read-only sandbox, head `{c['head'][:9]}`. "
+                f"Scope: `codex review --base <upstream v{self.pins['version']}>`, the fork's delta on top of upstream; upstream's own code is not covered.\n\n"
+                f"```codex-review\n{raw}\n```\n\nValidator:\n```\n{c['verdict']}\n```\n\n**GATE: {c['gate']}**"
+                + ("" if c["gate"] == "PASS" else " (clean prose without severity tags or a NO_FINDINGS line; needs a human read)") + "\n\nPosted by `.forgejo/scripts/fork-sync`.")
+        status, data, _ = api.call("POST", f"/repos/{slug}/issues/{number}/comments", {"body": text})
+        if status not in (200, 201):
+            raise Stop("pr", [f"posting the Codex comment failed: HTTP {status} {data}"])
+        self.state.data["codex_comment_posted"] = c["head"]
+        self.state.save()
+
+
+REPORT_TITLES = [("preflight", "Pre-flight"), ("hooks-backup", "Global hooks"), ("merge", "Merge"), ("fork-delta", "Fork delta"),
+                 ("checks", "Build checks"), ("suite", "Test suite"), ("codex", "Codex review"), ("hooks-verify", "Global hooks after the run"), ("pr", "Merge decision")]
+
+
+def acquire_lock(run_dir):
+    run_dir.mkdir(parents=True, exist_ok=True)
+    lock = run_dir / "lock"
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        pid = lock.read_text().strip()
+        try:
+            os.kill(int(pid), 0)
+            say(f"another fork-sync run (pid {pid}) holds {lock}")
+        except (ValueError, ProcessLookupError):
+            say(f"stale lock {lock} from pid {pid!r}, which is not running; remove it if no run is active")
+        except PermissionError:
+            say(f"{lock} is held by pid {pid}, owned by another user")
+        sys.exit(EXIT_LOCKED)
+    os.write(fd, str(os.getpid()).encode())
+    os.close(fd)
+    return lock
+
+
+def unfinished_runs():
+    if not RUN_ROOT.is_dir():
+        return []
+    found = []
+    for d in sorted(RUN_ROOT.iterdir()):
+        s = d / "state.json"
+        if s.is_file():
+            try:
+                if not json.loads(s.read_text()).get("finished"):
+                    found.append(d)
+            except json.JSONDecodeError:
+                found.append(d)
+    return found
+
+
+def pin(repo, mirror):
+    git(repo, "fetch", "-q", "origin")
+    git(repo, "fetch", "-q", "github", "main")
+    o = git(repo, "rev-parse", "origin/main")
+    g = git(repo, "rev-parse", "github/main")
+    mirror_out = git(repo, "ls-remote", mirror, "refs/heads/main").split()
+    return {"origin": o, "github": g, "mirror": mirror_out[0] if mirror_out else None,
+            "version": git(repo, "show", f"{g}:VERSION").strip(), "nothing": git_ok(repo, "merge-base", "--is-ancestor", g, o)}
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Sync the gstack fork with upstream, up to the merge decision.")
+    ap.add_argument("--repo", default=".", help="fork checkout with remotes origin (forge) and github (upstream)")
+    ap.add_argument("--until", choices=UNTIL_CHOICES, default="pr", help="last stage to run; 'checks' is the dry run")
+    ap.add_argument("--reruns", type=int, default=DEFAULT_RERUNS, help="extra standalone reruns for files the merge fails more than upstream")
+    ap.add_argument("--run-dir", type=Path, help=f"run directory (default {RUN_ROOT}/v<upstream VERSION>, or the one unfinished run)")
+    ap.add_argument("--mirror", default=os.environ.get("FORK_SYNC_MIRROR", DEFAULT_MIRROR), help="push-mirror URL that must match forge main")
+    ap.add_argument("--accept-dropped", action="append", metavar="PATH", help="fork-changed file the merge may drop on purpose (repeatable)")
+    args = ap.parse_args()
+    if args.reruns < 1:
+        ap.error("--reruns must be at least 1")
+
+    try:
+        repo = Path(git(Path(args.repo).resolve(), "rev-parse", "--show-toplevel"))
+        remotes = git(repo, "remote").split()
+    except lib.SyncError as e:
+        say(str(e))
+        return EXIT_USAGE
+    if not {"origin", "github"} <= set(remotes):
+        say(f"{repo} needs remotes 'origin' (forge) and 'github' (upstream); has {remotes}")
+        return EXIT_USAGE
+    start = live_snapshot(repo)
+
+    run_dir = args.run_dir
+    if run_dir is None:
+        open_runs = unfinished_runs()
+        if len(open_runs) > 1:
+            say("more than one unfinished run; pass --run-dir: " + ", ".join(map(str, open_runs)))
+            return EXIT_USAGE
+        run_dir = open_runs[0] if open_runs else None
+    lock = acquire_lock(run_dir) if run_dir else None
+    try:
+        state_exists = run_dir is not None and (run_dir / "state.json").exists()
+        pins = None
+        if not state_exists:
+            p = pin(repo, args.mirror)
+            if run_dir is None:
+                run_dir = RUN_ROOT / f"v{p['version']}"
+                lock = acquire_lock(run_dir)
+            pins = {"origin": p["origin"], "github": p["github"], "version": p["version"], "branch": f"upgrade/sync-v{p['version']}"}
+            if p["nothing"]:
+                say(f"Nothing to sync: upstream main {p['github'][:9]} is already in forge main {p['origin'][:9]}.")
+                return EXIT_OK
+        else:
+            say(f"resuming {run_dir}")
+        sync = Sync(args, repo, run_dir, pins)
+        return drive(sync, args, start, p if pins else None)
+    finally:
+        if lock and lock.exists() and lock.read_text().strip() == str(os.getpid()):
+            lock.unlink()
+
+
+def drive(sync, args, start, fresh):
+    until = lib.STAGES.index(args.until)
+    stage = "preflight"
+    try:
+        if not sync.done("preflight"):
+            if fresh["mirror"] != fresh["origin"]:
+                sync.section("preflight", f"Forge main `{fresh['origin'][:9]}`, mirror main `{(fresh['mirror'] or 'missing')[:9]}`.")
+                raise Stop("preflight", [f"forge main and the push mirror's main differ (mirror {args.mirror}); a forge push would force-mirror the forge over GitHub (L45). Fix the mirror first."])
+            if git_ok(sync.repo, "ls-remote", "--exit-code", "origin", f"refs/heads/{sync.pins['branch']}"):
+                raise Stop("preflight", [f"forge already has branch `{sync.pins['branch']}`; this version was synced or is in review"])
+            sync.passed("preflight", f"Forge main `{sync.pins['origin'][:9]}` = mirror main. Upstream main `{sync.pins['github'][:9]}` is v{sync.pins['version']}.")
+        for stage in lib.STAGES[1:until + 1]:
+            if sync.done(stage):
+                continue
+            say(f"stage {stage}")
+            if stage == "hooks-backup":
+                sync.hooks_backup()
+            elif stage == "merge":
+                sync.merge()
+            elif stage == "fork-delta":
+                sync.fork_delta()
+            elif stage == "checks":
+                sync.checks()
+            elif stage == "suite":
+                sync.suite()
+            elif stage == "codex":
+                sync.codex()
+            elif stage == "hooks-verify":
+                sync.passed("hooks-verify", sync.hooks_verify("hooks-verify"))
+            elif stage == "pr":
+                sync.pr(start)
+    except Stop as s:
+        path = sync.write_report(stopped=s.stage, problems=s.problems)
+        say(f"STOPPED at {s.stage}: nothing was pushed. Report: {path}")
+        for p in s.problems:
+            say(f"  - {p.splitlines()[0]}")
+        return EXIT_STOPPED
+    except lib.SyncError as e:
+        path = sync.write_report(stopped=stage, problems=[str(e)])
+        say(f"STOPPED at {stage}: {e}. Report: {path}")
+        return EXIT_STOPPED
+    path = sync.write_report()
+    if live_snapshot(sync.repo) != start:
+        say(f"WARNING: the live checkout {sync.repo} changed during this run")
+    url = sync.state.data.get("pr_url")
+    say(f"done through `{args.until}`. Report: {path}" + (f". PR: {url}" if url and args.until == "pr" else ""))
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

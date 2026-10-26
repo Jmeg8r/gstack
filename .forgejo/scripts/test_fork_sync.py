@@ -1,0 +1,297 @@
+# WHAT: Tests for fork-sync: pure logic in fork_sync_lib, plus integration runs of the
+#       fork-sync CLI against throwaway git repos.
+# WHY:  The script's job is to stop before anything reaches the forge when a sync has a
+#       problem, so the stop paths are what the integration tests exercise.
+# Run:  python3 -m unittest discover -s .forgejo/scripts -p 'test_*.py' -v
+
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+import fork_sync_lib as lib  # noqa: E402
+
+CLI = HERE / "fork-sync"
+
+
+class ParseFreeLog(unittest.TestCase):
+    def test_collects_failing_files_from_both_line_forms(self):
+        log = "\n".join([
+            "[test:free] shard 2/6",
+            "  ✗ test/a.test.ts — suite > case one",
+            "  ✗ test/a.test.ts — suite > case two",
+            "  ✗ browse/test/b.test.ts (crashed: exited)",
+            "[test:free] FAIL — 3 failing test(s) in 2 file(s), 0 crashed worker(s).",
+        ])
+        self.assertEqual(lib.parse_free_log(log), {"test/a.test.ts", "browse/test/b.test.ts"})
+
+    def test_clean_run_has_no_failing_files(self):
+        self.assertEqual(lib.parse_free_log("[test:free] PASS — 36 tests, 1 files, 0s."), set())
+
+    def test_reported_failures_without_attributable_lines_fail_closed(self):
+        with self.assertRaises(lib.SyncError):
+            lib.parse_free_log("[test:free] FAIL — 4 failing test(s) in 2 file(s), 0 crashed worker(s).")
+
+
+class ParseBunFails(unittest.TestCase):
+    def test_strips_timings_and_temp_paths_and_keys_by_file(self):
+        out = "\n".join([
+            "(fail) group > case [12.34ms]",
+            "(fail) group > reads /private/var/folders/x/T/fixture-AbC123/repo [5.00s]",
+            "(pass) group > fine",
+        ])
+        self.assertEqual(lib.parse_bun_fails("test/a.test.ts", out), {
+            "test/a.test.ts :: group > case",
+            "test/a.test.ts :: group > reads",
+        })
+
+
+class Classify(unittest.TestCase):
+    def runs(self, *sets):
+        return [set(s) for s in sets]
+
+    def test_fails_only_on_merge_every_time_is_fork_caused(self):
+        got = lib.classify(self.runs({"t"}, {"t"}), self.runs(set(), set()), self.runs(set(), set()))
+        self.assertEqual(got, {"t": "fork-caused"})
+
+    def test_also_failing_on_pre_sync_fork_is_pre_existing(self):
+        got = lib.classify(self.runs({"t"}, {"t"}), self.runs(set(), set()), self.runs({"t"}, set()))
+        self.assertEqual(got, {"t": "pre-existing"})
+
+    def test_intermittent_on_merge_is_flaky(self):
+        got = lib.classify(self.runs({"t"}, set()), self.runs(set(), set()), self.runs(set(), set()))
+        self.assertEqual(got, {"t": "flaky"})
+
+    def test_intermittent_on_upstream_is_flaky(self):
+        got = lib.classify(self.runs({"t"}, {"t"}), self.runs({"t"}, set()), self.runs(set(), set()))
+        self.assertEqual(got, {"t": "flaky"})
+
+    def test_failing_on_upstream_every_time_is_upstream(self):
+        got = lib.classify(self.runs({"t"}, {"t"}), self.runs({"t"}, {"t"}), self.runs({"t"}, {"t"}))
+        self.assertEqual(got, {"t": "upstream"})
+
+    def test_failing_only_on_baseline_is_ignored(self):
+        self.assertEqual(lib.classify(self.runs(set()), self.runs(set()), self.runs({"t"})), {})
+
+    def test_needs_at_least_one_run_per_side(self):
+        with self.assertRaises(lib.SyncError):
+            lib.classify([], self.runs(set()), self.runs(set()))
+
+
+class ForkDelta(unittest.TestCase):
+    def test_merge_back_to_upstream_bytes_is_dropped(self):
+        blobs = {"a": ("fork", "up", "up")}  # (pre-sync fork, upstream, merge)
+        self.assertEqual(lib.fork_delta(blobs), {"dropped": ["a"], "adopted": [], "kept": []})
+
+    def test_upstream_taking_the_fork_bytes_is_adopted_not_dropped(self):
+        blobs = {"a": ("fork", "fork", "fork")}
+        self.assertEqual(lib.fork_delta(blobs), {"dropped": [], "adopted": ["a"], "kept": []})
+
+    def test_merge_still_differing_from_upstream_is_kept(self):
+        blobs = {"a": ("fork", "up", "merged"), "b": ("fork", None, "fork")}
+        self.assertEqual(lib.fork_delta(blobs), {"dropped": [], "adopted": [], "kept": ["a", "b"]})
+
+    def test_fork_deletion_that_the_merge_brought_back_is_dropped(self):
+        blobs = {"a": (None, "up", "up")}
+        self.assertEqual(lib.fork_delta(blobs)["dropped"], ["a"])
+
+
+class HooksManifest(unittest.TestCase):
+    def test_diff_names_added_removed_and_changed_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d)
+            (p / "pre-push").write_text("one")
+            (p / "pre-commit").write_text("two")
+            before = lib.hooks_manifest(p)
+            (p / "pre-push").write_text("managed")
+            (p / "pre-commit").unlink()
+            (p / "pre-push.local").write_text("one")
+            diff = lib.hooks_diff(before, lib.hooks_manifest(p))
+        self.assertEqual(diff, {"added": ["pre-push.local"], "removed": ["pre-commit"], "changed": ["pre-push"]})
+
+    def test_unchanged_directory_has_empty_diff(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "pre-push").write_text("one")
+            m = lib.hooks_manifest(Path(d))
+            self.assertEqual(lib.hooks_diff(m, lib.hooks_manifest(Path(d))), {"added": [], "removed": [], "changed": []})
+
+
+class State(unittest.TestCase):
+    def test_passed_stages_survive_a_reload(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = lib.State.load(Path(d) / "state.json")
+            s.mark_passed("merge", sha="abc")
+            s.data["pins"] = {"origin": "1"}
+            s.save()
+            again = lib.State.load(Path(d) / "state.json")
+            self.assertTrue(again.passed("merge"))
+            self.assertFalse(again.passed("checks"))
+            self.assertEqual(again.data["pins"], {"origin": "1"})
+
+    def test_corrupt_state_file_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "state.json"
+            f.write_text("{not json")
+            with self.assertRaises(lib.SyncError):
+                lib.State.load(f)
+
+
+class RemoteSlug(unittest.TestCase):
+    def test_reads_owner_and_name_from_common_url_forms(self):
+        for url in ["http://host:3300/jfcadm/gstack.git", "git@host:jfcadm/gstack.git", "https://host/jfcadm/gstack"]:
+            self.assertEqual(lib.remote_slug(url), "jfcadm/gstack")
+
+
+class Report(unittest.TestCase):
+    def test_lists_blocking_items_first_and_keeps_every_section(self):
+        text = lib.render_report({
+            "upstream_version": "1.91.300.0", "stopped": "merge", "problems": ["CONFLICT: lib/x.ts"],
+            "sections": [("Merge", "conflicts in 1 file")],
+        })
+        self.assertIn("1.91.300.0", text)
+        self.assertLess(text.index("CONFLICT: lib/x.ts"), text.index("## Merge"))
+        self.assertIn("Stopped at stage `merge`", text)
+
+
+def git(cwd, *args, env=None):
+    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, env=env)
+    if r.returncode != 0:
+        raise AssertionError(f"git {' '.join(args)} failed: {r.stderr}")
+    return r.stdout.strip()
+
+
+class Integration(unittest.TestCase):
+    """Throwaway forge, upstream and clone; the CLI runs against them with an isolated git config."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.root = root
+        gitconfig = root / "gitconfig"
+        gitconfig.write_text("[user]\n\tname = Test\n\temail = test@example.invalid\n[init]\n\tdefaultBranch = main\n[commit]\n\tgpgsign = false\n")
+        self.env = {**os.environ, "GIT_CONFIG_GLOBAL": str(gitconfig), "GIT_CONFIG_NOSYSTEM": "1", "HOME": str(root / "home")}
+        self.env.pop("GIT_CONFIG_PARAMETERS", None)
+        (root / "home").mkdir()
+        self.upstream = root / "upstream.git"
+        self.forge = root / "forge.git"
+        git(root, "init", "-q", "--bare", str(self.upstream), env=self.env)
+        git(root, "init", "-q", "--bare", str(self.forge), env=self.env)
+        seed = root / "seed"
+        git(root, "init", "-q", str(seed), env=self.env)
+        (seed / "VERSION").write_text("1.0.0.0\n")
+        (seed / "shared.txt").write_text("base\n")
+        (seed / "fork.txt").write_text("base\n")
+        git(seed, "add", "VERSION", "shared.txt", "fork.txt", env=self.env)
+        git(seed, "commit", "-q", "-m", "base", env=self.env)
+        git(seed, "push", "-q", str(self.upstream), "main", env=self.env)
+        git(seed, "push", "-q", str(self.forge), "main", env=self.env)
+        self.repo = root / "live"
+        git(root, "clone", "-q", str(self.forge), str(self.repo), env=self.env)
+        git(self.repo, "remote", "add", "github", str(self.upstream), env=self.env)
+        self.run_dir = root / "run"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def commit_upstream(self, files, version):
+        work = self.root / f"up-{version}"
+        git(self.root, "clone", "-q", str(self.upstream), str(work), env=self.env)
+        for name, body in {**files, "VERSION": version + "\n"}.items():
+            (work / name).write_text(body)
+        git(work, "add", "-A", env=self.env)
+        git(work, "commit", "-q", "-m", f"v{version}", env=self.env)
+        git(work, "push", "-q", "origin", "main", env=self.env)
+
+    def commit_fork(self, files):
+        for name, body in files.items():
+            (self.repo / name).write_text(body)
+        git(self.repo, "add", *files, env=self.env)
+        git(self.repo, "commit", "-q", "-m", "fork change", env=self.env)
+        git(self.repo, "push", "-q", "origin", "main", env=self.env)
+
+    def run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, str(CLI), "--repo", str(self.repo), "--run-dir", str(self.run_dir), "--mirror", str(self.forge), *args],
+            capture_output=True, text=True, env=self.env, timeout=120)
+
+    def forge_refs(self):
+        return git(self.root, "ls-remote", str(self.forge), env=self.env)
+
+    def test_conflict_stops_before_push_and_names_the_path(self):
+        self.commit_fork({"shared.txt": "fork side\n"})
+        self.commit_upstream({"shared.txt": "upstream side\n"}, "1.1.0.0")
+        before = self.forge_refs()
+        r = self.run_cli("--until", "pr")
+        self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+        self.assertEqual(self.forge_refs(), before)
+        report = (self.run_dir / "report.md").read_text()
+        self.assertIn("shared.txt", report)
+        self.assertIn("Stopped at stage `merge`", report)
+
+    def test_resume_after_a_hand_resolved_merge_passes_merge_and_fork_delta(self):
+        self.commit_fork({"shared.txt": "fork side\n", "fork.txt": "fork only\n"})
+        self.commit_upstream({"shared.txt": "upstream side\n"}, "1.1.0.0")
+        self.assertEqual(self.run_cli("--until", "fork-delta").returncode, 10)
+        merge = self.run_dir / "merge"
+        (merge / "shared.txt").write_text("both sides\n")
+        git(merge, "add", "shared.txt", env=self.env)
+        git(merge, "commit", "-q", "--no-edit", env=self.env)
+        r = self.run_cli("--until", "fork-delta")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("fork.txt", (self.run_dir / "report.md").read_text())
+
+    def test_resolving_a_conflict_to_upstream_bytes_is_caught_as_a_dropped_fork_change(self):
+        self.commit_fork({"shared.txt": "fork side\n"})
+        self.commit_upstream({"shared.txt": "upstream side\n"}, "1.1.0.0")
+        self.run_cli("--until", "fork-delta")
+        merge = self.run_dir / "merge"
+        git(merge, "checkout", "--theirs", "--", "shared.txt", env=self.env)
+        git(merge, "add", "shared.txt", env=self.env)
+        git(merge, "commit", "-q", "--no-edit", env=self.env)
+        r = self.run_cli("--until", "fork-delta")
+        self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+        self.assertIn("dropped", (self.run_dir / "report.md").read_text().lower())
+
+    def test_live_checkout_is_left_on_its_branch_and_unchanged(self):
+        self.commit_upstream({"other.txt": "new\n"}, "1.1.0.0")
+        (self.repo / "untracked-note").write_text("mine\n")
+        before = (git(self.repo, "rev-parse", "HEAD", env=self.env), git(self.repo, "status", "--porcelain", env=self.env))
+        r = self.run_cli("--until", "fork-delta")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        after = (git(self.repo, "rev-parse", "HEAD", env=self.env), git(self.repo, "status", "--porcelain", env=self.env))
+        self.assertEqual(after, before)
+        self.assertEqual(git(self.repo, "branch", "--show-current", env=self.env), "main")
+
+    def test_nothing_to_sync_exits_cleanly_without_a_worktree(self):
+        r = self.run_cli("--until", "pr")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("nothing to sync", r.stdout.lower())
+        self.assertFalse((self.run_dir / "merge").exists())
+
+    def test_forge_and_mirror_out_of_step_stops_at_preflight(self):
+        other = self.root / "mirror.git"
+        git(self.root, "clone", "-q", "--bare", str(self.upstream), str(other), env=self.env)
+        self.commit_fork({"fork.txt": "fork only\n"})
+        self.commit_upstream({"other.txt": "new\n"}, "1.1.0.0")
+        r = subprocess.run(
+            [sys.executable, str(CLI), "--repo", str(self.repo), "--run-dir", str(self.run_dir), "--mirror", str(other), "--until", "merge"],
+            capture_output=True, text=True, env=self.env, timeout=120)
+        self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+        self.assertIn("mirror", (self.run_dir / "report.md").read_text().lower())
+        self.assertFalse((self.run_dir / "merge").exists())
+
+    def test_second_run_while_locked_exits_3(self):
+        self.run_dir.mkdir(parents=True)
+        (self.run_dir / "lock").write_text(str(os.getpid()))
+        self.commit_upstream({"other.txt": "new\n"}, "1.1.0.0")
+        r = self.run_cli("--until", "merge")
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()
