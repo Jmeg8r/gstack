@@ -38,6 +38,16 @@ The report (`report.md` in the run directory, also printed) says what to fix and
 - **Conflicts:** resolve per hunk (`git checkout -m <file>`, then edit the markers), never with a whole-file `--ours` or `--theirs`. Then commit the merge.
 - **An intended drop** (upstream replaced the fork's change): re-run with `--accept-dropped <path>`; the report lists it as dropped on purpose.
 
+### Abandoning a run
+
+A run pins the upstream and forge SHAs it started with, and resuming keeps them. To start over on a newer upstream instead, remove the run's worktrees, its local branch and its directory:
+
+```bash
+git worktree remove --force <run dir>/merge   # and <run dir>/upstream, <run dir>/baseline if present
+git branch -D upgrade/sync-v<VERSION>
+rm -r <run dir>
+```
+
 ### Options
 
 | Option | Default |

@@ -233,7 +233,7 @@ class Sync:
         if code != 0 or "none new" not in out:
             raise Stop("checks", [f"`bun run typecheck:test` reported new diagnostics (exit {code}):\n```\n{out.strip()[-1500:]}\n```"])
         ratchet = next((ln.strip() for ln in out.splitlines() if "none new" in ln), "")
-        self.passed("checks", f"`bun install`, `build:cso`, `gen:skill-docs` (no drift), `typecheck` clean, test typecheck ratchet: {ratchet}")
+        self.passed("checks", f"`bun install`, `build:cso`, `gen:skill-docs` (no drift), `typecheck` clean. {ratchet}")
 
     def prepared_worktree(self, name, rev):
         wt = self.run_dir / name
