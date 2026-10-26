@@ -170,7 +170,7 @@ function adversarialStructuredReview(ctx: TemplateContext, isShip: boolean): str
 
 If \`CODEX_MODE\` is \`ready\` or \`unverified\` and either \`DIFF_TOTAL >= 200\` or the user requested the override above:
 
-Prepare a structured review prompt requesting severity-tagged findings ([P0]-[P3]) or a final line of only NO_FINDINGS. Preserve the base-branch scope including committed changes and working-tree changes.
+Prepare a structured review prompt requesting severity-tagged findings ([P0]-[P3]) or a final line with only NO_FINDINGS. Preserve the base-branch scope including committed changes and working-tree changes.
 
 ${outsideVoiceInvocation(ctx, { timeoutMs: 540000, nativeAlreadyRequired: true, structuredBase: '<base>', gate: 'structured', diffCommand: 'DIFF_BASE=$(git merge-base <base> HEAD) && git diff "$DIFF_BASE"' })}
 
