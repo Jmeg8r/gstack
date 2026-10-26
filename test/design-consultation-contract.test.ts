@@ -44,7 +44,7 @@ test('creative wording leaves the review and scoring gates intact', () => {
 // Fork rule: the structured validator needs a standalone NO_FINDINGS line, so
 // every structured prompt producer must ask for exactly that.
 test('structured prompts request the standalone NO_FINDINGS line the validator requires', () => {
-  const marker = 'a final line of only NO_FINDINGS';
+  const marker = 'a final line with only NO_FINDINGS';
   for (const { name: host } of ALL_HOST_CONFIGS) {
     expect(outsideVoiceInvocation(context(host, 'review'), { timeoutMs: 300000, gate: 'structured' })).toContain(marker);
   }

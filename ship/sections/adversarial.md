@@ -172,7 +172,7 @@ For other modes, retain the native pass above; do not dispatch it again.
 
 If `CODEX_MODE` is `ready` or `unverified` and either `DIFF_TOTAL >= 200` or the user requested the override above:
 
-Prepare a structured review prompt requesting severity-tagged findings ([P0]-[P3]) or a final line of only NO_FINDINGS. Preserve the base-branch scope including committed changes and working-tree changes.
+Prepare a structured review prompt requesting severity-tagged findings ([P0]-[P3]) or a final line with only NO_FINDINGS. Preserve the base-branch scope including committed changes and working-tree changes.
 
 Run Codex’s built-in structured review with the selected base. It supplies its own prompt and accepts no custom prompt file with --base. Require severity-tagged findings (including native P1:/P2: labels) or an explicit no-findings conclusion; arbitrary prose or a refusal is missing coverage.
 
