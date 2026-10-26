@@ -66,6 +66,8 @@ No vendored files in your repo, no version drift, no manual upgrades. Every Clau
 
 Swap `required` for `optional` if you'd rather nudge teammates than block them.
 
+`required` blocks skills with a hook that runs on [Node.js](https://nodejs.org/), so every teammate needs Node.js on PATH, on every OS. With Claude Code 2.1.295 or later the hook also blocks when it can't run (no Node.js, or a missing `.claude/hooks/check-gstack.cjs`); older Claude Code lets skills through in that case.
+
 ### OpenClaw
 
 OpenClaw spawns Claude Code sessions via ACP, so every gstack skill just works
@@ -299,7 +301,7 @@ Each skill feeds into the next. `/office-hours` writes a design doc that `/plan-
 | `/qa` | **QA Lead** | Explore browser, API, CLI, job and webhook behavior. Reproduce bugs, write failing regressions, fix the cause and re-verify before committing. |
 | `/qa-only` | **QA Reporter** | Explore and report with replayable evidence. Suggest regression cases without changing product code or tests. |
 | `/pair-agent` | **Multi-Agent Coordinator** | Share gstack's own browser with any AI agent. One command, one paste, connected. Works with OpenClaw, Hermes, Codex, Cursor, or anything that can curl. Each agent gets its own tab. Auto-launches headed mode so you watch everything. Auto-starts ngrok tunnel for remote agents. Scoped tokens, tab isolation, rate limiting, activity attribution. (Runs on the bundled browser — the fallback engine; agents driving Aside just open their own tabs.) |
-| `/cso` | **Chief Security Officer** | Security audit with an application model, supported findings, independent challenge, and explicit coverage. Static assessment remains available without catalog profiles. With matching qualified profiles, comprehensive mode adds contained runtime/scanner execution and reviewable repair candidates for Node/Bun, Python, and Rails; no qualified runtime or scanner profile is published yet, so audits run static assessment only. Runtime-tested bundles authenticate separate external assertions. Project-test completion remains `self_reported` because target code controls the test process; `tested` is reserved for a future target-independent completion witness. |
+| `/cso` | **Chief Security Officer** | Security audit with an application model, supported findings, independent challenge, and explicit coverage. Static assessment remains available without catalog profiles. With matching qualified profiles, comprehensive mode adds contained runtime/scanner execution and reviewable repair candidates for Node/Bun, Python, and Rails. Qualified runtime and scanner images are published for linux/amd64 and linux/arm64. Without Docker, audits run static assessment only. Runtime-tested bundles authenticate separate external assertions. Project-test completion remains `self_reported` because target code controls the test process; `tested` is reserved for a future target-independent completion witness. |
 | `/ship` | **Release Engineer** | Sync main, run tests, explore changed behavior, audit coverage, gate integrity and docs, then verify, push and open a PR. |
 | `/land-and-deploy` | **Release Engineer** | Merge the PR, wait for CI and deploy, verify production health. One command from "approved" to "verified in production." |
 | `/canary` | **SRE** | Post-deploy monitoring loop. Watches for console errors, performance regressions, and page failures. |
@@ -513,9 +515,18 @@ The sprint structure is what makes parallelism work. Without a process, ten agen
 
 ### Voice input (AquaVoice, Whisper, etc.)
 
-gstack skills have voice-friendly trigger phrases. Say what you want naturally —
-"run a security check", "test the website", "do an engineering review" — and the
-right skill activates. You don't need to remember slash command names or acronyms.
+Many gstack skills list speech-to-text aliases (`voice-triggers:` in their
+templates): "security check" for `/cso`, "run QA" or "test the app" for `/qa`,
+"tech review" for `/plan-eng-review`. Say one of those naturally and the right
+skill can be picked without the slash command name. On Claude Code the aliases
+are routing lines in the root `/gstack` router; on Codex and the other hosts
+they are appended to each skill's description, which is what those hosts match
+on.
+
+The separate `triggers:` list in a skill's frontmatter is gstack metadata, not a
+matching surface. Claude Code and Codex choose a skill from its name and
+description, so a phrase that appears only under `triggers:` does not activate
+the skill (Codex output drops the field; the GBrain host keeps it).
 
 ## Uninstall
 
