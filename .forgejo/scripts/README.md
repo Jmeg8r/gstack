@@ -26,7 +26,7 @@ bin/gstack-detach --label fork-sync -- .forgejo/scripts/fork-sync
 | `merge` | `git merge --no-ff` of upstream into `upgrade/sync-v<VERSION>` conflicts, or the worktree has uncommitted changes. |
 | `fork-delta` | A file the fork changed now matches upstream although upstream never took the fork's version (a dropped fork change). |
 | `checks` | `bun install`, `build:cso`, `gen:skill-docs` (or it leaves drift), `typecheck`, or `typecheck:test` (new diagnostics) fails. |
-| `suite` | The runner reports an unfinished run (a killed shard, a missing summary, unhandled errors, failures without names), or a failure no repo test accounts for (a home-containment leak, an unattributed line), or a test fails on the merge in every run but never on pure upstream or the pre-sync fork (`fork-caused`). Pre-existing, flaky, not-reproduced and upstream failures are reported only. Each file is rerun alone with an exact absolute selector, and the run must report exactly one file. |
+| `suite` | The free suite runs through the runner's own CI mode (`--ci-plan`, then `--ci-run` per shard, the tree-mutating shard alone and last, then `--ci-verify`). It stops when a shard result is missing, duplicate or foreign, has an incomplete summary or timed out; when a failure no named test explains (for example home containment outside the agent-host writer list) is present without `--accept-unaccounted`; or when a test fails on the merge in every run but never on pure upstream or the pre-sync fork (`fork-caused`). Pre-existing, flaky, not-reproduced and upstream failures are reported only. |
 | `codex` | The Codex review gate is FAIL (P0/P1, or the review didn't run). PASS and UNVERIFIED continue, and the verdict is posted verbatim. |
 | `hooks-verify` | The global hooks directory changed during the run. It is never restored automatically; the report gives the restore command. |
 | `pr` | The live checkout changed, forge `main` moved, the mirror differs, or the push or `forge-pr create` fails. |
@@ -53,12 +53,14 @@ rm -r <run dir>
 | Option | Default |
 |---|---|
 | `--until merge\|fork-delta\|checks\|suite\|codex\|pr` | `pr` |
+| `--shards N` (concurrent shards in the runner's CI plan) | 6 |
 | `--reruns N` (extra standalone reruns where the merge fails more than upstream) | 3 |
 | `--run-dir PATH` | `~/.gstack-dev/fork-sync/v<upstream VERSION>-<upstream sha>`, or the one unfinished run if there is one. A finished run is never resumed. |
 | `--mirror URL` (or `FORK_SYNC_MIRROR`) | `https://github.com/Jmeg8r/gstack.git` |
 | `--accept-dropped PATH` (repeatable) | none |
 | `--accept-unaccounted` (continue past suite failures no named test accounts for, each listed in the report) | off |
 | `GSTACK_SKILL_ROOT` (where the Codex probe and validator live) | `~/.claude/skills/gstack` |
+| `FORK_SYNC_EXTERNAL_HOME_WRITERS` (colon-separated globs of real-home paths agent hosts write while the suite runs; containment failures touching only these are reported, not blocking) | Claude Code's `.claude.json` backups, session files and `~/.claude/state/*`; the Codex app's SQLite journal, shell snapshots and locks |
 
 ### Exit codes
 

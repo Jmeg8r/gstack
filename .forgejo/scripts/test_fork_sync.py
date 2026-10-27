@@ -4,6 +4,7 @@
 #       problem, so the stop paths are what the integration tests exercise.
 # Run:  python3 -m unittest discover -s .forgejo/scripts -p 'test_*.py' -v
 
+import json
 import os
 import subprocess
 import time
@@ -20,53 +21,95 @@ import fork_sync_lib as lib  # noqa: E402
 CLI = HERE / "fork-sync"
 
 
-class ParseFreeLog(unittest.TestCase):
-    def test_collects_failing_files_from_both_line_forms(self):
-        log = "\n".join([
-            "[test:free] shard 2/6",
-            "  ✗ test/a.test.ts — suite > case one",
-            "  ✗ test/a.test.ts — suite > case two",
-            "  ✗ browse/test/b.test.ts (crashed: exited)",
-            "[test:free] FAIL — 3 failing test(s) in 2 file(s), 0 crashed worker(s).",
-        ])
-        self.assertEqual(lib.parse_free_log(log), ({
-            "test/a.test.ts": {"test/a.test.ts :: suite > case one", "test/a.test.ts :: suite > case two"},
-            "browse/test/b.test.ts": {"browse/test/b.test.ts :: <crashed>"},
-        }, []))
 
-    def test_clean_run_has_no_failing_files(self):
-        self.assertEqual(lib.parse_free_log("[test:free] PASS — 36 tests, 1 files, 0s."), ({}, []))
 
-    def test_home_containment_failures_are_returned_even_beside_named_failures(self):
-        log = ("  ✗ test/a.test.ts — g > a\n"
-               "[test:free] shard 2/6 shard cleanup or home containment failed: real home changed: ~/.codex/x; retained /tmp/s\n")
-        failures, diagnostics = lib.parse_free_log(log)
-        self.assertEqual(set(failures), {"test/a.test.ts"})
-        self.assertEqual(len(diagnostics), 1)
-        self.assertIn("home containment failed", diagnostics[0])
+PLAN = {"id": "plan-1", "revision": "rev-1", "version": 1, "shards": [
+    {"shard": 1, "files": ["test/a.test.ts", "test/b.test.ts"], "predictedMs": 1},
+    {"shard": 2, "files": ["test/c.test.ts"], "predictedMs": 1},
+    {"shard": 3, "files": ["test/tree.test.ts"], "predictedMs": 1}]}
 
-    def test_concurrent_phase_home_changes_are_diagnostics_too(self):
-        log = ("  ✗ test/a.test.ts — g > a\n"
-               "[test:free] real home changed while 6 shards ran concurrently (watches ~/.codex): ~/.codex/x. They share one HOME\n")
-        self.assertEqual(len(lib.parse_free_log(log)[1]), 1)
 
-    def test_runner_incompleteness_markers_fail_closed_even_beside_named_failures(self):
-        named = "  ✗ test/a.test.ts — suite > case\n"
-        for marker in ["  ⚠ 2 failure(s) reported without named result lines",
-                       "  ⚠ unhandled error between tests (around test/b.test.ts)",
-                       "  ⚠ test process ended before its summary; in flight: test/c.test.ts",
-                       "  ⏱ in flight at kill: test/c.test.ts",
-                       "[test:free] shard 3/6 exceeded the 845s wall-clock deadline — killed",
-                       "[test:free] shard 1/6 exited 0 but bun's summary reported 11 file(s), expected 12. Treating as FAILED."]:
-            with self.assertRaises(lib.SyncError, msg=marker):
-                lib.parse_free_log(named + marker)
+def result(shard, status="passed", failing=(), unattributed=0, files_ran=None, failures=(), plan_id="plan-1", revision="rev-1", saw=True):
+    files = next(s["files"] for s in PLAN["shards"] if s["shard"] == shard)
+    return {"planId": plan_id, "revision": revision, "retry": None, "outcome": {
+        "shard": shard, "files": files, "status": status, "exitCode": 0 if status == "passed" else 1, "elapsedMs": 1, "groupPid": 1,
+        "summary": {"testsRan": 5, "filesRan": len(files) if files_ran is None else files_ran, "sawTerminalSummary": saw},
+        "failingFiles": list(failing), "unattributedFailures": unattributed,
+        "failures": [{"file": f, "testName": n, "excerpt": []} for f, n in failures]}}
 
-    def test_a_crash_that_passed_on_retry_is_not_incomplete(self):
-        self.assertEqual(lib.parse_free_log("  ⚠ crashed+retried: test/d.test.ts\n[test:free] PASS — 3 tests, 1 files, 0s."), ({}, []))
 
-    def test_reported_failures_without_attributable_lines_fail_closed(self):
-        with self.assertRaises(lib.SyncError):
-            lib.parse_free_log("[test:free] FAIL — 4 failing test(s) in 2 file(s), 0 crashed worker(s).")
+EXTERNAL = ["~/.claude/backups/.claude.json.backup.*", "~/.codex/*.sqlite-wal"]
+CONTAIN = ("[test:free] shard {i}/3 shard cleanup or home containment failed: real home changed while this shard ran "
+           "(watches ~/.gstack, ~/.claude, ~/.codex, ~/.agents, ~/.config/gstack only): {paths}. Give the writer a private HOME. Shard files: x; retained /tmp/s")
+
+
+class AssessCiResults(unittest.TestCase):
+    def assess(self, results, logs=None):
+        return lib.assess_ci_results(PLAN, results, logs or {}, EXTERNAL)
+
+    def test_all_passing_shards_have_nothing_to_compare(self):
+        a = self.assess([result(1), result(2), result(3)])
+        self.assertEqual((a["problems"], a["unaccounted"], a["failing_files"]), ([], [], []))
+
+    def test_named_failures_go_to_the_comparison_with_their_test_names(self):
+        a = self.assess([result(1, "failed", ["test/b.test.ts"], failures=[("test/b.test.ts", "g > x")]), result(2), result(3)])
+        self.assertEqual(a["problems"], [])
+        self.assertEqual(a["failing_files"], ["test/b.test.ts"])
+        self.assertEqual(a["failures"], {"test/b.test.ts": {"test/b.test.ts :: g > x"}})
+
+    def test_a_missing_shard_result_is_a_hard_problem(self):
+        self.assertTrue(self.assess([result(1), result(3)])["problems"])
+
+    def test_a_duplicate_or_foreign_result_is_a_hard_problem(self):
+        self.assertTrue(self.assess([result(1), result(1), result(2), result(3)])["problems"])
+        self.assertTrue(self.assess([result(1, plan_id="other"), result(2), result(3)])["problems"])
+        self.assertTrue(self.assess([result(1, revision="rev-0"), result(2), result(3)])["problems"])
+
+    def test_an_incomplete_summary_is_a_hard_problem(self):
+        self.assertTrue(self.assess([result(1, files_ran=1), result(2), result(3)])["problems"])
+        self.assertTrue(self.assess([result(1, saw=False), result(2), result(3)])["problems"])
+
+    def test_a_timed_out_shard_is_a_hard_problem(self):
+        self.assertTrue(self.assess([result(1, "timed-out"), result(2), result(3)])["problems"])
+
+    def test_a_failing_file_outside_the_shard_is_a_hard_problem(self):
+        self.assertTrue(self.assess([result(1, "failed", ["test/c.test.ts"]), result(2), result(3)])["problems"])
+
+    def test_a_failure_with_no_attribution_at_all_is_unaccounted(self):
+        a = self.assess([result(1, "failed"), result(2), result(3)])
+        self.assertEqual(a["problems"], [])
+        self.assertEqual(len(a["unaccounted"]), 1)
+
+    def test_containment_touching_only_external_writer_paths_is_environmental(self):
+        log = CONTAIN.format(i=1, paths="~/.claude/backups/.claude.json.backup.1792, ~/.codex/state_5.sqlite-wal")
+        a = self.assess([result(1, "failed", ["test/b.test.ts"], 1), result(2), result(3)], {1: log})
+        self.assertEqual(a["unaccounted"], [])
+        self.assertEqual(len(a["environmental"]), 1)
+        self.assertEqual(a["failing_files"], ["test/b.test.ts"])
+
+    def test_containment_touching_any_other_path_is_unaccounted(self):
+        log = CONTAIN.format(i=1, paths="~/.claude/backups/.claude.json.backup.1792, ~/.claude/settings.json")
+        self.assertEqual(len(self.assess([result(1, "failed", [], 1), result(2), result(3)], {1: log})["unaccounted"]), 1)
+
+    def test_a_truncated_path_list_is_unaccounted(self):
+        log = CONTAIN.format(i=1, paths="~/.claude/backups/.claude.json.backup.1792 (+93 more)")
+        self.assertEqual(len(self.assess([result(1, "failed", [], 1), result(2), result(3)], {1: log})["unaccounted"]), 1)
+
+    def test_more_unattributed_failures_than_containment_lines_is_unaccounted(self):
+        log = CONTAIN.format(i=1, paths="~/.codex/state_5.sqlite-wal")
+        self.assertEqual(len(self.assess([result(1, "failed", [], 2), result(2), result(3)], {1: log})["unaccounted"]), 1)
+
+    def test_a_containment_line_for_another_shard_does_not_count(self):
+        log = CONTAIN.format(i=2, paths="~/.codex/state_5.sqlite-wal")
+        self.assertEqual(len(self.assess([result(1, "failed", [], 1), result(2), result(3)], {1: log})["unaccounted"]), 1)
+
+
+class ExclusiveShards(unittest.TestCase):
+    def test_a_shard_made_only_of_tree_mutating_files_runs_alone(self):
+        self.assertEqual(lib.exclusive_shards(PLAN, {"test/tree.test.ts": "mutates the tree"}), [3])
+
+    def test_a_mixed_shard_is_not_exclusive(self):
+        self.assertEqual(lib.exclusive_shards(PLAN, {"test/a.test.ts": "x"}), [])
 
 
 class ParseBunFails(unittest.TestCase):
@@ -167,34 +210,6 @@ class BlockingDirty(unittest.TestCase):
         self.assertEqual(lib.blocking_dirty([" M .gitignore"]), [" M .gitignore"])
 
 
-class SuiteCompleted(unittest.TestCase):
-    PLAN = "[test:free] full suite: 30 files across 2 shard processes (duration-packed), then 1 exclusive host-state file(s) serially\n"
-    SHARDS = "[test:free] shard 2/3: 15 files, 9s, fail\n[test:free] shard 1/3: 14 files, 8s, pass\n[test:free] shard 3/3: 1 files, 0s, pass\n"
-    EPILOGUE = PLAN + "  ✗ test/a.test.ts — g > a\n[test:free] FAIL — 1 failing test(s) in 1 file(s), 0 crashed worker(s). Full log: x\n" + SHARDS
-
-    def test_normal_failing_exit_with_the_epilogue_is_complete(self):
-        lib.suite_completed(1, self.EPILOGUE)
-
-    def test_killed_runner_is_incomplete_even_with_a_named_failure(self):
-        with self.assertRaises(lib.SyncError):
-            lib.suite_completed(-9, self.EPILOGUE)
-
-    def test_a_planned_shard_without_its_result_line_is_incomplete(self):
-        with self.assertRaises(lib.SyncError):
-            lib.suite_completed(1, self.EPILOGUE.replace("[test:free] shard 3/3: 1 files, 0s, pass\n", ""))
-
-    def test_no_plan_line_is_incomplete(self):
-        with self.assertRaises(lib.SyncError):
-            lib.suite_completed(1, self.EPILOGUE.replace(self.PLAN, ""))
-
-    def test_plan_without_an_exclusive_phase_counts_only_the_concurrent_shards(self):
-        out = ("[test:free] full suite: 30 files across 2 shard processes (duration-packed)\n"
-               "[test:free] PASS — 9 tests, 30 files, 9s.\n[test:free] shard 1/2: 15 files, 9s, pass\n[test:free] shard 2/2: 15 files, 9s, pass\n")
-        lib.suite_completed(0, out)
-
-    def test_missing_epilogue_is_incomplete(self):
-        with self.assertRaises(lib.SyncError):
-            lib.suite_completed(1, "  ✗ test/a.test.ts — g > a\n")
 
 
 class DotenvFiles(unittest.TestCase):
@@ -370,7 +385,9 @@ class Integration(unittest.TestCase):
         (seed / "VERSION").write_text("1.0.0.0\n")
         (seed / "shared.txt").write_text("base\n")
         (seed / "fork.txt").write_text("base\n")
-        git(seed, "add", "VERSION", "shared.txt", "fork.txt", env=self.env)
+        (seed / "test").mkdir()
+        (seed / "test" / "a.test.ts").write_text("// stub\n")
+        git(seed, "add", "VERSION", "shared.txt", "fork.txt", "test/a.test.ts", env=self.env)
         git(seed, "commit", "-q", "-m", "base", env=self.env)
         git(seed, "push", "-q", str(self.upstream), "main", env=self.env)
         git(seed, "push", "-q", str(self.forge), "main", env=self.env)
@@ -498,32 +515,6 @@ class Integration(unittest.TestCase):
         self.assertTrue((self.root / "rel-run" / "merge" / "VERSION").is_file())
         self.assertTrue((self.root / "rel-run" / "report.md").is_file())
 
-    def test_suite_with_a_killed_shard_stops_even_though_another_shard_named_a_failure(self):
-        """End to end through `checks` and `suite`, with a stub bun on PATH: one shard
-        names a failure while another was killed at its deadline."""
-        stub = self.root / "stub-bin"
-        stub.mkdir()
-        (stub / "bun").write_text(
-            "#!/bin/sh\n"
-            f'echo "$*" >> "{self.root}/bun-calls.log"\n'
-            'case "$*" in\n'
-            '  "--no-env-file run test --verbose") printf \'  ✗ test/a.test.ts — g > a\\n  ⏱ in flight at kill: test/b.test.ts\\n\'; exit 1;;\n'
-            '  "--no-env-file run typecheck:test") echo "test typecheck ratchet: 0 known diagnostics, none new."; exit 0;;\n'
-            "  *) exit 0;;\n"
-            "esac\n")
-        (stub / "bun").chmod(0o755)
-        self.commit_upstream({"other.txt": "new\n"}, "1.1.0.0")
-        env = {**self.env, "PATH": f"{stub}:{os.environ['PATH']}"}
-        r = subprocess.run([sys.executable, str(CLI), "--repo", str(self.repo), "--run-dir", str(self.run_dir), "--mirror", str(self.forge), "--until", "suite"],
-                           capture_output=True, text=True, env=env, timeout=120)
-        self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
-        report = (self.run_dir / "report.md").read_text()
-        self.assertIn("Stopped at stage `suite`", report)
-        self.assertIn("in flight at kill", report)
-        calls = (self.root / "bun-calls.log").read_text().splitlines()
-        self.assertGreaterEqual(len(calls), 6)
-        self.assertTrue(all(c.startswith("--no-env-file ") for c in calls), calls)
-
     def test_dotenv_file_in_the_merge_worktree_stops_before_checks(self):
         self.commit_upstream({"other.txt": "new\n"}, "1.1.0.0")
         self.assertEqual(self.run_cli("--until", "fork-delta").returncode, 0)
@@ -541,6 +532,116 @@ class Integration(unittest.TestCase):
         r = self.run_cli("--until", "pr")
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("finished", r.stdout.lower())
+
+    STUB = r"""#!{python}
+import json, os, sys
+calls = os.environ["FAKE_CALLS"]
+with open(calls, "a") as f:
+    f.write(" ".join(sys.argv[1:]) + "\n")
+sc = json.load(open(os.environ["FAKE_CI"]))
+a = [x for x in sys.argv[1:] if x not in ("--no-env-file", "--config=/dev/null")]
+def flag(name):
+    return a[a.index(name) + 1]
+if a[:1] == ["-e"]:
+    print(json.dumps(sc.get("tree_mutating", []))); sys.exit(0)
+if a[:2] == ["run", "scripts/test-free-shards.ts"]:
+    if "--ci-plan" in a:
+        json.dump({{"id": "p1", "revision": "r1", "version": 1, "shards": sc["shards"]}}, open(flag("--ci-plan"), "w")); sys.exit(0)
+    if "--ci-run" in a:
+        n = flag("--shard"); r = sc["results"].get(n)
+        print(sc.get("logs", {{}}).get(n, ""))
+        if r is None:
+            sys.exit(1)
+        json.dump({{"planId": "p1", "revision": "r1", "retry": None, "outcome": r}}, open(flag("--result"), "w"))
+        sys.exit(0 if r["status"] == "passed" else 1)
+    if "--ci-verify" in a:
+        print("[test:free] verify (stub)"); sys.exit(sc["verify_exit"])
+if a[:2] == ["run", "typecheck:test"]:
+    print("test typecheck ratchet: 0 known diagnostics, none new."); sys.exit(0)
+if a[:1] == ["test"]:
+    path = a[1]; tree = next((t for t in ("merge", "upstream", "baseline") if "/" + t + "/" in path), "?")
+    fails = sc.get("standalone", {{}}).get(tree, [])
+    for name in fails:
+        print("(fail) " + name + " [1.00ms]")
+    print(" 1 pass\n " + str(len(fails)) + " fail\nRan " + str(1 + len(fails)) + " tests across 1 file. [5.00ms]")
+    sys.exit(1 if fails else 0)
+sys.exit(0)
+"""
+
+    def outcome(self, shard, files, status="passed", failing=(), unattributed=0, failures=()):
+        return {"shard": shard, "files": list(files), "status": status, "exitCode": 0 if status == "passed" else 1, "elapsedMs": 1, "groupPid": 1,
+                "summary": {"testsRan": 3, "filesRan": len(files), "sawTerminalSummary": True},
+                "failingFiles": list(failing), "unattributedFailures": unattributed,
+                "failures": [{"file": f, "testName": n, "excerpt": []} for f, n in failures]}
+
+    def run_suite(self, scenario, *extra):
+        stub = self.root / "stub-bin"
+        stub.mkdir(exist_ok=True)
+        (stub / "bun").write_text(self.STUB.format(python=sys.executable))
+        (stub / "bun").chmod(0o755)
+        (self.root / "scenario.json").write_text(json.dumps(scenario))
+        self.commit_upstream({"other.txt": "new\n"}, "1.1.0.0")
+        env = {**self.env, "PATH": f"{stub}:{os.environ['PATH']}", "FAKE_CI": str(self.root / "scenario.json"), "FAKE_CALLS": str(self.root / "bun-calls.log")}
+        return subprocess.run([sys.executable, str(CLI), "--repo", str(self.repo), "--run-dir", str(self.run_dir), "--mirror", str(self.forge), "--until", "suite", *extra],
+                              capture_output=True, text=True, env=env, timeout=180)
+
+    SHARDS = [{"shard": 1, "files": ["test/a.test.ts"], "predictedMs": 1}, {"shard": 2, "files": ["test/tree.test.ts"], "predictedMs": 1}]
+
+    def test_ci_verify_pass_clears_the_suite_and_every_bun_call_ignores_dotenv(self):
+        r = self.run_suite({"shards": self.SHARDS, "tree_mutating": ["test/tree.test.ts"], "verify_exit": 0,
+                            "results": {"1": self.outcome(1, ["test/a.test.ts"]), "2": self.outcome(2, ["test/tree.test.ts"])}})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("`--ci-verify` passed", (self.run_dir / "report.md").read_text())
+        calls = (self.root / "bun-calls.log").read_text().splitlines()
+        self.assertTrue(calls and all(c.startswith("--no-env-file ") for c in calls), calls)
+        runs = [c for c in calls if "--ci-run" in c]
+        self.assertEqual(runs[-1].split("--shard ")[1].split()[0], "2", "the tree-mutating shard runs last, alone")
+
+    def test_a_shard_that_never_wrote_its_result_stops(self):
+        r = self.run_suite({"shards": self.SHARDS, "tree_mutating": ["test/tree.test.ts"], "verify_exit": 1,
+                            "results": {"1": self.outcome(1, ["test/a.test.ts"])}})
+        self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+        self.assertIn("shard 2 has no result", (self.run_dir / "report.md").read_text())
+
+    def test_a_timed_out_shard_stops_even_beside_a_named_failure(self):
+        r = self.run_suite({"shards": self.SHARDS, "tree_mutating": ["test/tree.test.ts"], "verify_exit": 1,
+                            "results": {"1": self.outcome(1, ["test/a.test.ts"], "failed", ["test/a.test.ts"], failures=[("test/a.test.ts", "g > a")]),
+                                        "2": self.outcome(2, ["test/tree.test.ts"], "timed-out")}})
+        self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+        self.assertIn("shard 2 timed out", (self.run_dir / "report.md").read_text())
+
+    def test_failure_on_upstream_too_with_agent_host_containment_passes_and_is_reported(self):
+        log = ("[test:free] shard 1/2 shard cleanup or home containment failed: real home changed while this shard ran (watches ~/.claude only): "
+               "~/.claude/backups/.claude.json.backup.1. Give the writer a private HOME. Shard files: x; retained /tmp/s")
+        r = self.run_suite({"shards": self.SHARDS, "tree_mutating": ["test/tree.test.ts"], "verify_exit": 1, "logs": {"1": log},
+                            "results": {"1": self.outcome(1, ["test/a.test.ts"], "failed", ["test/a.test.ts"], 1, [("test/a.test.ts", "g > a")]),
+                                        "2": self.outcome(2, ["test/tree.test.ts"])},
+                            "standalone": {"merge": ["g > a"], "upstream": ["g > a"], "baseline": ["g > a"]}})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        report = (self.run_dir / "report.md").read_text()
+        self.assertIn("| upstream | 1 | no |", report)
+        self.assertIn("agent-host writes", report)
+
+    def test_failure_only_on_the_merge_is_fork_caused_and_stops(self):
+        r = self.run_suite({"shards": self.SHARDS, "tree_mutating": ["test/tree.test.ts"], "verify_exit": 1,
+                            "results": {"1": self.outcome(1, ["test/a.test.ts"], "failed", ["test/a.test.ts"], failures=[("test/a.test.ts", "g > a")]),
+                                        "2": self.outcome(2, ["test/tree.test.ts"])},
+                            "standalone": {"merge": ["g > a"], "upstream": [], "baseline": []}})
+        self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+        self.assertIn("fork-caused failure", (self.run_dir / "report.md").read_text())
+
+    def test_containment_outside_agent_host_paths_stops_unless_accepted(self):
+        log = ("[test:free] shard 1/2 shard cleanup or home containment failed: real home changed while this shard ran (watches ~/.claude only): "
+               "~/.claude/settings.json. Give the writer a private HOME. Shard files: x; retained /tmp/s")
+        scenario = {"shards": self.SHARDS, "tree_mutating": ["test/tree.test.ts"], "verify_exit": 1, "logs": {"1": log},
+                    "results": {"1": self.outcome(1, ["test/a.test.ts"], "failed", [], 1), "2": self.outcome(2, ["test/tree.test.ts"])}}
+        r = self.run_suite(scenario)
+        self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+        self.assertIn("~/.claude/settings.json", (self.run_dir / "report.md").read_text())
+        r2 = subprocess.run([sys.executable, str(CLI), "--repo", str(self.repo), "--run-dir", str(self.run_dir), "--mirror", str(self.forge), "--until", "suite", "--accept-unaccounted"],
+                            capture_output=True, text=True, env={**self.env, "PATH": f"{self.root / 'stub-bin'}:{os.environ['PATH']}", "FAKE_CI": str(self.root / "scenario.json"), "FAKE_CALLS": str(self.root / "bun-calls.log")}, timeout=180)
+        self.assertEqual(r2.returncode, 0, r2.stdout + r2.stderr)
+        self.assertIn("passed on purpose with --accept-unaccounted", (self.run_dir / "report.md").read_text())
 
     def test_second_run_while_locked_exits_3(self):
         self.run_dir.mkdir(parents=True)

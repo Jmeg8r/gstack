@@ -3,6 +3,7 @@
 # WHY:  Everything here decides whether a sync may reach the forge, so it is kept free
 #       of subprocess calls and covered by test_fork_sync.py.
 
+import fnmatch
 import hashlib
 import json
 import re
@@ -15,50 +16,6 @@ STAGES = ["preflight", "hooks-backup", "merge", "fork-delta", "checks", "suite",
 
 class SyncError(Exception):
     """A condition the script must not continue past."""
-
-
-FAILED_TEST = re.compile(r"^  ✗ (\S+) — (.+)$")
-CRASHED_FILE = re.compile(r"^  ✗ (\S+) \(crashed: ")
-FAIL_SUMMARY = re.compile(r"^\[test:free\] FAIL — (\d+) failing test")
-# The runner's own markers for a run that did not finish or could not name what failed
-# (buildRunEpilogue in scripts/test-free-shards.ts). A crash that passed on its retry
-# is the one `⚠` line that still means the tests ran.
-INCOMPLETE = [re.compile(r"^  ⚠ (?!crashed\+retried: )"), re.compile(r"^  ⏱ "), re.compile(r"exceeded the \d+s wall-clock deadline"),
-              re.compile(r" exited 0 but .* Treating as FAILED")]
-# A shard whose tests ran but whose sandbox leaked into the real home. Not proof of
-# incomplete coverage, but not accounted for by any named test either.
-CONTAINMENT = re.compile(r" shard cleanup or home containment failed: |real home changed while |wrote its private HOME")
-
-
-def parse_free_log(text):
-    """Failing tests in a `bun run test --verbose` log, as ({file: {"file :: name"}},
-    [shard diagnostics]). Fails closed when the runner says a shard did not finish, a
-    failure has no named result, an error happened between tests, or failures are
-    reported but none named. Home-containment failures come back as diagnostics: the
-    caller must account for them, never ignore them."""
-    failures = {}
-    diagnostics = []
-    reported = 0
-    for line in text.splitlines():
-        if any(p.search(line) for p in INCOMPLETE):
-            raise SyncError(f"the free runner reports an incomplete or unattributed run: {line.strip()!r}; an unfinished suite cannot clear the gate")
-        if CONTAINMENT.search(line):
-            diagnostics.append(line.strip())
-            continue
-        m = FAILED_TEST.match(line)
-        if m:
-            failures.setdefault(m.group(1), set()).add(f"{m.group(1)} :: {TEMP_PATH.sub('', m.group(2)).strip()}")
-            continue
-        c = CRASHED_FILE.match(line)
-        if c:
-            failures.setdefault(c.group(1), set()).add(f"{c.group(1)} :: <crashed>")
-            continue
-        s = FAIL_SUMMARY.match(line)
-        if s:
-            reported += int(s.group(1))
-    if reported and not failures:
-        raise SyncError(f"the free runner reported {reported} failing test(s) but no line names a file; refusing to call the suite clean")
-    return failures, diagnostics
 
 
 BUN_FAIL = re.compile(r"^\(fail\) (.*?)(?: \[[0-9.]+m?s\])?$")
@@ -101,31 +58,6 @@ def parse_bun_run(test_file, exit_code, output):
     return names
 
 
-RUNNER_EPILOGUE = re.compile(r"^\[test:free\] (PASS|FAIL) — ", re.M)
-RUNNER_PLAN = re.compile(r"^\[test:free\] full suite: \d+ files across (\d+) shard processes[^\n]*?(?:, then (\d+) exclusive [^\n]*)?$", re.M)
-SHARD_RESULT = re.compile(r"^\[test:free\] shard (\d+)/(\d+): \d+ files, \d+s, (pass|fail|timed-out)$", re.M)
-
-
-def suite_completed(exit_code, output):
-    """The free runner itself must have finished: a normal exit (0 pass, 1 fail) and
-    its own PASS/FAIL epilogue. A killed runner can leave one shard's named failure
-    in the log while other shards never ran; that is not a result."""
-    if exit_code not in (0, 1):
-        raise SyncError(f"`bun run test` ended abnormally (exit {exit_code}); an interrupted suite cannot clear the gate")
-    if not RUNNER_EPILOGUE.search(output):
-        raise SyncError("`bun run test` printed no `[test:free] PASS|FAIL` epilogue; the runner did not finish")
-    # Each shard prints its own epilogue, so one shard's PASS/FAIL says nothing about
-    # the others: every planned shard must report a result line.
-    plan = RUNNER_PLAN.search(output)
-    if not plan:
-        raise SyncError("`bun run test` printed no `full suite: N files across S shard processes` plan line; cannot tell which shards had to run")
-    planned = int(plan.group(1)) + int(plan.group(2) or 0)
-    reported = {int(i) for i, n, _ in SHARD_RESULT.findall(output) if int(n) == planned}
-    missing = sorted(set(range(1, planned + 1)) - reported)
-    if missing:
-        raise SyncError(f"the free runner planned {planned} shard(s) but shard(s) {missing} printed no result; unstarted or unfinished shards are not coverage")
-
-
 # What bun auto-loads: .env, .env.local, .env.<NODE_ENV>, .env.<NODE_ENV>.local.
 # Templates such as the tracked .env.example are never loaded.
 DOTENV = re.compile(r"^\.env(\.(development|production|test))?(\.local)?$")
@@ -134,6 +66,111 @@ DOTENV = re.compile(r"^\.env(\.(development|production|test))?(\.local)?$")
 def dotenv_files(names):
     """Files bun would auto-load as dotenv from a working directory."""
     return sorted(n for n in names if DOTENV.match(n))
+
+
+# Paths a concurrently running agent host writes in its own home while the suite
+# runs (Claude Code's config backups, the Codex app's SQLite journal, shell
+# snapshots and locks). The runner's own volatile list misses these; override with
+# FORK_SYNC_EXTERNAL_HOME_WRITERS (colon-separated globs).
+DEFAULT_EXTERNAL_HOME_WRITERS = [
+    "~/.claude/backups/.claude.json.backup.*", "~/.claude/sessions/*.json", "~/.claude/state/*",
+    "~/.codex/*.sqlite-wal", "~/.codex/*.sqlite-shm",
+    "~/.codex/shell_snapshots/*", "~/.codex/thread-writer-locks/*",
+]
+CONTAINMENT_LINE = re.compile(r"^\[test:free\] shard (\d+)/\d+ shard cleanup or home containment failed: real home changed while this shard ran \([^)]*\): (.*?)\. Give the writer", re.M)
+
+
+def containment_paths(log_text, shard):
+    """Path lists from the runner's own containment-failure lines for one shard, as
+    printed by that shard's --ci-run process. None for a list the runner truncated."""
+    out = []
+    for m in CONTAINMENT_LINE.finditer(log_text):
+        if int(m.group(1)) != shard:
+            continue
+        listed = m.group(2)
+        out.append(None if re.search(r"\(\+\d+ more\)", listed) else [p.strip() for p in listed.split(", ") if p.strip()])
+    return out
+
+
+def is_external_writer(path, patterns):
+    return any(fnmatch.fnmatchcase(path, pat) for pat in patterns)
+
+
+def exclusive_shards(plan, tree_mutating):
+    """Shards made only of files the runner marks tree-mutating: they run alone."""
+    return [s["shard"] for s in plan["shards"] if s["files"] and all(f in tree_mutating for f in s["files"])]
+
+
+def assess_ci_results(plan, results, shard_logs, external_patterns):
+    """Judge `--ci-run` results that `--ci-verify` rejected.
+
+    problems      results that are not evidence: missing, duplicate or foreign
+                  results, incomplete summaries, timeouts, inconsistent files (hard stop)
+    unaccounted   failures no named test explains (stop unless accepted)
+    environmental containment failures touching only external agent-host paths
+    failing_files files with named failures, for the paired comparison
+    failures      {file: {"file :: test name"}} from the runner's named failures"""
+    problems, unaccounted, environmental = [], [], []
+    failing, failures = set(), {}
+    by_shard = {}
+    for r in results:
+        o = r.get("outcome") or {}
+        n = o.get("shard")
+        if r.get("planId") != plan["id"] or r.get("revision") != plan["revision"]:
+            problems.append(f"result for shard {n} belongs to another plan or revision")
+            continue
+        if n in by_shard:
+            problems.append(f"duplicate result for shard {n}")
+            continue
+        by_shard[n] = o
+    for shard in plan["shards"]:
+        n, files = shard["shard"], shard["files"]
+        o = by_shard.get(n)
+        if o is None:
+            problems.append(f"shard {n} has no result; it did not run or did not finish")
+            continue
+        if o.get("files") != files:
+            problems.append(f"shard {n} ran a different file set than planned")
+            continue
+        summary = o.get("summary") or {}
+        complete = isinstance(summary.get("testsRan"), int) and summary["testsRan"] >= 0 and summary.get("filesRan") == len(files) \
+            and (summary.get("sawTerminalSummary") is True if files else True)
+        if not complete:
+            problems.append(f"shard {n} has an incomplete execution summary {summary}; it is not coverage")
+            continue
+        status = o.get("status")
+        named = o.get("failingFiles") or []
+        unattr = o.get("unattributedFailures") or 0
+        if status == "timed-out":
+            problems.append(f"shard {n} timed out")
+            continue
+        if any(f not in files for f in named):
+            problems.append(f"shard {n} reports failing files outside its plan: {sorted(set(named) - set(files))}")
+            continue
+        if status == "passed":
+            if named or unattr:
+                problems.append(f"shard {n} passed but reports failures")
+            continue
+        if status != "failed":
+            problems.append(f"shard {n} has unknown status {status!r}")
+            continue
+        failing.update(named)
+        for fl in o.get("failures") or []:
+            if fl.get("file") in named:
+                failures.setdefault(fl["file"], set()).add(f"{fl['file']} :: {TEMP_PATH.sub('', str(fl.get('testName', ''))).strip()}")
+        if unattr:
+            lists = containment_paths(shard_logs.get(n, ""), n)
+            if len(lists) == unattr and all(l is not None and all(is_external_writer(p, external_patterns) for p in l) for l in lists):
+                environmental.append(f"shard {n}: real-home writes by agent hosts only: {', '.join(p for l in lists for p in l)}")
+            else:
+                why = "a truncated path list" if any(l is None for l in lists) else (
+                    f"{unattr} unattributed failure(s), {len(lists)} containment line(s)" if len(lists) != unattr else
+                    "paths outside the external-writer list: " + ", ".join(p for l in lists for p in l if not is_external_writer(p, external_patterns)))
+                unaccounted.append(f"shard {n}: unattributed failure(s) not explained by a named test ({why})")
+        elif not named:
+            unaccounted.append(f"shard {n} failed with no named failure and no unattributed count")
+    return {"problems": problems, "unaccounted": unaccounted, "environmental": environmental,
+            "failing_files": sorted(failing), "failures": failures}
 
 
 def blocking_dirty(porcelain_lines):

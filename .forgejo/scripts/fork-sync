@@ -31,6 +31,8 @@ DEFAULT_MIRROR = "https://github.com/Jmeg8r/gstack.git"
 DEFAULT_RERUNS = 3
 SUITE_FILE_TIMEOUT_S = 600
 CODEX_TIMEOUT_S = 330
+SUITE_TIMEOUT_S = 4 * 3600
+DEFAULT_SHARDS = 6
 KILL_GRACE_S = 5
 UNTIL_CHOICES = ["merge", "fork-delta", "checks", "suite", "codex", "pr"]
 # Stages at or after this one are only skipped when they passed at the merge
@@ -129,6 +131,8 @@ class Sync:
             self.state.data.setdefault("pins", pins)
         self.pins = self.state.data["pins"]
         self.merge_wt = run_dir / "merge"
+        env_writers = os.environ.get("FORK_SYNC_EXTERNAL_HOME_WRITERS")
+        self.external_writers = env_writers.split(":") if env_writers else lib.DEFAULT_EXTERNAL_HOME_WRITERS
 
     # -- bookkeeping ---------------------------------------------------------
 
@@ -298,31 +302,79 @@ class Sync:
         except lib.SyncError as e:
             raise Stop("suite", [f"{e} (in `{wt.name}`; see `{log}`)"]) from e
 
-    def suite(self):
-        say("full free suite on the merge (about 35 minutes)")
-        log = self.logs / "suite.log"
-        log.unlink(missing_ok=True)
-        code, out = run(["bun", "run", "test", "--verbose"], self.merge_wt, log=log)
+    def tree_mutating(self):
+        """The runner's own TREE_MUTATING export; no guessing which shard must run alone."""
+        code, out = run(["bun", "--config=/dev/null", "-e",
+                         "import { TREE_MUTATING } from './scripts/test-free-shards.ts'; console.log(JSON.stringify(Object.keys(TREE_MUTATING)))"], self.merge_wt)
         try:
-            listed, diagnostics = lib.parse_free_log(out)
-            lib.suite_completed(code, out)
-        except lib.SyncError as e:
-            raise Stop("suite", [str(e)]) from e
-        files, unattributed = lib.split_attributable(listed, lambda f: (self.merge_wt / f).is_file())
-        unaccounted = [f"failure naming no repo test file: `{u}`" for u in unattributed] + [f"shard diagnostic: `{d}`" for d in diagnostics]
-        if unaccounted and not self.args.accept_unaccounted:
-            self.section("suite", f"Full free suite: {len(unaccounted)} failure(s) that no named repo test accounts for:\n" + "\n".join(f"- {u}" for u in unaccounted))
-            raise Stop("suite", unaccounted + [f"Inspect `{log}`. If each is understood (for example the Codex app writing its own ~/.codex while the suite ran), re-run with `--accept-unaccounted`; the report will list them."])
-        if code != 0 and not listed and not diagnostics:
-            raise Stop("suite", [f"`bun run test` exited {code} with no attributable failures; see `{log}`"])
-        summary = next((ln for ln in reversed(out.splitlines()) if ln.startswith("Ran ")), "")
-        if not files:
-            accepted = ("\n\nPassed on purpose with --accept-unaccounted:\n" + "\n".join(f"- {u}" for u in unaccounted)) if unaccounted else ""
-            self.passed("suite", f"Full free suite: no failing repo test ({summary}).{accepted}\n\nGlobal hooks after the suite: {self.hooks_verify('suite')}")
+            names = json.loads(out.strip().splitlines()[-1]) if code == 0 else None
+        except (json.JSONDecodeError, IndexError):
+            names = None
+        if not isinstance(names, list):
+            raise Stop("suite", [f"could not read TREE_MUTATING from scripts/test-free-shards.ts (exit {code}); cannot tell which shard must run alone:\n```\n{out.strip()[-600:]}\n```"])
+        return set(names)
+
+    def run_ci_shards(self, plan_file, results_dir, numbers):
+        """Run `--ci-run` for these shards at once, each in its own process group with
+        its own log; every shard gets the same outer deadline."""
+        procs = {}
+        for n in numbers:
+            log = self.logs / "ci" / f"shard-{n}.log"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            fh = log.open("w")
+            cmd = ["bun", "--no-env-file", "run", "scripts/test-free-shards.ts", "--ci-run", str(plan_file), "--shard", str(n), "--result", str(results_dir / f"{n}.json")]
+            procs[n] = (subprocess.Popen(cmd, cwd=self.merge_wt, stdout=fh, stderr=subprocess.STDOUT, start_new_session=True,
+                                         env={k: v for k, v in os.environ.items() if k != "GSTACK_FREE_RETRY_FLAKY"}), fh)
+        deadline = time.monotonic() + SUITE_TIMEOUT_S
+        for n, (proc, fh) in procs.items():
+            try:
+                proc.wait(timeout=max(1, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                for other, _ in procs.values():
+                    kill_group(other)
+                raise Stop("suite", [f"`--ci-run` shards exceeded the {SUITE_TIMEOUT_S}s outer deadline; killed their process groups"])
+            finally:
+                fh.close()
+
+    def suite(self):
+        ci = self.run_dir / "ci"
+        results_dir = ci / "results"
+        shutil.rmtree(ci, ignore_errors=True)
+        results_dir.mkdir(parents=True)
+        plan_file = ci / "plan.json"
+        code, out = run(["bun", "run", "scripts/test-free-shards.ts", "--ci-plan", str(plan_file), "--shards", str(self.args.shards)], self.merge_wt, log=self.logs / "ci-plan.log")
+        if code != 0 or not plan_file.is_file():
+            raise Stop("suite", [f"`--ci-plan` failed (exit {code}):\n```\n{out.strip()[-800:]}\n```"])
+        plan = json.loads(plan_file.read_text())
+        alone = lib.exclusive_shards(plan, self.tree_mutating())
+        together = [s["shard"] for s in plan["shards"] if s["shard"] not in alone]
+        say(f"free suite: {len(plan['shards'])} shards from the runner's CI plan ({len(together)} concurrent, then {len(alone)} alone)")
+        self.run_ci_shards(plan_file, results_dir, together)
+        for n in alone:
+            self.run_ci_shards(plan_file, results_dir, [n])
+        vcode, vout = run(["bun", "run", "scripts/test-free-shards.ts", "--ci-verify", str(plan_file), "--results", str(results_dir)], self.merge_wt, log=self.logs / "ci-verify.log")
+        files_total = sum(len(s["files"]) for s in plan["shards"])
+        if vcode == 0:
+            self.passed("suite", f"Free suite: `--ci-verify` passed, {files_total} files across {len(plan['shards'])} shards, every shard complete.\n\nGlobal hooks after the suite: {self.hooks_verify('suite')}")
             return
-        say(f"{len(files)} file(s) had failures; rerunning each alone on merge, upstream and pre-sync fork")
+        results = []
+        for f in sorted(results_dir.glob("*.json")):
+            try:
+                results.append(json.loads(f.read_text()))
+            except json.JSONDecodeError:
+                raise Stop("suite", [f"`{f}` is not valid JSON; that shard did not finish writing its result"])
+        logs = {s["shard"]: (self.logs / "ci" / f"shard-{s['shard']}.log").read_text() if (self.logs / "ci" / f"shard-{s['shard']}.log").exists() else ""
+                for s in plan["shards"]}
+        a = lib.assess_ci_results(plan, results, logs, self.external_writers)
+        if a["problems"]:
+            raise Stop("suite", a["problems"] + [f"`--ci-verify` (exit {vcode}): {vout.strip().splitlines()[-1] if vout.strip() else 'no output'}"])
+        if a["unaccounted"] and not self.args.accept_unaccounted:
+            self.section("suite", "Free suite: failures no named test accounts for:\n" + "\n".join(f"- {u}" for u in a["unaccounted"]))
+            raise Stop("suite", a["unaccounted"] + ["Read the shard logs under `logs/ci/`. If each is understood, re-run with `--accept-unaccounted`; the report will list them."])
+        files = a["failing_files"]
+        say(f"{len(files)} file(s) had named failures; rerunning each alone on merge, upstream and pre-sync fork")
         trees = {"merge": self.merge_wt, "upstream": self.prepared_worktree("upstream", self.pins["github"]),
-                 "baseline": self.prepared_worktree("baseline", self.pins["origin"])}
+                 "baseline": self.prepared_worktree("baseline", self.pins["origin"])} if files else {}
         verdicts = {}
         absent = {"upstream": [], "baseline": []}
         for i, f in enumerate(files, 1):
@@ -341,11 +393,12 @@ class Sync:
                             runs[side].append(self.run_file(wt, f, f"{key}.{side}.{n}"))
             verdicts.update(lib.classify(runs["merge"], runs["upstream"], runs["baseline"]))
             say(f"  [{i}/{len(files)}] {f}")
-        for name in lib.not_reproduced({f: listed[f] for f in files}, verdicts):
+        for name in lib.not_reproduced(a["failures"], verdicts):
             verdicts[name] = "not-reproduced"
         (self.run_dir / "classification.json").write_text(json.dumps(verdicts, indent=2, sort_keys=True) + "\n")
         by = {c: sorted(n for n, v in verdicts.items() if v == c) for c in ("fork-caused", "pre-existing", "flaky", "not-reproduced", "upstream")}
-        lines = [f"Full free suite: {summary}. {len(files)} file(s) with failures, each rerun alone on the merge, pure upstream and the pre-sync fork ({self.args.reruns} extra reruns where the merge failed more than upstream).",
+        lines = [f"Free suite: {files_total} files across {len(plan['shards'])} shards from the runner's CI plan; every shard complete. "
+                 f"{len(files)} file(s) with named failures, each rerun alone on the merge, pure upstream and the pre-sync fork ({self.args.reruns} extra reruns where the merge failed more than upstream).",
                  "", "| Class | Tests | Blocks |", "|---|---|---|"]
         lines += [f"| {c} | {len(by[c])} | {'yes' if c == 'fork-caused' else 'no'} |" for c in by]
         for c in ("fork-caused", "pre-existing", "flaky", "not-reproduced"):
@@ -354,10 +407,11 @@ class Sync:
         for side, label in (("upstream", "absent upstream (fork-only; judged against the pre-sync fork)"), ("baseline", "absent from the pre-sync fork (new upstream; judged against upstream)")):
             if absent[side]:
                 lines.append(f"\n{len(absent[side])} file(s) {label}:\n" + "\n".join(f"- `{f}`" for f in absent[side]))
-        if unaccounted:
-            lines.append(f"\n{len(unaccounted)} unaccounted failure(s), passed on purpose with --accept-unaccounted:\n" + "\n".join(f"- {u}" for u in unaccounted))
-        text = "\n".join(lines)
-        self.section("suite", text + f"\n\nGlobal hooks after the suite: {self.hooks_verify('suite')}")
+        if a["environmental"]:
+            lines.append(f"\n{len(a['environmental'])} shard(s) failed home containment only through agent-host writes (not blocking):\n" + "\n".join(f"- {e}" for e in a["environmental"]))
+        if a["unaccounted"]:
+            lines.append(f"\n{len(a['unaccounted'])} unaccounted failure(s), passed on purpose with --accept-unaccounted:\n" + "\n".join(f"- {u}" for u in a["unaccounted"]))
+        self.section("suite", "\n".join(lines) + f"\n\nGlobal hooks after the suite: {self.hooks_verify('suite')}")
         if by["fork-caused"]:
             raise Stop("suite", [f"fork-caused failure (fails on the merge every run, never on upstream or the pre-sync fork): `{n}`" for n in by["fork-caused"]])
         self.passed("suite")
@@ -524,6 +578,7 @@ def main():
     ap = argparse.ArgumentParser(description="Sync the gstack fork with upstream, up to the merge decision.")
     ap.add_argument("--repo", default=".", help="fork checkout with remotes origin (forge) and github (upstream)")
     ap.add_argument("--until", choices=UNTIL_CHOICES, default="pr", help="last stage to run; 'checks' is the dry run")
+    ap.add_argument("--shards", type=int, default=DEFAULT_SHARDS, help="concurrent shards in the runner's CI plan")
     ap.add_argument("--reruns", type=int, default=DEFAULT_RERUNS, help="extra standalone reruns for files the merge fails more than upstream")
     ap.add_argument("--run-dir", type=Path, help=f"run directory (default {RUN_ROOT}/v<upstream VERSION>, or the one unfinished run)")
     ap.add_argument("--mirror", default=os.environ.get("FORK_SYNC_MIRROR", DEFAULT_MIRROR), help="push-mirror URL that must match forge main")
