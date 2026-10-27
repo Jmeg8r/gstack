@@ -966,6 +966,54 @@ sys.exit(0)
         self.assertEqual(json.loads((archived / "codex-state.json").read_text())["gate"], "FAIL")
         self.assertEqual((self.run_dir / "logs" / "codex.out").read_text(), "review 2\n")
 
+    FAKE_FORGE_PR = r"""#!{python}
+import json, os, sys
+DB = os.environ["FAKE_FORGE_DB"]
+DEFAULT_API = "http://fake/api/v1"
+def load():
+    return json.load(open(DB)) if os.path.exists(DB) else {{"pulls": [], "calls": []}}
+def save(d):
+    json.dump(d, open(DB, "w"))
+def read_token():
+    return "t"
+class ForgeAPI:
+    def __init__(self, base, token):
+        pass
+    def call(self, method, path, body=None):
+        d = load(); d["calls"].append([method, path]); save(d)
+        if method == "GET" and "/pulls" in path:
+            return 200, (d["pulls"] if "page=1&" in path or path.endswith("page=1") else []), {{}}
+        return (201 if method == "POST" else 200), {{}}, {{}}
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    if "create" in a:
+        d = load(); head = a[a.index("--head") + 1]
+        if any(p["head"]["ref"] == head for p in d["pulls"]):
+            print("error: a pull request for this branch already exists"); sys.exit(1)
+        d["pulls"].append({{"number": 7, "html_url": "http://fake/o/r/pulls/7", "state": "open", "head": {{"ref": head}}, "base": {{"ref": "main"}}}})
+        save(d)
+        sys.exit(0)  # the forge created it, but the response carrying the URL was lost
+"""
+
+    def test_a_resume_adopts_the_pr_a_lost_create_response_left_behind(self):
+        passing = {"shards": self.SHARDS, "tree_mutating": ["test/tree.test.ts"], "verify_exit": 0,
+                   "results": {"1": self.outcome(1, ["test/a.test.ts"]), "2": self.outcome(2, ["test/tree.test.ts"])}}
+        self.assertEqual(self.run_suite(passing).returncode, 0)
+        (self.root / "stub-bin" / "forge-pr").write_text(self.FAKE_FORGE_PR.format(python=sys.executable))
+        (self.root / "stub-bin" / "forge-pr").chmod(0o755)
+        db = self.root / "forge-db.json"
+        env = {**self.env, "PATH": f"{self.root / 'stub-bin'}:{os.environ['PATH']}", "FAKE_CI": str(self.root / "scenario.json"),
+               "FAKE_CALLS": str(self.root / "bun-calls.log"), "GSTACK_SKILL_ROOT": str(self.fake_skill_root()), "FAKE_FORGE_DB": str(db)}
+        cmd = [sys.executable, str(CLI), "--repo", str(self.repo), "--run-dir", str(self.run_dir), "--mirror", str(self.forge), "--until", "pr"]
+        first = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=180)
+        self.assertEqual(first.returncode, 10, first.stdout + first.stderr)
+        second = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=180)
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(lib.State.load(self.run_dir / "state.json").data["pr_url"], "http://fake/o/r/pulls/7")
+        calls = json.loads(db.read_text())["calls"]
+        self.assertIn("PATCH", [m for m, path in calls if path.endswith("/pulls/7")])
+        self.assertTrue(any(m == "POST" and path.endswith("/issues/7/comments") for m, path in calls))
+
     def test_a_truncated_containment_line_is_settled_by_the_full_run_window(self):
         log = ("[test:free] shard 1/2 shard cleanup or home containment failed: real home changed while this shard ran (watches ~/.codex only): "
                "~/.codex/a.sqlite-wal (+40 more). Give the writer a private HOME. Shard files: x; retained /tmp/s")

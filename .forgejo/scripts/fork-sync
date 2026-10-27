@@ -34,6 +34,7 @@ DEFAULT_RERUNS = 3
 SUITE_FILE_TIMEOUT_S = 600
 CODEX_TIMEOUT_S = 330
 SUITE_TIMEOUT_S = 4 * 3600
+PR_PAGE_SIZE = 50
 DEFAULT_SHARDS = 6
 KILL_GRACE_S = 5
 UNTIL_CHOICES = ["merge", "fork-delta", "checks", "suite", "codex", "pr"]
@@ -630,6 +631,16 @@ class Sync:
                            "After merging: discard the generated `name:` lines in the live checkout, fast-forward it, then `./setup --prefix`.")
         body = self.write_report()
         if not self.state.data.get("pr_url"):
+            # A create whose response was lost (or a run stopped before saving the
+            # URL) leaves an open PR behind; adopt it rather than fail on it forever.
+            existing = self.open_prs(forge_pr, slug, branch)
+            if len(existing) > 1:
+                raise Stop("pr", [f"{len(existing)} open PRs from `{branch}` into main: " + ", ".join(p["html_url"] for p in existing) + "; close the extras"])
+            if existing:
+                self.state.data["pr_url"] = existing[0]["html_url"]
+                self.state.save()
+                say(f"adopted the open PR {existing[0]['html_url']} for `{branch}`")
+        if not self.state.data.get("pr_url"):
             code, out = run([forge_pr, "--repo", slug, "create", "--base", "main", "--head", branch,
                              "--title", f"chore(upstream): sync fork to garrytan/gstack v{self.pins['version']}", "--body-file", str(body)], self.merge_wt, log=self.logs / "pr.log")
             url = next((w for w in out.split() if "/pulls/" in w), None)
@@ -652,6 +663,18 @@ class Sync:
         mod = importlib.util.module_from_spec(spec)
         loader.exec_module(mod)
         return mod.ForgeAPI(os.environ.get("FORGE_API", mod.DEFAULT_API), mod.read_token())
+
+    def open_prs(self, forge_pr, slug, branch):
+        """Open PRs from `branch` into main, read page by page."""
+        api, found, page = self.forge_api(forge_pr), [], 1
+        while True:
+            status, data, _ = api.call("GET", f"/repos/{slug}/pulls?state=open&page={page}&limit={PR_PAGE_SIZE}")
+            if status != 200 or not isinstance(data, list):
+                raise Stop("pr", [f"listing open PRs to check for an existing one failed: HTTP {status} {data}"])
+            found += [p for p in data if (p.get("head") or {}).get("ref") == branch and (p.get("base") or {}).get("ref") == "main"]
+            if len(data) < PR_PAGE_SIZE:
+                return found
+            page += 1
 
     def update_pr_body(self, forge_pr, slug, body):
         number = self.state.data["pr_url"].rstrip("/").split("/")[-1]
