@@ -850,6 +850,19 @@ sys.exit(0)
         time.sleep(0.5)
         self.assertEqual([x for x in pids if alive(x)], [], "no shard process or shard child may outlive the run")
 
+    def test_a_resume_archives_the_previous_attempts_ci_evidence(self):
+        self.assertEqual(self.run_suite(self.FORK_CAUSED).returncode, 10)
+        first = (self.run_dir / "ci-merge" / "results" / "1.json").read_text()
+        (self.run_dir / "logs" / "ci-merge" / "shard-1.log").write_text("first attempt\n")
+        env = {**self.env, "PATH": f"{self.root / 'stub-bin'}:{os.environ['PATH']}", "FAKE_CI": str(self.root / "scenario.json"), "FAKE_CALLS": str(self.root / "bun-calls.log")}
+        r = subprocess.run([sys.executable, str(CLI), "--repo", str(self.repo), "--run-dir", str(self.run_dir), "--mirror", str(self.forge), "--until", "suite"],
+                           capture_output=True, text=True, env=env, timeout=180)
+        self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+        archived = self.run_dir / "attempts" / "1"
+        self.assertEqual((archived / "ci-merge" / "results" / "1.json").read_text(), first)
+        self.assertEqual((archived / "logs" / "ci-merge" / "shard-1.log").read_text(), "first attempt\n")
+        self.assertTrue((self.run_dir / "ci-merge" / "results" / "1.json").exists(), "the current attempt keeps the usual paths")
+
     def test_a_truncated_containment_line_is_settled_by_the_full_run_window(self):
         log = ("[test:free] shard 1/2 shard cleanup or home containment failed: real home changed while this shard ran (watches ~/.codex only): "
                "~/.codex/a.sqlite-wal (+40 more). Give the writer a private HOME. Shard files: x; retained /tmp/s")

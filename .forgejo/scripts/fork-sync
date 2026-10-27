@@ -374,8 +374,6 @@ class Sync:
         ci = self.run_dir / f"ci-{label}"
         results_dir = ci / "results"
         log_dir = self.logs / f"ci-{label}"
-        shutil.rmtree(ci, ignore_errors=True)
-        shutil.rmtree(log_dir, ignore_errors=True)
         results_dir.mkdir(parents=True)
         plan_file = ci / "plan.json"
         code, out = run(["bun", "run", "scripts/test-free-shards.ts", "--ci-plan", str(plan_file), "--shards", str(self.args.shards)], wt, log=self.logs / f"ci-plan-{label}.log")
@@ -410,7 +408,25 @@ class Sync:
         logs = {x["shard"]: (log_dir / f"shard-{x['shard']}.log").read_text() if (log_dir / f"shard-{x['shard']}.log").exists() else "" for x in plan["shards"]}
         return plan, results, logs, vcode, vout, window
 
+    def archive_ci_evidence(self):
+        """Move an earlier suite attempt's CI plans, results, home windows and shard
+        logs to attempts/<n>/ before a resume replans, so the original failure
+        survives; only the current attempt is ever verified."""
+        found = [d for label in ("merge", "upstream") for d in (self.run_dir / f"ci-{label}", self.logs / f"ci-{label}") if d.exists()]
+        if not found:
+            return
+        n = 1
+        while (self.run_dir / "attempts" / str(n)).exists():
+            n += 1
+        dest = self.run_dir / "attempts" / str(n)
+        for d in found:
+            target = dest / d.relative_to(self.run_dir)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            d.rename(target)
+        say(f"kept the previous suite attempt's evidence in {dest}")
+
     def suite(self):
+        self.archive_ci_evidence()
         plan, results, logs, vcode, vout, window = self.run_ci(self.merge_wt, "merge")
         files_total = sum(len(x["files"]) for x in plan["shards"])
         if vcode == 0:

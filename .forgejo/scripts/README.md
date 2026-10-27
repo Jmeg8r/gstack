@@ -4,7 +4,7 @@ These live under `.forgejo/` so they never conflict with upstream on a sync. Not
 
 ## fork-sync
 
-Syncs the `jfcadm/gstack` fork with upstream `garrytan/gstack` up to the merge decision, and no further. Every problem stops the run **before anything is pushed**; re-running resumes from the first stage that hasn't passed.
+Syncs the `jfcadm/gstack` fork with upstream `garrytan/gstack` up to the merge decision, and no further. Every problem stops the run **before anything is pushed**; re-running resumes from the first stage that hasn't passed. A resumed suite stage first moves the earlier attempt's CI plans, results and shard logs to `attempts/<n>/` in the run directory.
 
 ```bash
 .forgejo/scripts/fork-sync --until checks   # dry run: through the build checks, nothing pushed
@@ -64,7 +64,7 @@ rm -r <run dir>
 
 ### Exit codes
 
-`0` done through `--until` (or nothing to sync) · `2` usage or environment error · `3` another run holds the lock (or a stale lock: remove it once no run is active) · `10` stopped on a problem, with nothing pushed. · `130` interrupted (Ctrl-C or SIGTERM) after stopping every process group it started; re-run to resume.
+`0` done through `--until` (or nothing to sync) · `2` usage or environment error · `3` another run holds the lock (or a stale lock: remove it once no run is active) · `10` stopped on a problem, with nothing pushed · `130` interrupted (Ctrl-C or SIGTERM) after stopping every process group it started; re-run to resume.
 
 ### What it never does
 
