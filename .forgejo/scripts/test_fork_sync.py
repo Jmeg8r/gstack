@@ -28,10 +28,26 @@ class ParseFreeLog(unittest.TestCase):
             "  ✗ browse/test/b.test.ts (crashed: exited)",
             "[test:free] FAIL — 3 failing test(s) in 2 file(s), 0 crashed worker(s).",
         ])
-        self.assertEqual(lib.parse_free_log(log), {"test/a.test.ts", "browse/test/b.test.ts"})
+        self.assertEqual(lib.parse_free_log(log), {
+            "test/a.test.ts": {"test/a.test.ts :: suite > case one", "test/a.test.ts :: suite > case two"},
+            "browse/test/b.test.ts": {"browse/test/b.test.ts :: <crashed>"},
+        })
 
     def test_clean_run_has_no_failing_files(self):
-        self.assertEqual(lib.parse_free_log("[test:free] PASS — 36 tests, 1 files, 0s."), set())
+        self.assertEqual(lib.parse_free_log("[test:free] PASS — 36 tests, 1 files, 0s."), {})
+
+    def test_runner_incompleteness_markers_fail_closed_even_beside_named_failures(self):
+        named = "  ✗ test/a.test.ts — suite > case\n"
+        for marker in ["  ⚠ 2 failure(s) reported without named result lines",
+                       "  ⚠ unhandled error between tests (around test/b.test.ts)",
+                       "  ⚠ test process ended before its summary; in flight: test/c.test.ts",
+                       "  ⏱ in flight at kill: test/c.test.ts",
+                       "[test:free] shard 3/6 exceeded the 845s wall-clock deadline — killed"]:
+            with self.assertRaises(lib.SyncError, msg=marker):
+                lib.parse_free_log(named + marker)
+
+    def test_a_crash_that_passed_on_retry_is_not_incomplete(self):
+        self.assertEqual(lib.parse_free_log("  ⚠ crashed+retried: test/d.test.ts\n[test:free] PASS — 3 tests, 1 files, 0s."), {})
 
     def test_reported_failures_without_attributable_lines_fail_closed(self):
         with self.assertRaises(lib.SyncError):
@@ -118,9 +134,23 @@ class Classify(unittest.TestCase):
     def test_failing_only_on_baseline_is_ignored(self):
         self.assertEqual(lib.classify(self.runs(set()), self.runs(set()), self.runs({"t"})), {})
 
+    def test_a_test_absent_upstream_is_judged_against_the_pre_sync_fork(self):
+        self.assertEqual(lib.classify(self.runs({"t"}, {"t"}), None, self.runs(set(), set())), {"t": "fork-caused"})
+        self.assertEqual(lib.classify(self.runs({"t"}, {"t"}), None, self.runs({"t"}, {"t"})), {"t": "pre-existing"})
+
+    def test_a_test_new_upstream_is_judged_against_upstream_alone(self):
+        self.assertEqual(lib.classify(self.runs({"t"}, {"t"}), self.runs({"t"}, {"t"}), None), {"t": "upstream"})
+        self.assertEqual(lib.classify(self.runs({"t"}, {"t"}), self.runs(set(), set()), None), {"t": "fork-caused"})
+
     def test_needs_at_least_one_run_per_side(self):
         with self.assertRaises(lib.SyncError):
             lib.classify([], self.runs(set()), self.runs(set()))
+
+
+class NotReproduced(unittest.TestCase):
+    def test_suite_failures_missing_from_every_standalone_run_are_kept(self):
+        suite = {"t.ts": {"t.ts :: a", "t.ts :: b"}}
+        self.assertEqual(lib.not_reproduced(suite, {"t.ts :: a": "flaky"}), ["t.ts :: b"])
 
 
 class ForkDelta(unittest.TestCase):
@@ -352,6 +382,36 @@ class Integration(unittest.TestCase):
         r = self.run_cli("--until", "fork-delta")
         self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
         self.assertIn("uncommitted", (self.run_dir / "report.md").read_text().lower())
+
+    def test_relative_run_dir_resolves_against_the_callers_cwd(self):
+        self.commit_upstream({"other.txt": "new\n"}, "1.1.0.0")
+        r = subprocess.run([sys.executable, str(CLI), "--repo", str(self.repo), "--run-dir", "rel-run", "--mirror", str(self.forge), "--until", "fork-delta"],
+                           cwd=self.root, capture_output=True, text=True, env=self.env, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue((self.root / "rel-run" / "merge" / "VERSION").is_file())
+        self.assertTrue((self.root / "rel-run" / "report.md").is_file())
+
+    def test_suite_with_a_killed_shard_stops_even_though_another_shard_named_a_failure(self):
+        """End to end through `checks` and `suite`, with a stub bun on PATH: one shard
+        names a failure while another was killed at its deadline."""
+        stub = self.root / "stub-bin"
+        stub.mkdir()
+        (stub / "bun").write_text(
+            "#!/bin/sh\n"
+            'case "$*" in\n'
+            '  "run test --verbose") printf \'  ✗ test/a.test.ts — g > a\\n  ⏱ in flight at kill: test/b.test.ts\\n\'; exit 1;;\n'
+            '  "run typecheck:test") echo "test typecheck ratchet: 0 known diagnostics, none new."; exit 0;;\n'
+            "  *) exit 0;;\n"
+            "esac\n")
+        (stub / "bun").chmod(0o755)
+        self.commit_upstream({"other.txt": "new\n"}, "1.1.0.0")
+        env = {**self.env, "PATH": f"{stub}:{os.environ['PATH']}"}
+        r = subprocess.run([sys.executable, str(CLI), "--repo", str(self.repo), "--run-dir", str(self.run_dir), "--mirror", str(self.forge), "--until", "suite"],
+                           capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+        report = (self.run_dir / "report.md").read_text()
+        self.assertIn("Stopped at stage `suite`", report)
+        self.assertIn("in flight at kill", report)
 
     def test_second_run_while_locked_exits_3(self):
         self.run_dir.mkdir(parents=True)

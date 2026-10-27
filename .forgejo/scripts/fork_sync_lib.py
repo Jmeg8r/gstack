@@ -8,6 +8,8 @@ import json
 import re
 from pathlib import Path
 
+TEMP_PATH = re.compile(r"\s*/private/\S*")
+
 STAGES = ["preflight", "hooks-backup", "merge", "fork-delta", "checks", "suite", "codex", "hooks-verify", "pr"]
 
 
@@ -15,31 +17,41 @@ class SyncError(Exception):
     """A condition the script must not continue past."""
 
 
-FAILED_TEST = re.compile(r"^  ✗ (\S+) — ")
+FAILED_TEST = re.compile(r"^  ✗ (\S+) — (.+)$")
 CRASHED_FILE = re.compile(r"^  ✗ (\S+) \(crashed: ")
 FAIL_SUMMARY = re.compile(r"^\[test:free\] FAIL — (\d+) failing test")
+# The runner's own markers for a run that did not finish or could not name what failed
+# (buildRunEpilogue in scripts/test-free-shards.ts). A crash that passed on its retry
+# is the one `⚠` line that still means the tests ran.
+INCOMPLETE = [re.compile(r"^  ⚠ (?!crashed\+retried: )"), re.compile(r"^  ⏱ "), re.compile(r"exceeded the \d+s wall-clock deadline")]
 
 
 def parse_free_log(text):
-    """Files with a failure in a `bun run test --verbose` log. Fails closed when the
-    runner reports failures that no line attributes to a file."""
-    files = set()
+    """Failing tests in a `bun run test --verbose` log, as {file: {"file :: name"}}.
+    Fails closed when the runner says a shard did not finish, a failure has no named
+    result, an error happened between tests, or failures are reported but none named."""
+    failures = {}
     reported = 0
     for line in text.splitlines():
-        m = FAILED_TEST.match(line) or CRASHED_FILE.match(line)
+        if any(p.search(line) for p in INCOMPLETE):
+            raise SyncError(f"the free runner reports an incomplete or unattributed run: {line.strip()!r}; an unfinished suite cannot clear the gate")
+        m = FAILED_TEST.match(line)
         if m:
-            files.add(m.group(1))
+            failures.setdefault(m.group(1), set()).add(f"{m.group(1)} :: {TEMP_PATH.sub('', m.group(2)).strip()}")
+            continue
+        c = CRASHED_FILE.match(line)
+        if c:
+            failures.setdefault(c.group(1), set()).add(f"{c.group(1)} :: <crashed>")
             continue
         s = FAIL_SUMMARY.match(line)
         if s:
             reported += int(s.group(1))
-    if reported and not files:
+    if reported and not failures:
         raise SyncError(f"the free runner reported {reported} failing test(s) but no line names a file; refusing to call the suite clean")
-    return files
+    return failures
 
 
 BUN_FAIL = re.compile(r"^\(fail\) (.*?)(?: \[[0-9.]+m?s\])?$")
-TEMP_PATH = re.compile(r"\s*/private/\S*")
 
 
 def parse_bun_fails(test_file, output):
@@ -105,22 +117,32 @@ def classify(merge_runs, upstream_runs, baseline_runs):
     pre-existing  as fork-caused, but also fails on the pre-sync fork (reported)
     flaky         intermittent on the merge, or on upstream (reported)
     upstream      fails in every upstream run (reported as environment/upstream)
-    A test failing only on the baseline was fixed by the merge and is not listed."""
-    if not merge_runs or not upstream_runs or not baseline_runs:
-        raise SyncError("classification needs at least one run in each of merge, upstream and baseline")
-    names = set().union(*merge_runs, *upstream_runs)
+    A test failing only on the baseline was fixed by the merge and is not listed.
+    None for upstream or baseline means the test file does not exist there (a
+    fork-only test, or one upstream just added): that side gives no evidence and the
+    test is judged against the other one."""
+    if not merge_runs or (upstream_runs is not None and not upstream_runs) or (baseline_runs is not None and not baseline_runs):
+        raise SyncError("classification needs at least one run in the merge and in every comparison tree that has the file")
+    names = set().union(*merge_runs, *(upstream_runs or []))
     out = {}
     for name in names:
         m = sum(name in r for r in merge_runs)
-        u = sum(name in r for r in upstream_runs)
-        b = sum(name in r for r in baseline_runs)
-        if u == len(upstream_runs):
+        u = sum(name in r for r in upstream_runs) if upstream_runs is not None else 0
+        b = sum(name in r for r in baseline_runs) if baseline_runs is not None else 0
+        if upstream_runs is not None and u == len(upstream_runs):
             out[name] = "upstream"
         elif m == len(merge_runs) and u == 0:
             out[name] = "pre-existing" if b else "fork-caused"
         else:
             out[name] = "flaky"
     return out
+
+
+def not_reproduced(suite_failures, verdicts):
+    """Full-suite failures that no standalone run reproduced in any tree. They are
+    kept in the inventory (as flaky, not blocking) instead of silently vanishing."""
+    named = set().union(*suite_failures.values()) if suite_failures else set()
+    return sorted(named - set(verdicts))
 
 
 def fork_delta(blobs):

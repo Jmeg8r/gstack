@@ -287,23 +287,36 @@ class Sync:
         trees = {"merge": self.merge_wt, "upstream": self.prepared_worktree("upstream", self.pins["github"]),
                  "baseline": self.prepared_worktree("baseline", self.pins["origin"])}
         verdicts = {}
+        absent = {"upstream": [], "baseline": []}
         for i, f in enumerate(files, 1):
             key = f.replace("/", "_")
-            runs = {side: [self.run_file(wt, f, f"{key}.{side}.0")] for side, wt in trees.items()}
-            if runs["merge"][0] - runs["upstream"][0]:
+            # A comparison tree without the file gives no evidence (None), never a run
+            # against a missing selector.
+            present = {side: (wt / f).is_file() for side, wt in trees.items()}
+            for side in absent:
+                if not present[side]:
+                    absent[side].append(f)
+            runs = {side: ([self.run_file(wt, f, f"{key}.{side}.0")] if present[side] else None) for side, wt in trees.items()}
+            if runs["merge"][0] - (runs["upstream"][0] if runs["upstream"] else set()):
                 for n in range(1, self.args.reruns + 1):
                     for side, wt in trees.items():
-                        runs[side].append(self.run_file(wt, f, f"{key}.{side}.{n}"))
+                        if present[side]:
+                            runs[side].append(self.run_file(wt, f, f"{key}.{side}.{n}"))
             verdicts.update(lib.classify(runs["merge"], runs["upstream"], runs["baseline"]))
             say(f"  [{i}/{len(files)}] {f}")
+        for name in lib.not_reproduced({f: listed[f] for f in files}, verdicts):
+            verdicts[name] = "not-reproduced"
         (self.run_dir / "classification.json").write_text(json.dumps(verdicts, indent=2, sort_keys=True) + "\n")
-        by = {c: sorted(n for n, v in verdicts.items() if v == c) for c in ("fork-caused", "pre-existing", "flaky", "upstream")}
+        by = {c: sorted(n for n, v in verdicts.items() if v == c) for c in ("fork-caused", "pre-existing", "flaky", "not-reproduced", "upstream")}
         lines = [f"Full free suite: {summary}. {len(files)} file(s) with failures, each rerun alone on the merge, pure upstream and the pre-sync fork ({self.args.reruns} extra reruns where the merge failed more than upstream).",
                  "", "| Class | Tests | Blocks |", "|---|---|---|"]
         lines += [f"| {c} | {len(by[c])} | {'yes' if c == 'fork-caused' else 'no'} |" for c in by]
-        for c in ("fork-caused", "pre-existing", "flaky"):
+        for c in ("fork-caused", "pre-existing", "flaky", "not-reproduced"):
             if by[c]:
                 lines.append(f"\n**{c}:**\n" + "\n".join(f"- `{n}`" for n in by[c]))
+        for side, label in (("upstream", "absent upstream (fork-only; judged against the pre-sync fork)"), ("baseline", "absent from the pre-sync fork (new upstream; judged against upstream)")):
+            if absent[side]:
+                lines.append(f"\n{len(absent[side])} file(s) {label}:\n" + "\n".join(f"- `{f}`" for f in absent[side]))
         if unattributed:
             lines.append(f"\n{len(unattributed)} unattributable failure line(s), passed on purpose with --accept-unattributed:\n" + "\n".join(f"- `{u}`" for u in unattributed))
         text = "\n".join(lines)
@@ -380,21 +393,33 @@ class Sync:
                 raise Stop("pr", [f"`forge-pr create` failed (exit {code}):\n```\n{out.strip()[-800:]}\n```"])
             self.state.data["pr_url"] = url
             self.state.save()
+        else:
+            self.update_pr_body(forge_pr, slug, body)
         self.post_codex_comment(forge_pr, slug)
         if git(self.repo, "ls-remote", self.args.mirror, "refs/heads/main").split()[0] != origin_now:
             say("WARNING: mirror main changed after the push; check the forge push mirror")
         self.state.data["finished"] = True
         self.passed("pr")
 
-    def post_codex_comment(self, forge_pr, slug):
-        c = self.state.data.get("codex")
-        if not c or self.state.data.get("codex_comment_posted") == c["head"]:
-            return
+    def forge_api(self, forge_pr):
+        """forge-pr's own client, so the token stays inside its reader."""
         loader = importlib.machinery.SourceFileLoader("forge_pr", forge_pr)
         spec = importlib.util.spec_from_loader("forge_pr", loader)
         mod = importlib.util.module_from_spec(spec)
         loader.exec_module(mod)
-        api = mod.ForgeAPI(os.environ.get("FORGE_API", mod.DEFAULT_API), mod.read_token())
+        return mod.ForgeAPI(os.environ.get("FORGE_API", mod.DEFAULT_API), mod.read_token())
+
+    def update_pr_body(self, forge_pr, slug, body):
+        number = self.state.data["pr_url"].rstrip("/").split("/")[-1]
+        status, data, _ = self.forge_api(forge_pr).call("PATCH", f"/repos/{slug}/pulls/{number}", {"body": body.read_text()})
+        if status not in (200, 201):
+            raise Stop("pr", [f"refreshing the PR body for the pushed revision failed: HTTP {status} {data}"])
+
+    def post_codex_comment(self, forge_pr, slug):
+        c = self.state.data.get("codex")
+        if not c or self.state.data.get("codex_comment_posted") == c["head"]:
+            return
+        api = self.forge_api(forge_pr)
         number = self.state.data["pr_url"].rstrip("/").split("/")[-1]
         raw = (self.logs / "codex.out").read_text().strip()
         text = (f"## Codex review: GATE: {c['gate']}\n\nModel {c['model']}, read-only sandbox, head `{c['head'][:9]}`. "
@@ -481,7 +506,7 @@ def main():
         return EXIT_USAGE
     start = live_snapshot(repo)
 
-    run_dir = args.run_dir
+    run_dir = args.run_dir.expanduser().resolve() if args.run_dir else None
     if run_dir is None:
         open_runs = unfinished_runs()
         if len(open_runs) > 1:
