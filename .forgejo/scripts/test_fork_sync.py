@@ -139,6 +139,27 @@ class BlockingDirty(unittest.TestCase):
         self.assertEqual(lib.blocking_dirty([" M .gitignore"]), [" M .gitignore"])
 
 
+class SuiteCompleted(unittest.TestCase):
+    EPILOGUE = "  ✗ test/a.test.ts — g > a\n[test:free] FAIL — 1 failing test(s) in 1 file(s), 0 crashed worker(s). Full log: x\n"
+
+    def test_normal_failing_exit_with_the_epilogue_is_complete(self):
+        lib.suite_completed(1, self.EPILOGUE)
+
+    def test_killed_runner_is_incomplete_even_with_a_named_failure(self):
+        with self.assertRaises(lib.SyncError):
+            lib.suite_completed(-9, self.EPILOGUE)
+
+    def test_missing_epilogue_is_incomplete(self):
+        with self.assertRaises(lib.SyncError):
+            lib.suite_completed(1, "  ✗ test/a.test.ts — g > a\n")
+
+
+class DotenvFiles(unittest.TestCase):
+    def test_finds_every_dotenv_variant_bun_would_load(self):
+        names = [".env", ".env.local", ".env.test", ".envrc-not", "env", ".gitignore", "README.md"]
+        self.assertEqual(lib.dotenv_files(names), [".env", ".env.local", ".env.test"])
+
+
 class SplitAttributable(unittest.TestCase):
     def test_entries_that_are_not_repo_files_are_unattributable(self):
         listed = {"test/a.test.ts", "(unattributed)", "var/folders/x/T/nested.test.ts"}
@@ -456,6 +477,14 @@ class Integration(unittest.TestCase):
         calls = (self.root / "bun-calls.log").read_text().splitlines()
         self.assertGreaterEqual(len(calls), 6)
         self.assertTrue(all(c.startswith("--no-env-file ") for c in calls), calls)
+
+    def test_dotenv_file_in_the_merge_worktree_stops_before_checks(self):
+        self.commit_upstream({"other.txt": "new\n"}, "1.1.0.0")
+        self.assertEqual(self.run_cli("--until", "fork-delta").returncode, 0)
+        (self.run_dir / "merge" / ".env").write_text("SECRET=1\n")
+        r = self.run_cli("--until", "checks")
+        self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+        self.assertIn(".env", (self.run_dir / "report.md").read_text())
 
     def test_second_run_while_locked_exits_3(self):
         self.run_dir.mkdir(parents=True)

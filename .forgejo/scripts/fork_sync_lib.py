@@ -101,6 +101,27 @@ def parse_bun_run(test_file, exit_code, output):
     return names
 
 
+RUNNER_EPILOGUE = re.compile(r"^\[test:free\] (PASS|FAIL) — ", re.M)
+
+
+def suite_completed(exit_code, output):
+    """The free runner itself must have finished: a normal exit (0 pass, 1 fail) and
+    its own PASS/FAIL epilogue. A killed runner can leave one shard's named failure
+    in the log while other shards never ran; that is not a result."""
+    if exit_code not in (0, 1):
+        raise SyncError(f"`bun run test` ended abnormally (exit {exit_code}); an interrupted suite cannot clear the gate")
+    if not RUNNER_EPILOGUE.search(output):
+        raise SyncError("`bun run test` printed no `[test:free] PASS|FAIL` epilogue; the runner did not finish")
+
+
+DOTENV = re.compile(r"^\.env(\..+)?$")
+
+
+def dotenv_files(names):
+    """Files bun would load as dotenv from a working directory (.env, .env.<mode>, …)."""
+    return sorted(n for n in names if DOTENV.match(n))
+
+
 def blocking_dirty(porcelain_lines):
     """`git status --porcelain` lines that mean the worktree differs from its commit.
     Untracked top-level dot entries (tool state: .serena/, .context/, .DS_Store) are

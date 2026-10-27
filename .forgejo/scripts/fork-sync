@@ -149,6 +149,11 @@ class Sync:
         .serena/ or .context/) are ignored; every other untracked file counts."""
         if not self.merge_wt.exists():
             return
+        # Nested bun processes (package scripts) would load these despite the outer
+        # --no-env-file, so none may exist where the checks run.
+        dotenv = lib.dotenv_files(p.name for p in self.merge_wt.iterdir() if p.is_file())
+        if dotenv:
+            raise Stop(stage, [f"dotenv file(s) in `{self.merge_wt}`: {', '.join(f'`{n}`' for n in dotenv)}. Nested bun runs would read them, so the evidence would depend on files the commit does not contain; remove them and re-run."])
         dirty = lib.blocking_dirty(git(self.merge_wt, "status", "--porcelain").splitlines())
         if dirty:
             raise Stop(stage, [f"uncommitted changes in `{self.merge_wt}`; commit them (or discard them) so the evidence matches what is pushed:\n```\n" + "\n".join(dirty) + "\n```"])
@@ -278,6 +283,7 @@ class Sync:
         code, out = run(["bun", "run", "test", "--verbose"], self.merge_wt, log=log)
         try:
             listed, diagnostics = lib.parse_free_log(out)
+            lib.suite_completed(code, out)
         except lib.SyncError as e:
             raise Stop("suite", [str(e)]) from e
         files, unattributed = lib.split_attributable(listed, lambda f: (self.merge_wt / f).is_file())
