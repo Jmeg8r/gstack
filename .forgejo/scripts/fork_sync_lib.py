@@ -209,6 +209,11 @@ def hooks_diff(before, after):
     }
 
 
+def default_run_dir(root, version, upstream_sha):
+    """One run per upstream commit: VERSION alone can repeat across upstream commits."""
+    return Path(root) / f"v{version}-{upstream_sha[:9]}"
+
+
 REMOTE_SLUG = re.compile(r"[:/]([^/:]+)/([^/]+?)(?:\.git)?/?$")
 
 

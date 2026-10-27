@@ -54,7 +54,7 @@ rm -r <run dir>
 |---|---|
 | `--until merge\|fork-delta\|checks\|suite\|codex\|pr` | `pr` |
 | `--reruns N` (extra standalone reruns where the merge fails more than upstream) | 3 |
-| `--run-dir PATH` | `~/.gstack-dev/fork-sync/v<upstream VERSION>`, or the one unfinished run if there is one |
+| `--run-dir PATH` | `~/.gstack-dev/fork-sync/v<upstream VERSION>-<upstream sha>`, or the one unfinished run if there is one. A finished run is never resumed. |
 | `--mirror URL` (or `FORK_SYNC_MIRROR`) | `https://github.com/Jmeg8r/gstack.git` |
 | `--accept-dropped PATH` (repeatable) | none |
 | `--accept-unaccounted` (continue past suite failures no named test accounts for, each listed in the report) | off |

@@ -13,6 +13,7 @@ import importlib.util
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -30,6 +31,7 @@ DEFAULT_MIRROR = "https://github.com/Jmeg8r/gstack.git"
 DEFAULT_RERUNS = 3
 SUITE_FILE_TIMEOUT_S = 600
 CODEX_TIMEOUT_S = 330
+KILL_GRACE_S = 5
 UNTIL_CHOICES = ["merge", "fork-delta", "checks", "suite", "codex", "pr"]
 # Stages at or after this one are only skipped when they passed at the merge
 # worktree's current HEAD, so a fix committed during a stop re-runs them.
@@ -58,18 +60,38 @@ def run(cmd, cwd, log=None, timeout=None):
     if cmd and cmd[0] == "bun" and "--no-env-file" not in cmd:
         cmd = ["bun", "--no-env-file", *cmd[1:]]
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    # Its own process group, so a timeout takes down every process the command
+    # started (a test's helper children), not just the command itself.
+    p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, start_new_session=True)
     try:
-        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
-        out, code = p.stdout + p.stderr, p.returncode
-    except subprocess.TimeoutExpired as e:
-        out = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
-        out += f"\n[fork-sync] timed out after {timeout}s\n"
-        code = 124
+        so, se = p.communicate(timeout=timeout)
+        out, code = so + se, p.returncode
+    except subprocess.TimeoutExpired:
+        kill_group(p)
+        so, se = p.communicate()
+        out, code = so + se + f"\n[fork-sync] timed out after {timeout}s; killed its process group\n", lib.TIMEOUT_EXIT
     if log:
         log.parent.mkdir(parents=True, exist_ok=True)
         with log.open("a") as f:
             f.write(f"$ {' '.join(map(str, cmd))}  (cwd {cwd})\n{out}\n[exit {code}]\n\n")
     return code, out
+
+
+def kill_group(proc):
+    """SIGTERM the process group, then SIGKILL whatever is left after a short grace."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            return
+        try:
+            proc.wait(timeout=KILL_GRACE_S)
+            if sig == signal.SIGTERM:
+                os.killpg(proc.pid, 0)
+        except ProcessLookupError:
+            return
+        except subprocess.TimeoutExpired:
+            continue
 
 
 def git(cwd, *args):
@@ -532,6 +554,11 @@ def main():
     lock = acquire_lock(run_dir) if run_dir else None
     try:
         state_exists = run_dir is not None and (run_dir / "state.json").exists()
+        if state_exists and lib.State.load(run_dir / "state.json").data.get("finished"):
+            done = lib.State.load(run_dir / "state.json").data
+            say(f"the run in {run_dir} is finished" + (f" (PR {done['pr_url']})" if done.get("pr_url") else "")
+                + "; a finished run is never resumed. Start a new run with another --run-dir, or remove this one.")
+            return EXIT_USAGE
         if state_exists and not lib.State.load(run_dir / "state.json").passed("preflight"):
             state_exists = False
             say(f"{run_dir} stopped before preflight passed; re-reading the remotes")
@@ -540,7 +567,7 @@ def main():
         if not state_exists:
             p = pin(repo, args.mirror)
             if run_dir is None:
-                run_dir = RUN_ROOT / f"v{p['version']}"
+                run_dir = lib.default_run_dir(RUN_ROOT, p["version"], p["github"])
                 lock = acquire_lock(run_dir)
             pins = {"origin": p["origin"], "github": p["github"], "version": p["version"], "branch": f"upgrade/sync-v{p['version']}"}
             if p["nothing"]:

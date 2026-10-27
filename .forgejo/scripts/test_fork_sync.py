@@ -6,6 +6,7 @@
 
 import os
 import subprocess
+import time
 import sys
 import tempfile
 import unittest
@@ -128,6 +129,33 @@ class HooksNeverCached(unittest.TestCase):
             state.mark_passed("hooks-verify", sha=None)
             sync = cli.Sync(type("A", (), {})(), Path(d), run_dir, None)
             self.assertFalse(sync.done("hooks-verify"))
+
+
+class RunIdentity(unittest.TestCase):
+    def test_default_run_dir_names_the_upstream_sha_not_just_the_version(self):
+        a = lib.default_run_dir(Path("/r"), "1.2.3.4", "abcdef0123456789")
+        b = lib.default_run_dir(Path("/r"), "1.2.3.4", "fedcba9876543210")
+        self.assertEqual(a, Path("/r/v1.2.3.4-abcdef012"))
+        self.assertNotEqual(a, b)
+
+
+class TimeoutKillsTheProcessTree(unittest.TestCase):
+    def test_a_child_the_command_started_does_not_outlive_the_timeout(self):
+        cli = load_cli()
+        with tempfile.TemporaryDirectory() as d:
+            pidfile = Path(d) / "child.pid"
+            code, _ = cli.run(["sh", "-c", f"sleep 300 & echo $! > {pidfile}; wait"], Path(d), timeout=1)
+            self.assertEqual(code, 124)
+            pid = int(pidfile.read_text())
+            for _ in range(50):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.1)
+            else:
+                os.kill(pid, 9)
+                self.fail(f"child {pid} outlived the timeout")
 
 
 class BlockingDirty(unittest.TestCase):
@@ -485,6 +513,16 @@ class Integration(unittest.TestCase):
         r = self.run_cli("--until", "checks")
         self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
         self.assertIn(".env", (self.run_dir / "report.md").read_text())
+
+    def test_a_finished_run_is_never_resumed(self):
+        self.commit_upstream({"other.txt": "new\n"}, "1.1.0.0")
+        self.assertEqual(self.run_cli("--until", "fork-delta").returncode, 0)
+        state = lib.State.load(self.run_dir / "state.json")
+        state.data["finished"] = True
+        state.save()
+        r = self.run_cli("--until", "pr")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("finished", r.stdout.lower())
 
     def test_second_run_while_locked_exits_3(self):
         self.run_dir.mkdir(parents=True)
