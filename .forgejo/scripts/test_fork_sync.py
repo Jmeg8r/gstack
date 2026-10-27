@@ -629,6 +629,8 @@ if a[:2] == ["run", "scripts/test-free-shards.ts"]:
     side = "upstream" if "/upstream" in os.getcwd() else "merge"
     if "--ci-run" in a:
         n = flag("--shard"); r = sc.get("results_" + side, sc["results"]).get(n)
+        if sc.get("require_log_dir") and not os.path.isdir(os.path.join(".context", "free-test-logs")):
+            print("EEXIST race stand-in: .context/free-test-logs was not created before the shards started"); sys.exit(3)
         for rel in sc.get("home_writes", {{}}).get(n, []):
             target = os.path.join(os.environ["HOME"], rel)
             os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -680,6 +682,13 @@ sys.exit(0)
         self.assertTrue(calls and all(c.startswith("--no-env-file ") for c in calls), calls)
         runs = [c for c in calls if "--ci-run" in c]
         self.assertEqual(runs[-1].split("--shard ")[1].split()[0], "2", "the tree-mutating shard runs last, alone")
+
+    def test_the_log_directory_exists_before_concurrent_shards_start(self):
+        r = self.run_suite({"shards": self.SHARDS, "tree_mutating": ["test/tree.test.ts"], "verify_exit": 0, "require_log_dir": True,
+                            "results": {"1": self.outcome(1, ["test/a.test.ts"]), "2": self.outcome(2, ["test/tree.test.ts"])}})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        log_dir = self.run_dir / "merge" / ".context" / "free-test-logs"
+        self.assertEqual(log_dir.stat().st_mode & 0o777, 0o700)
 
     def test_a_shard_that_never_wrote_its_result_stops(self):
         r = self.run_suite({"shards": self.SHARDS, "tree_mutating": ["test/tree.test.ts"], "verify_exit": 1,
