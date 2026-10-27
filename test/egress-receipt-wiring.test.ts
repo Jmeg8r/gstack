@@ -150,6 +150,9 @@ const SCANNER_EXEMPT: Record<string, string> = {
     'git fetch appears only in an error-message string',
   'bin/gstack-state-matrix':
     'git fetch appears only in an error-message string (the fix the user runs when origin/<base> has no merge base)',
+  // Fork-only (jfcadm/gstack): not part of upstream gstack.
+  'bin/review-pr.sh':
+    'fork-only CI gate client deployed byte-identical from jfcadm/sovereign-forge (its check-gate-kit.sh fails on any local edit, and that repo has no egress lib to source); it runs only in the forge\'s own CI and POSTs the PR diff to the operator\'s self-hosted review broker and the verdict comment to the operator\'s own forge, both on their private tailnet; no installed-gstack user state is sent',
   'bin/gstack-redact-prepush':
     'git push mentions are hook documentation strings (bypass instructions)',
   'browse/src/security-classifier.ts':
