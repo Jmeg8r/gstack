@@ -44,6 +44,11 @@ class ParseFreeLog(unittest.TestCase):
         self.assertEqual(len(diagnostics), 1)
         self.assertIn("home containment failed", diagnostics[0])
 
+    def test_concurrent_phase_home_changes_are_diagnostics_too(self):
+        log = ("  ✗ test/a.test.ts — g > a\n"
+               "[test:free] real home changed while 6 shards ran concurrently (watches ~/.codex): ~/.codex/x. They share one HOME\n")
+        self.assertEqual(len(lib.parse_free_log(log)[1]), 1)
+
     def test_runner_incompleteness_markers_fail_closed_even_beside_named_failures(self):
         named = "  ✗ test/a.test.ts — suite > case\n"
         for marker in ["  ⚠ 2 failure(s) reported without named result lines",
@@ -101,6 +106,28 @@ class ParseBunRun(unittest.TestCase):
     def test_unhandled_errors_count_as_a_named_failure(self):
         out = "# Unhandled error between tests\n 4 pass\n 0 fail\n 1 error\nRan 4 tests across 1 file."
         self.assertEqual(lib.parse_bun_run("t.ts", 1, out), {"t.ts :: <unhandled error>"})
+
+
+def load_cli():
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("fork_sync_cli", str(CLI))
+    spec = importlib.util.spec_from_loader("fork_sync_cli", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+class HooksNeverCached(unittest.TestCase):
+    def test_hooks_verify_reruns_even_when_it_passed_at_the_same_head(self):
+        cli = load_cli()
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = Path(d)
+            state = lib.State.load(run_dir / "state.json")
+            state.data["pins"] = {"version": "1", "origin": "o", "github": "g", "branch": "b"}
+            state.mark_passed("hooks-verify", sha=None)
+            sync = cli.Sync(type("A", (), {})(), Path(d), run_dir, None)
+            self.assertFalse(sync.done("hooks-verify"))
 
 
 class BlockingDirty(unittest.TestCase):
@@ -411,9 +438,10 @@ class Integration(unittest.TestCase):
         stub.mkdir()
         (stub / "bun").write_text(
             "#!/bin/sh\n"
+            f'echo "$*" >> "{self.root}/bun-calls.log"\n'
             'case "$*" in\n'
-            '  "run test --verbose") printf \'  ✗ test/a.test.ts — g > a\\n  ⏱ in flight at kill: test/b.test.ts\\n\'; exit 1;;\n'
-            '  "run typecheck:test") echo "test typecheck ratchet: 0 known diagnostics, none new."; exit 0;;\n'
+            '  "--no-env-file run test --verbose") printf \'  ✗ test/a.test.ts — g > a\\n  ⏱ in flight at kill: test/b.test.ts\\n\'; exit 1;;\n'
+            '  "--no-env-file run typecheck:test") echo "test typecheck ratchet: 0 known diagnostics, none new."; exit 0;;\n'
             "  *) exit 0;;\n"
             "esac\n")
         (stub / "bun").chmod(0o755)
@@ -425,6 +453,9 @@ class Integration(unittest.TestCase):
         report = (self.run_dir / "report.md").read_text()
         self.assertIn("Stopped at stage `suite`", report)
         self.assertIn("in flight at kill", report)
+        calls = (self.root / "bun-calls.log").read_text().splitlines()
+        self.assertGreaterEqual(len(calls), 6)
+        self.assertTrue(all(c.startswith("--no-env-file ") for c in calls), calls)
 
     def test_second_run_while_locked_exits_3(self):
         self.run_dir.mkdir(parents=True)

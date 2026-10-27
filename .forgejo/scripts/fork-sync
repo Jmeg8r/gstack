@@ -52,6 +52,11 @@ def say(msg):
 
 
 def run(cmd, cwd, log=None, timeout=None):
+    # No .env is ever read: an untracked one would pass the dirty check yet change
+    # what is tested. The committed bunfig.toml stays in force on purpose; it is the
+    # tracked test configuration (preload) CI runs with, and editing it shows as dirty.
+    if cmd and cmd[0] == "bun" and "--no-env-file" not in cmd:
+        cmd = ["bun", "--no-env-file", *cmd[1:]]
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     try:
         p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
@@ -109,7 +114,8 @@ class Sync:
         return git(self.merge_wt, "rev-parse", "HEAD") if self.merge_wt.exists() else None
 
     def done(self, stage):
-        if not self.state.passed(stage):
+        # The hooks manifest is state outside the commit, so a pass is never reused.
+        if stage == "hooks-verify" or not self.state.passed(stage):
             return False
         if lib.STAGES.index(stage) < lib.STAGES.index(FIRST_HEAD_BOUND_STAGE):
             return True
@@ -378,6 +384,7 @@ class Sync:
         forge_pr = shutil.which("forge-pr")
         if not forge_pr:
             raise Stop("pr", ["`forge-pr` is not on PATH"])
+        self.hooks_verify("pr")
         branch = self.pins["branch"]
         code, out = run(["git", "push", "-u", "origin", branch], self.merge_wt, log=self.logs / "pr.log")
         if code != 0:

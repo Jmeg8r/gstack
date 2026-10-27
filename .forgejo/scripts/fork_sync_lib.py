@@ -27,7 +27,7 @@ INCOMPLETE = [re.compile(r"^  ⚠ (?!crashed\+retried: )"), re.compile(r"^  ⏱ 
               re.compile(r" exited 0 but .* Treating as FAILED")]
 # A shard whose tests ran but whose sandbox leaked into the real home. Not proof of
 # incomplete coverage, but not accounted for by any named test either.
-CONTAINMENT = re.compile(r" shard cleanup or home containment failed: ")
+CONTAINMENT = re.compile(r" shard cleanup or home containment failed: |real home changed while |wrote its private HOME")
 
 
 def parse_free_log(text):
