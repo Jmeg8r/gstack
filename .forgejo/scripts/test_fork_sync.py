@@ -284,6 +284,23 @@ class HomeSnapshot(unittest.TestCase):
             self.assertEqual(lib.home_changes(before, after), ["~/.claude/settings.json", "~/.codex/deep", "~/.codex/deep/er", "~/.codex/deep/er/f"])
 
 
+    def test_a_repointed_directory_link_is_a_change_and_is_never_traversed(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            for target in ("a", "b"):
+                (home / "elsewhere" / target).mkdir(parents=True)
+                (home / "elsewhere" / target / "SKILL.md").write_text(target)
+            (home / ".claude" / "skills").mkdir(parents=True)
+            (home / ".claude" / "skills" / "gstack").symlink_to(home / "elsewhere" / "a")
+            os.symlink(home / "elsewhere" / "a", home / ".codex")
+            before = lib.home_snapshot(home, [".claude", ".codex"], [])
+            self.assertEqual(before[".claude/skills/gstack"].split(":")[:2], ["link", str(home / "elsewhere" / "a")])
+            self.assertTrue(before[".codex"].startswith("link:"))
+            self.assertNotIn(".claude/skills/gstack/SKILL.md", before)
+            (home / ".claude" / "skills" / "gstack").unlink()
+            (home / ".claude" / "skills" / "gstack").symlink_to(home / "elsewhere" / "b")
+            self.assertEqual(lib.home_changes(before, lib.home_snapshot(home, [".claude", ".codex"], [])), ["~/.claude/skills/gstack"])
+
 class ExclusiveShards(unittest.TestCase):
     def test_a_shard_made_only_of_tree_mutating_files_runs_alone(self):
         self.assertEqual(lib.exclusive_shards(PLAN, {"test/tree.test.ts": "mutates the tree"}), [3])

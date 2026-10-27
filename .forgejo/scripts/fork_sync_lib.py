@@ -94,31 +94,54 @@ HOME_VOLATILE = [
 ]
 
 
+def link_entry(path):
+    """A link as the runner records it: its target and its own mtime, never followed."""
+    return f"link:{os.readlink(path)}:{path.lstat().st_mtime_ns}"
+
+
 def home_snapshot(home, surfaces=HOME_SURFACES, volatile=HOME_VOLATILE):
     """Every file, link and directory under the watched surfaces, untruncated, so a
     run window's real-home changes can be listed in full (the runner caps its list).
-    Directory mtimes are ignored, as the runner does."""
+    Links, to files or directories, are recorded by target and never traversed, as
+    the runner records them; directory mtimes are ignored, as the runner does."""
     home = Path(home)
     skip = {Path(v) for v in volatile}
     snap = {}
     for surface in surfaces:
         root = home / surface
+        if root.is_symlink():
+            snap[surface] = link_entry(root)
+            continue
         if not root.exists():
             continue
         for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
             rel_dir = Path(dirpath).relative_to(home)
-            dirnames[:] = [d for d in dirnames if rel_dir / d not in skip]
+            kept = []
             for d in dirnames:
-                snap[str(rel_dir / d)] = "dir"
+                rel = rel_dir / d
+                if rel in skip:
+                    continue
+                if (home / rel).is_symlink():
+                    try:
+                        snap[str(rel)] = link_entry(home / rel)
+                    except FileNotFoundError:
+                        continue
+                else:
+                    snap[str(rel)] = "dir"
+                    kept.append(d)
+            dirnames[:] = kept
             for f in filenames:
                 rel = rel_dir / f
                 if rel in skip:
                     continue
                 try:
-                    st = (home / rel).lstat()
+                    if (home / rel).is_symlink():
+                        snap[str(rel)] = link_entry(home / rel)
+                    else:
+                        st = (home / rel).lstat()
+                        snap[str(rel)] = f"file:{st.st_size}:{st.st_mtime_ns}"
                 except FileNotFoundError:
                     continue
-                snap[str(rel)] = f"{'link' if os.path.islink(home / rel) else 'file'}:{st.st_size}:{st.st_mtime_ns}"
     return snap
 
 
