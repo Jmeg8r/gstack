@@ -82,6 +82,19 @@ def run(cmd, cwd, log=None, timeout=None):
     return code, out
 
 
+def run_to_files(cmd, cwd, out_file, err_file, timeout):
+    """Run `cmd` with stdout and stderr going to files, in its own process group that
+    is reaped on an interrupt or when `timeout` expires (then exit TIMEOUT_EXIT)."""
+    with out_file.open("w") as fo, err_file.open("w") as fe:
+        p = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=fo, stderr=fe, start_new_session=True)
+        with reaped([p]):
+            try:
+                return p.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                kill_group(p)
+                return lib.TIMEOUT_EXIT
+
+
 @contextlib.contextmanager
 def reaped(procs):
     """Kill and reap every group in `procs` when anything escapes, Ctrl-C and SIGTERM
@@ -532,8 +545,7 @@ class Sync:
                "codex", "review", "--base", self.pins["github"], "-c", f'sandbox_mode="{sandbox}"', "-c", f'review_model="{model}"',
                "-c", f'model="{model}"', "-c", "skills.include_instructions=false", "-c", 'web_search="cached"']
         say(f"Codex review of the fork delta ({model})")
-        with out_file.open("w") as fo, err_file.open("w") as fe:
-            codex_exit = subprocess.run(cmd, cwd=self.merge_wt, stdin=subprocess.DEVNULL, stdout=fo, stderr=fe, timeout=CODEX_TIMEOUT_S + 60).returncode
+        codex_exit = run_to_files(cmd, self.merge_wt, out_file, err_file, timeout=CODEX_TIMEOUT_S + 60)
         vcode, verdict = run(["bun", "--no-env-file", "--config=/dev/null", str(validator), "--label", "Codex review", "--exit", str(codex_exit),
                               "--stderr", str(err_file), "structured", str(out_file)], self.merge_wt)
         gate = {0: "PASS", 4: "UNVERIFIED", 3: "FAIL"}.get(vcode, "FAIL")

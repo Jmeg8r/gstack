@@ -82,6 +82,36 @@ class InterruptedRun(unittest.TestCase):
             self.assertFalse(alive(int(pid_file.read_text())), "the command's child must not outlive the interrupt")
 
 
+class RunToFiles(unittest.TestCase):
+    SPAWN = "sleep 60 & echo $! > {pid}; wait"
+
+    def test_the_outer_timeout_reaps_the_whole_group_and_reads_as_a_timeout(self):
+        cli = load_cli()
+        with tempfile.TemporaryDirectory() as d:
+            pid = Path(d) / "pid"
+            code = cli.run_to_files(["sh", "-c", self.SPAWN.format(pid=pid)], d, Path(d) / "out", Path(d) / "err", timeout=1)
+            self.assertEqual(code, lib.TIMEOUT_EXIT)
+            time.sleep(0.5)
+            self.assertFalse(alive(int(pid.read_text())))
+
+    def test_an_interrupt_reaps_the_whole_group_before_propagating(self):
+        cli = load_cli()
+        with tempfile.TemporaryDirectory() as d:
+            pid = Path(d) / "pid"
+            def interrupt(*_):
+                raise KeyboardInterrupt
+            old = signal.signal(signal.SIGALRM, interrupt)
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 1.0)
+                with self.assertRaises(KeyboardInterrupt):
+                    cli.run_to_files(["sh", "-c", self.SPAWN.format(pid=pid)], d, Path(d) / "out", Path(d) / "err", timeout=60)
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, old)
+            time.sleep(0.5)
+            self.assertFalse(alive(int(pid.read_text())))
+
+
 class AssessCiResults(unittest.TestCase):
     def assess(self, results, logs=None, window=None):
         return lib.assess_ci_results(PLAN, results, logs or {}, EXTERNAL, window)
