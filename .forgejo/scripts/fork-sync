@@ -379,24 +379,27 @@ class Sync:
         a = lib.assess_ci_results(plan, results, logs, self.external_writers, window)
         if a["problems"]:
             raise Stop("suite", a["problems"] + [f"`--ci-verify` (exit {vcode}): {vout.strip().splitlines()[-1] if vout.strip() else 'no output'}"])
-        if a["unaccounted"] and not self.args.accept_unaccounted:
-            self.section("suite", "Free suite: failures no named test accounts for:\n" + "\n".join(f"- {u}" for u in a["unaccounted"]))
-            raise Stop("suite", a["unaccounted"] + ["Read the shard logs under `logs/ci-merge/`. If each is understood, re-run with `--accept-unaccounted`; the report will list them."])
-        environmental_gaps = []
-        if a["gaps"]:
-            say(f"{len(a['gaps'])} merge shard(s) gave no usable coverage; running the same CI plan on pure upstream to compare")
+        environmental_gaps, shared_unaccounted, merge_only_unaccounted = [], [], []
+        if a["gaps"] or a["unaccounted"]:
+            say(f"{len(a['gaps'])} merge shard(s) without usable coverage and {len(a['unaccounted'])} with unexplained failures; running the same CI plan on pure upstream to compare")
             upstream_wt = self.prepared_worktree("upstream", self.pins["github"])
             uplan, uresults, ulogs, uvcode, _, uwindow = self.run_ci(upstream_wt, "upstream")
-            ua = {"problems": [], "gaps": []} if uvcode == 0 else lib.assess_ci_results(uplan, uresults, ulogs, self.external_writers, uwindow)
+            ua = {"problems": [], "gaps": [], "unaccounted": []} if uvcode == 0 else lib.assess_ci_results(uplan, uresults, ulogs, self.external_writers, uwindow)
             if ua["problems"]:
                 raise Stop("suite", [f"the upstream control run is not evidence: {p}" for p in ua["problems"]])
+            upstream_bad = ua["gaps"] + ua["unaccounted"]
             try:
-                environmental_gaps, blocking = lib.compare_gaps(a["gaps"], ua["gaps"], plan, uplan)
+                environmental_gaps, blocking = lib.compare_gaps(a["gaps"], upstream_bad, plan, uplan)
+                shared_unaccounted, merge_only_unaccounted = lib.compare_gaps(a["unaccounted"], upstream_bad, plan, uplan)
             except lib.SyncError as e:
                 raise Stop("suite", [str(e)]) from e
             if blocking:
                 raise Stop("suite", [f"merge shard {g['shard']} ({len(g['files'])} files): {g['reason']}, while the same shard is complete on upstream" for g in blocking]
                            + ["A gap only on the merge is not environmental. Re-run to rule out a one-off; if it repeats, the merge changed how that shard runs."])
+            if merge_only_unaccounted and not self.args.accept_unaccounted:
+                self.section("suite", "Free suite: failures no named test accounts for, on the merge only:\n" + "\n".join(f"- shard {u['shard']}: {u['reason']}" for u in merge_only_unaccounted))
+                raise Stop("suite", [f"merge shard {u['shard']}: {u['reason']}, while the same shard is fine on upstream" for u in merge_only_unaccounted]
+                           + ["Read the shard logs under `logs/ci-merge/`. If each is understood, re-run with `--accept-unaccounted`; the report will list them."])
         # The fork's own changes always get standalone coverage, even inside shards
         # without a usable summary. Paid files are not in the plan, so they never run.
         base = git(self.repo, "merge-base", self.pins["origin"], self.pins["github"])
@@ -444,8 +447,12 @@ class Sync:
                          + "\n".join(f"- shard {g['shard']} ({len(g['files'])} files): {g['reason']}" for g in environmental_gaps))
         if a["environmental"]:
             lines.append(f"\n{len(a['environmental'])} shard(s) failed home containment only through agent-host writes (not blocking):\n" + "\n".join(f"- {e}" for e in a["environmental"]))
-        if a["unaccounted"]:
-            lines.append(f"\n{len(a['unaccounted'])} unaccounted failure(s), passed on purpose with --accept-unaccounted:\n" + "\n".join(f"- {u}" for u in a["unaccounted"]))
+        if shared_unaccounted:
+            lines.append(f"\n{len(shared_unaccounted)} shard(s) with failures no named test explains, unaccounted on the merge and on upstream alike (environmental):\n"
+                         + "\n".join(f"- shard {u['shard']}: {u['reason']}" for u in shared_unaccounted))
+        if merge_only_unaccounted:
+            lines.append(f"\n{len(merge_only_unaccounted)} merge-only unaccounted failure(s), passed on purpose with --accept-unaccounted:\n"
+                         + "\n".join(f"- shard {u['shard']}: {u['reason']}" for u in merge_only_unaccounted))
         self.section("suite", "\n".join(lines) + f"\n\nGlobal hooks after the suite: {self.hooks_verify('suite')}")
         if by["fork-caused"]:
             raise Stop("suite", [f"fork-caused failure (fails on the merge every run, never on upstream or the pre-sync fork): `{n}`" for n in by["fork-caused"]])

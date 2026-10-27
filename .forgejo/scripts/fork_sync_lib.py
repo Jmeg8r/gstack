@@ -75,7 +75,7 @@ def dotenv_files(names):
 # FORK_SYNC_EXTERNAL_HOME_WRITERS (colon-separated globs).
 DEFAULT_EXTERNAL_HOME_WRITERS = [
     "~/.claude/backups/.claude.json.backup.*", "~/.claude/sessions/*.json", "~/.claude/state/*",
-    "~/.claude/.git/*",
+    "~/.claude/.git/*", "~/.claude/memory-sweeper/*",
     "~/.codex/*.sqlite-wal", "~/.codex/*.sqlite-shm",
     "~/.codex/shell_snapshots/*", "~/.codex/thread-writer-locks/*",
 ]
@@ -155,7 +155,8 @@ def assess_ci_results(plan, results, shard_logs, external_patterns, window_chang
                   results, a pass that reports failures (hard stop)
     gaps          shards whose run is not coverage: incomplete summary, timeout, or
                   failure attribution outside the plan; compared with upstream later
-    unaccounted   failures no named test explains (stop unless accepted)
+    unaccounted   failures no named test explains, as {shard, files, reason}; compared
+                  with upstream like gaps, then stop unless accepted
     environmental containment failures touching only external agent-host paths
     failing_files files with named failures, for the paired comparison
     failures      {file: {"file :: test name"}} from the runner's named failures
@@ -221,14 +222,14 @@ def assess_ci_results(plan, results, shard_logs, external_patterns, window_chang
                 environmental.append(f"shard {n}: the runner truncated its path list; fork-sync's own full snapshot of the run window shows only agent-host writes ({len(window_changes)} paths)")
             elif len(lists) == unattr and any(l is None for l in lists) and window_changes is not None:
                 outside = [p for p in window_changes if not is_external_writer(p, external_patterns)]
-                unaccounted.append(f"shard {n}: home containment failed, and the run window changed paths outside the external-writer list: {', '.join(outside[:20])}" + (f" (+{len(outside) - 20} more)" if len(outside) > 20 else ""))
+                unaccounted.append({"shard": n, "files": files, "reason": f"home containment failed, and the run window changed paths outside the external-writer list: {', '.join(outside[:20])}" + (f" (+{len(outside) - 20} more)" if len(outside) > 20 else "")})
             else:
                 why = "a truncated path list" if any(l is None for l in lists) else (
                     f"{unattr} unattributed failure(s), {len(lists)} containment line(s)" if len(lists) != unattr else
                     "paths outside the external-writer list: " + ", ".join(p for l in lists for p in l if not is_external_writer(p, external_patterns)))
-                unaccounted.append(f"shard {n}: unattributed failure(s) not explained by a named test ({why})")
+                unaccounted.append({"shard": n, "files": files, "reason": f"unattributed failure(s) not explained by a named test ({why})"})
         elif not named:
-            unaccounted.append(f"shard {n} failed with no named failure and no unattributed count")
+            unaccounted.append({"shard": n, "files": files, "reason": "failed with no named failure and no unattributed count"})
     return {"problems": problems, "gaps": gaps, "unaccounted": unaccounted, "environmental": environmental,
             "failing_files": sorted(failing), "failures": failures}
 

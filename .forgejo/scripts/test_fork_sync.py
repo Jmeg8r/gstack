@@ -86,7 +86,12 @@ class AssessCiResults(unittest.TestCase):
     def test_a_failure_with_no_attribution_at_all_is_unaccounted(self):
         a = self.assess([result(1, "failed"), result(2), result(3)])
         self.assertEqual(a["problems"], [])
-        self.assertEqual(len(a["unaccounted"]), 1)
+        self.assertEqual([(u["shard"], u["files"]) for u in a["unaccounted"]], [(1, ["test/a.test.ts", "test/b.test.ts"])])
+
+    def test_a_cleanup_failure_of_another_kind_is_unaccounted_for_comparison(self):
+        log = "[test:free] shard 1/3 shard cleanup or home containment failed: browser child ownership is unconfirmed; retained /tmp/s"
+        a = self.assess([result(1, "failed", ["test/b.test.ts"], 1), result(2), result(3)], {1: log})
+        self.assertEqual([u["shard"] for u in a["unaccounted"]], [1])
 
     def test_containment_touching_only_external_writer_paths_is_environmental(self):
         log = CONTAIN.format(i=1, paths="~/.claude/backups/.claude.json.backup.1792, ~/.codex/state_5.sqlite-wal")
@@ -113,7 +118,7 @@ class AssessCiResults(unittest.TestCase):
         log = CONTAIN.format(i=1, paths="~/.codex/a.sqlite-wal (+93 more)")
         a = self.assess([result(1, "failed", [], 1), result(2), result(3)], {1: log}, window=["~/.codex/a.sqlite-wal", "~/.gstack/config.yaml"])
         self.assertEqual(len(a["unaccounted"]), 1)
-        self.assertIn("~/.gstack/config.yaml", a["unaccounted"][0])
+        self.assertIn("~/.gstack/config.yaml", a["unaccounted"][0]["reason"])
 
     def test_more_unattributed_failures_than_containment_lines_is_unaccounted(self):
         log = CONTAIN.format(i=1, paths="~/.codex/state_5.sqlite-wal")
@@ -135,6 +140,12 @@ class CompareGaps(unittest.TestCase):
     def test_a_gap_only_on_the_merge_blocks(self):
         env, blocking = lib.compare_gaps([self.gap(1), self.gap(2)], [self.gap(1)], PLAN, PLAN)
         self.assertEqual(([g["shard"] for g in env], [g["shard"] for g in blocking]), ([1], [2]))
+
+    def test_an_unaccounted_merge_shard_matched_by_an_unaccounted_or_gap_upstream_shard_is_environmental(self):
+        merge = [{"shard": 1, "files": PLAN["shards"][0]["files"], "reason": "slug-cache leak"}]
+        upstream = [{"shard": 1, "files": PLAN["shards"][0]["files"], "reason": "slug-cache leak"}]
+        env, blocking = lib.compare_gaps(merge, upstream, PLAN, PLAN)
+        self.assertEqual((len(env), blocking), (1, []))
 
     def test_plans_with_different_shard_file_sets_cannot_be_compared(self):
         other = {**PLAN, "shards": [{**PLAN["shards"][0], "files": ["test/a.test.ts"]}, *PLAN["shards"][1:]]}
@@ -735,18 +746,26 @@ sys.exit(0)
                 "results": {"1": self.outcome(1, ["test/a.test.ts"], "failed", ["test/a.test.ts"], 1, [("test/a.test.ts", "g > a")]),
                             "2": self.outcome(2, ["test/tree.test.ts"])},
                 "standalone": {"merge": ["g > a"], "upstream": ["g > a"], "baseline": ["g > a"]}}
-        r = self.run_suite({**base, "home_writes": {"1": [".codex/a.sqlite-wal", ".gstack/config.yaml"]}})
+        r = self.run_suite({**base, "verify_exit_upstream": 0, "home_writes": {"1": [".codex/a.sqlite-wal", ".gstack/config.yaml"]}})
         self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
         self.assertIn("~/.gstack/config.yaml", (self.run_dir / "report.md").read_text())
+
+    def test_an_unaccounted_shard_that_upstream_shares_is_environmental(self):
+        log = ("[test:free] shard 1/2 shard cleanup or home containment failed: browser child ownership is unconfirmed; retained /tmp/s")
+        r = self.run_suite({"shards": self.SHARDS, "tree_mutating": ["test/tree.test.ts"], "verify_exit": 1, "logs": {"1": log},
+                            "results": {"1": self.outcome(1, ["test/a.test.ts"], "failed", [], 1), "2": self.outcome(2, ["test/tree.test.ts"])}})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("unaccounted on the merge and on upstream", (self.run_dir / "report.md").read_text())
 
     def test_containment_outside_agent_host_paths_stops_unless_accepted(self):
         log = ("[test:free] shard 1/2 shard cleanup or home containment failed: real home changed while this shard ran (watches ~/.claude only): "
                "~/.claude/settings.json. Give the writer a private HOME. Shard files: x; retained /tmp/s")
-        scenario = {"shards": self.SHARDS, "tree_mutating": ["test/tree.test.ts"], "verify_exit": 1, "logs": {"1": log},
+        scenario = {"shards": self.SHARDS, "tree_mutating": ["test/tree.test.ts"], "verify_exit": 1, "verify_exit_upstream": 0, "logs": {"1": log},
                     "results": {"1": self.outcome(1, ["test/a.test.ts"], "failed", [], 1), "2": self.outcome(2, ["test/tree.test.ts"])}}
         r = self.run_suite(scenario)
         self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
         self.assertIn("~/.claude/settings.json", (self.run_dir / "report.md").read_text())
+        self.assertIn("while the same shard is fine on upstream", (self.run_dir / "report.md").read_text())
         r2 = subprocess.run([sys.executable, str(CLI), "--repo", str(self.repo), "--run-dir", str(self.run_dir), "--mirror", str(self.forge), "--until", "suite", "--accept-unaccounted"],
                             capture_output=True, text=True, env={**self.env, "PATH": f"{self.root / 'stub-bin'}:{os.environ['PATH']}", "FAKE_CI": str(self.root / "scenario.json"), "FAKE_CALLS": str(self.root / "bun-calls.log")}, timeout=180)
         self.assertEqual(r2.returncode, 0, r2.stdout + r2.stderr)
