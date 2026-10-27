@@ -65,15 +65,23 @@ class AssessCiResults(unittest.TestCase):
         self.assertTrue(self.assess([result(1, plan_id="other"), result(2), result(3)])["problems"])
         self.assertTrue(self.assess([result(1, revision="rev-0"), result(2), result(3)])["problems"])
 
-    def test_an_incomplete_summary_is_a_hard_problem(self):
-        self.assertTrue(self.assess([result(1, files_ran=1), result(2), result(3)])["problems"])
-        self.assertTrue(self.assess([result(1, saw=False), result(2), result(3)])["problems"])
+    def test_an_incomplete_summary_is_a_coverage_gap_not_a_hard_problem(self):
+        for r1 in (result(1, files_ran=1), result(1, saw=False)):
+            a = self.assess([r1, result(2), result(3)])
+            self.assertEqual(a["problems"], [])
+            self.assertEqual([g["shard"] for g in a["gaps"]], [1])
 
-    def test_a_timed_out_shard_is_a_hard_problem(self):
-        self.assertTrue(self.assess([result(1, "timed-out"), result(2), result(3)])["problems"])
+    def test_a_timed_out_shard_is_a_coverage_gap(self):
+        a = self.assess([result(1, "timed-out"), result(2), result(3)])
+        self.assertEqual(([g["shard"] for g in a["gaps"]], a["problems"]), ([1], []))
 
-    def test_a_failing_file_outside_the_shard_is_a_hard_problem(self):
-        self.assertTrue(self.assess([result(1, "failed", ["test/c.test.ts"]), result(2), result(3)])["problems"])
+    def test_named_failures_inside_an_incomplete_shard_still_reach_the_comparison(self):
+        a = self.assess([result(1, "failed", ["test/b.test.ts"], files_ran=1, failures=[("test/b.test.ts", "g > x")]), result(2), result(3)])
+        self.assertEqual(a["failing_files"], ["test/b.test.ts"])
+
+    def test_failure_attribution_outside_the_shard_is_a_coverage_gap(self):
+        a = self.assess([result(1, "failed", ["test/c.test.ts"]), result(2), result(3)])
+        self.assertEqual(([g["shard"] for g in a["gaps"]], a["problems"]), ([1], []))
 
     def test_a_failure_with_no_attribution_at_all_is_unaccounted(self):
         a = self.assess([result(1, "failed"), result(2), result(3)])
@@ -102,6 +110,38 @@ class AssessCiResults(unittest.TestCase):
     def test_a_containment_line_for_another_shard_does_not_count(self):
         log = CONTAIN.format(i=2, paths="~/.codex/state_5.sqlite-wal")
         self.assertEqual(len(self.assess([result(1, "failed", [], 1), result(2), result(3)], {1: log})["unaccounted"]), 1)
+
+
+class CompareGaps(unittest.TestCase):
+    def gap(self, shard):
+        return {"shard": shard, "files": next(s["files"] for s in PLAN["shards"] if s["shard"] == shard), "reason": "x"}
+
+    def test_a_gap_also_present_upstream_is_environmental(self):
+        env, blocking = lib.compare_gaps([self.gap(1)], [self.gap(1), self.gap(2)], PLAN, PLAN)
+        self.assertEqual(([g["shard"] for g in env], blocking), ([1], []))
+
+    def test_a_gap_only_on_the_merge_blocks(self):
+        env, blocking = lib.compare_gaps([self.gap(1), self.gap(2)], [self.gap(1)], PLAN, PLAN)
+        self.assertEqual(([g["shard"] for g in env], [g["shard"] for g in blocking]), ([1], [2]))
+
+    def test_plans_with_different_shard_file_sets_cannot_be_compared(self):
+        other = {**PLAN, "shards": [{**PLAN["shards"][0], "files": ["test/a.test.ts"]}, *PLAN["shards"][1:]]}
+        with self.assertRaises(lib.SyncError):
+            lib.compare_gaps([self.gap(1)], [self.gap(1)], PLAN, other)
+
+
+class FocusedTests(unittest.TestCase):
+    def test_changed_tests_and_tests_naming_a_changed_source_are_focused(self):
+        sources = {
+            "test/outside-review-result.test.ts": "import { x } from '../lib/outside-review-result';",
+            "test/probe.test.ts": "const PROBE = path.join(ROOT, 'bin', 'gstack-codex-probe');",
+            "test/unrelated.test.ts": "import { y } from '../lib/other';",
+            "test/plain-name.test.ts": "spawn('bin/gstack-codex-probe')",
+        }
+        changed = ["lib/outside-review-result.ts", "bin/gstack-codex-probe", "test/codex-hardening.test.ts",
+                   "docs/changes/x/plan.md", ".forgejo/scripts/fork-sync"]
+        got = lib.focused_test_files(changed, list(sources) + ["test/codex-hardening.test.ts"], lambda f: sources.get(f, ""))
+        self.assertEqual(got, ["test/codex-hardening.test.ts", "test/outside-review-result.test.ts", "test/plain-name.test.ts", "test/probe.test.ts"])
 
 
 class ExclusiveShards(unittest.TestCase):
@@ -547,15 +587,16 @@ if a[:1] == ["-e"]:
 if a[:2] == ["run", "scripts/test-free-shards.ts"]:
     if "--ci-plan" in a:
         json.dump({{"id": "p1", "revision": "r1", "version": 1, "shards": sc["shards"]}}, open(flag("--ci-plan"), "w")); sys.exit(0)
+    side = "upstream" if "/upstream" in os.getcwd() else "merge"
     if "--ci-run" in a:
-        n = flag("--shard"); r = sc["results"].get(n)
+        n = flag("--shard"); r = sc.get("results_" + side, sc["results"]).get(n)
         print(sc.get("logs", {{}}).get(n, ""))
         if r is None:
             sys.exit(1)
         json.dump({{"planId": "p1", "revision": "r1", "retry": None, "outcome": r}}, open(flag("--result"), "w"))
         sys.exit(0 if r["status"] == "passed" else 1)
     if "--ci-verify" in a:
-        print("[test:free] verify (stub)"); sys.exit(sc["verify_exit"])
+        print("[test:free] verify (stub)"); sys.exit(sc.get("verify_exit_" + side, sc["verify_exit"]))
 if a[:2] == ["run", "typecheck:test"]:
     print("test typecheck ratchet: 0 known diagnostics, none new."); sys.exit(0)
 if a[:1] == ["test"]:
@@ -603,12 +644,37 @@ sys.exit(0)
         self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
         self.assertIn("shard 2 has no result", (self.run_dir / "report.md").read_text())
 
-    def test_a_timed_out_shard_stops_even_beside_a_named_failure(self):
-        r = self.run_suite({"shards": self.SHARDS, "tree_mutating": ["test/tree.test.ts"], "verify_exit": 1,
+    def test_a_shard_timed_out_only_on_the_merge_stops(self):
+        r = self.run_suite({"shards": self.SHARDS, "tree_mutating": ["test/tree.test.ts"], "verify_exit": 1, "verify_exit_upstream": 0,
                             "results": {"1": self.outcome(1, ["test/a.test.ts"], "failed", ["test/a.test.ts"], failures=[("test/a.test.ts", "g > a")]),
-                                        "2": self.outcome(2, ["test/tree.test.ts"], "timed-out")}})
+                                        "2": self.outcome(2, ["test/tree.test.ts"], "timed-out")},
+                            "results_upstream": {"1": self.outcome(1, ["test/a.test.ts"]), "2": self.outcome(2, ["test/tree.test.ts"])}})
         self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
-        self.assertIn("shard 2 timed out", (self.run_dir / "report.md").read_text())
+        self.assertIn("merge shard 2 (1 files): timed out, while the same shard is complete on upstream", (self.run_dir / "report.md").read_text())
+
+    def test_a_gap_on_both_the_merge_and_upstream_is_environmental(self):
+        gap = dict(self.outcome(1, ["test/a.test.ts"], "failed"), summary={"testsRan": 1, "filesRan": 1, "sawTerminalSummary": True})
+        gap["files"] = ["test/a.test.ts", "test/b.test.ts"]
+        shards = [{"shard": 1, "files": ["test/a.test.ts", "test/b.test.ts"], "predictedMs": 1}, self.SHARDS[1]]
+        r = self.run_suite({"shards": shards, "tree_mutating": ["test/tree.test.ts"], "verify_exit": 1,
+                            "results": {"1": gap, "2": self.outcome(2, ["test/tree.test.ts"])}})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("same shard gave none on upstream either", (self.run_dir / "report.md").read_text())
+
+    def test_a_focused_file_failing_only_on_the_merge_blocks_inside_an_environmental_gap(self):
+        self.commit_fork({"lib-thing.ts": "export const thing = 2;\n"})
+        (self.repo / "test" / "a.test.ts").write_text("import { thing } from '../lib-thing';\n")
+        git(self.repo, "add", "test/a.test.ts", env=self.env)
+        git(self.repo, "commit", "-q", "-m", "fork test names the fork file", env=self.env)
+        git(self.repo, "push", "-q", "origin", "main", env=self.env)
+        gap = dict(self.outcome(1, ["test/a.test.ts"], "failed"), summary={"testsRan": 1, "filesRan": 0, "sawTerminalSummary": False})
+        r = self.run_suite({"shards": self.SHARDS, "tree_mutating": ["test/tree.test.ts"], "verify_exit": 1,
+                            "results": {"1": gap, "2": self.outcome(2, ["test/tree.test.ts"])},
+                            "standalone": {"merge": ["g > a"], "upstream": [], "baseline": []}})
+        self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+        report = (self.run_dir / "report.md").read_text()
+        self.assertIn("fork-caused failure", report)
+        self.assertIn("test/a.test.ts :: g > a", report)
 
     def test_failure_on_upstream_too_with_agent_host_containment_passes_and_is_reported(self):
         log = ("[test:free] shard 1/2 shard cleanup or home containment failed: real home changed while this shard ran (watches ~/.claude only): "

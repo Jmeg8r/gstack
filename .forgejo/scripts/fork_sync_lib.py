@@ -104,13 +104,15 @@ def exclusive_shards(plan, tree_mutating):
 def assess_ci_results(plan, results, shard_logs, external_patterns):
     """Judge `--ci-run` results that `--ci-verify` rejected.
 
-    problems      results that are not evidence: missing, duplicate or foreign
-                  results, incomplete summaries, timeouts, inconsistent files (hard stop)
+    problems      results that are not evidence at all: missing, duplicate or foreign
+                  results, a pass that reports failures (hard stop)
+    gaps          shards whose run is not coverage: incomplete summary, timeout, or
+                  failure attribution outside the plan; compared with upstream later
     unaccounted   failures no named test explains (stop unless accepted)
     environmental containment failures touching only external agent-host paths
     failing_files files with named failures, for the paired comparison
     failures      {file: {"file :: test name"}} from the runner's named failures"""
-    problems, unaccounted, environmental = [], [], []
+    problems, unaccounted, environmental, gaps = [], [], [], []
     failing, failures = set(), {}
     by_shard = {}
     for r in results:
@@ -135,17 +137,20 @@ def assess_ci_results(plan, results, shard_logs, external_patterns):
         summary = o.get("summary") or {}
         complete = isinstance(summary.get("testsRan"), int) and summary["testsRan"] >= 0 and summary.get("filesRan") == len(files) \
             and (summary.get("sawTerminalSummary") is True if files else True)
-        if not complete:
-            problems.append(f"shard {n} has an incomplete execution summary {summary}; it is not coverage")
-            continue
         status = o.get("status")
         named = o.get("failingFiles") or []
         unattr = o.get("unattributedFailures") or 0
-        if status == "timed-out":
-            problems.append(f"shard {n} timed out")
-            continue
-        if any(f not in files for f in named):
-            problems.append(f"shard {n} reports failing files outside its plan: {sorted(set(named) - set(files))}")
+        outside = sorted(set(named) - set(files))
+        in_plan = [f for f in named if f in files]
+        reason = ("timed out" if status == "timed-out" else f"incomplete execution summary {summary}" if not complete
+                  else f"failure attribution outside its plan: {outside}" if outside else None)
+        if reason:
+            # Not coverage, but its in-plan named failures are still real failures to compare.
+            gaps.append({"shard": n, "files": files, "reason": reason})
+            failing.update(in_plan)
+            for fl in o.get("failures") or []:
+                if fl.get("file") in in_plan:
+                    failures.setdefault(fl["file"], set()).add(f"{fl['file']} :: {TEMP_PATH.sub('', str(fl.get('testName', ''))).strip()}")
             continue
         if status == "passed":
             if named or unattr:
@@ -169,8 +174,48 @@ def assess_ci_results(plan, results, shard_logs, external_patterns):
                 unaccounted.append(f"shard {n}: unattributed failure(s) not explained by a named test ({why})")
         elif not named:
             unaccounted.append(f"shard {n} failed with no named failure and no unattributed count")
-    return {"problems": problems, "unaccounted": unaccounted, "environmental": environmental,
+    return {"problems": problems, "gaps": gaps, "unaccounted": unaccounted, "environmental": environmental,
             "failing_files": sorted(failing), "failures": failures}
+
+
+def compare_gaps(merge_gaps, upstream_gaps, merge_plan, upstream_plan):
+    """Split the merge's coverage gaps into environmental ones (the shard with the same
+    file set also has a gap upstream) and blocking ones. Plans whose shard file sets
+    differ cannot be compared shard for shard, so that fails closed."""
+    def sets(plan):
+        return [tuple(s["files"]) for s in plan["shards"]]
+    if sets(merge_plan) != sets(upstream_plan):
+        raise SyncError("the merge and upstream CI plans pack different shard file sets, so their coverage gaps cannot be compared shard for shard")
+    upstream_gap_files = {tuple(g["files"]) for g in upstream_gaps}
+    environmental = [g for g in merge_gaps if tuple(g["files"]) in upstream_gap_files]
+    blocking = [g for g in merge_gaps if tuple(g["files"]) not in upstream_gap_files]
+    return environmental, blocking
+
+
+MIN_FOCUS_BASENAME = 8
+
+
+def focused_test_files(changed, test_files, read_text):
+    """Test files that must always run alone: those the fork changed, plus those whose
+    source names a fork-changed source file by its path without extension (an import
+    specifier or a spawned path). docs/ and .forgejo/ changes trigger nothing."""
+    triggers = []
+    for f in changed:
+        if f.startswith(("docs/", ".forgejo/")) or f.endswith(".test.ts"):
+            continue
+        stem = re.sub(r"\.(ts|js|mjs|tsx|md|tmpl)$", "", f)
+        if stem.endswith(".md"):
+            stem = stem[:-3]
+        triggers.append(stem)
+    # The basename too: tests often build paths piecewise (path.join(ROOT, 'bin', name)).
+    # Short basenames are skipped so a generic word cannot pull in the whole suite.
+    names = triggers + [b for b in (t.rsplit("/", 1)[-1] for t in triggers) if len(b) >= MIN_FOCUS_BASENAME]
+    focused = {f for f in changed if f.endswith(".test.ts") and f in test_files}
+    for t in test_files:
+        text = read_text(t)
+        if any(n in text for n in names):
+            focused.add(t)
+    return sorted(focused)
 
 
 def blocking_dirty(porcelain_lines):
