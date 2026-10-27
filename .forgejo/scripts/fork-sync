@@ -8,6 +8,7 @@
 #       Design: docs/changes/2026-10-26-fork-sync/plan.md. Usage: README.md here.
 
 import argparse
+import contextlib
 import importlib.machinery
 import importlib.util
 import json
@@ -26,6 +27,7 @@ EXIT_OK = 0
 EXIT_USAGE = 2
 EXIT_LOCKED = 3
 EXIT_STOPPED = 10
+EXIT_INTERRUPTED = 130
 
 DEFAULT_MIRROR = "https://github.com/Jmeg8r/gstack.git"
 DEFAULT_RERUNS = 3
@@ -65,18 +67,33 @@ def run(cmd, cwd, log=None, timeout=None):
     # Its own process group, so a timeout takes down every process the command
     # started (a test's helper children), not just the command itself.
     p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, start_new_session=True)
-    try:
-        so, se = p.communicate(timeout=timeout)
-        out, code = so + se, p.returncode
-    except subprocess.TimeoutExpired:
-        kill_group(p)
-        so, se = p.communicate()
-        out, code = so + se + f"\n[fork-sync] timed out after {timeout}s; killed its process group\n", lib.TIMEOUT_EXIT
+    with reaped([p]):
+        try:
+            so, se = p.communicate(timeout=timeout)
+            out, code = so + se, p.returncode
+        except subprocess.TimeoutExpired:
+            kill_group(p)
+            so, se = p.communicate()
+            out, code = so + se + f"\n[fork-sync] timed out after {timeout}s; killed its process group\n", lib.TIMEOUT_EXIT
     if log:
         log.parent.mkdir(parents=True, exist_ok=True)
         with log.open("a") as f:
             f.write(f"$ {' '.join(map(str, cmd))}  (cwd {cwd})\n{out}\n[exit {code}]\n\n")
     return code, out
+
+
+@contextlib.contextmanager
+def reaped(procs):
+    """Kill and reap every group in `procs` when anything escapes, Ctrl-C and SIGTERM
+    included. The groups run in their own sessions, so the terminal's signal never
+    reaches them, and main() releases the run lock on the way out: a resume must not
+    start a second suite over live workers."""
+    try:
+        yield
+    except BaseException:
+        for p in procs:
+            kill_group(p)
+        raise
 
 
 def kill_group(proc):
@@ -330,23 +347,24 @@ class Sync:
     def run_ci_shards(self, wt, log_dir, plan_file, results_dir, numbers):
         """Run `--ci-run` for these shards at once, each in its own process group with
         its own log; every shard gets the same outer deadline."""
-        procs = {}
-        for n in numbers:
-            log = log_dir / f"shard-{n}.log"
-            log.parent.mkdir(parents=True, exist_ok=True)
-            fh = log.open("w")
-            cmd = ["bun", "--no-env-file", "run", "scripts/test-free-shards.ts", "--ci-run", str(plan_file), "--shard", str(n), "--result", str(results_dir / f"{n}.json")]
-            procs[n] = (subprocess.Popen(cmd, cwd=wt, stdout=fh, stderr=subprocess.STDOUT, start_new_session=True,
-                                         env={k: v for k, v in os.environ.items() if k != "GSTACK_FREE_RETRY_FLAKY"}), fh)
-        deadline = time.monotonic() + SUITE_TIMEOUT_S
-        for n, (proc, fh) in procs.items():
-            try:
-                proc.wait(timeout=max(1, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:
-                for other, _ in procs.values():
-                    kill_group(other)
-                raise Stop("suite", [f"`--ci-run` shards exceeded the {SUITE_TIMEOUT_S}s outer deadline; killed their process groups"])
-            finally:
+        launched, handles = [], []
+        try:
+            with reaped(launched):
+                for n in numbers:
+                    log = log_dir / f"shard-{n}.log"
+                    log.parent.mkdir(parents=True, exist_ok=True)
+                    handles.append(log.open("w"))
+                    cmd = ["bun", "--no-env-file", "run", "scripts/test-free-shards.ts", "--ci-run", str(plan_file), "--shard", str(n), "--result", str(results_dir / f"{n}.json")]
+                    launched.append(subprocess.Popen(cmd, cwd=wt, stdout=handles[-1], stderr=subprocess.STDOUT, start_new_session=True,
+                                                     env={k: v for k, v in os.environ.items() if k != "GSTACK_FREE_RETRY_FLAKY"}))
+                deadline = time.monotonic() + SUITE_TIMEOUT_S
+                for proc in launched:
+                    try:
+                        proc.wait(timeout=max(1, deadline - time.monotonic()))
+                    except subprocess.TimeoutExpired:
+                        raise Stop("suite", [f"`--ci-run` shards exceeded the {SUITE_TIMEOUT_S}s outer deadline; killed their process groups"])
+        finally:
+            for fh in handles:
                 fh.close()
 
     def run_ci(self, wt, label):
@@ -753,5 +771,15 @@ def drive(sync, args, start, fresh):
     return EXIT_OK
 
 
+def _terminate(signum, frame):
+    raise KeyboardInterrupt
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    # SIGTERM unwinds like Ctrl-C, so the same cleanup reaps every launched group.
+    signal.signal(signal.SIGTERM, _terminate)
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        say("interrupted; every process group fork-sync started was stopped. Re-run to resume.")
+        sys.exit(EXIT_INTERRUPTED)

@@ -64,7 +64,7 @@ rm -r <run dir>
 
 ### Exit codes
 
-`0` done through `--until` (or nothing to sync) · `2` usage or environment error · `3` another run holds the lock (or a stale lock: remove it once no run is active) · `10` stopped on a problem, with nothing pushed.
+`0` done through `--until` (or nothing to sync) · `2` usage or environment error · `3` another run holds the lock (or a stale lock: remove it once no run is active) · `10` stopped on a problem, with nothing pushed. · `130` interrupted (Ctrl-C or SIGTERM) after stopping every process group it started; re-run to resume.
 
 ### What it never does
 

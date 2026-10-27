@@ -4,8 +4,11 @@
 #       problem, so the stop paths are what the integration tests exercise.
 # Run:  python3 -m unittest discover -s .forgejo/scripts -p 'test_*.py' -v
 
+import importlib.machinery
+import importlib.util
 import json
 import os
+import signal
 import subprocess
 import time
 import sys
@@ -41,6 +44,42 @@ def result(shard, status="passed", failing=(), unattributed=0, files_ran=None, f
 EXTERNAL = ["~/.claude/backups/.claude.json.backup.*", "~/.codex/*.sqlite-wal"]
 CONTAIN = ("[test:free] shard {i}/3 shard cleanup or home containment failed: real home changed while this shard ran "
            "(watches ~/.gstack, ~/.claude, ~/.codex, ~/.agents, ~/.config/gstack only): {paths}. Give the writer a private HOME. Shard files: x; retained /tmp/s")
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    # A reparented zombie is gone in every way that matters.
+    return subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()[:1] not in ("Z", "")
+
+
+def load_cli():
+    loader = importlib.machinery.SourceFileLoader("fork_sync_cli", str(CLI))
+    spec = importlib.util.spec_from_loader("fork_sync_cli", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+class InterruptedRun(unittest.TestCase):
+    def test_an_interrupt_kills_the_commands_whole_group_before_propagating(self):
+        cli = load_cli()
+        with tempfile.TemporaryDirectory() as d:
+            pid_file = Path(d) / "pid"
+            def interrupt(*_):
+                raise KeyboardInterrupt
+            old = signal.signal(signal.SIGALRM, interrupt)
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 1.0)
+                with self.assertRaises(KeyboardInterrupt):
+                    cli.run(["sh", "-c", f"sleep 60 & echo $! > {pid_file}; wait"], d)
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, old)
+            time.sleep(0.5)
+            self.assertFalse(alive(int(pid_file.read_text())), "the command's child must not outlive the interrupt")
 
 
 class AssessCiResults(unittest.TestCase):
@@ -625,7 +664,7 @@ class Integration(unittest.TestCase):
         self.assertIn("finished", r.stdout.lower())
 
     STUB = r"""#!{python}
-import json, os, sys
+import json, os, subprocess, sys, time
 calls = os.environ["FAKE_CALLS"]
 with open(calls, "a") as f:
     f.write(" ".join(sys.argv[1:]) + "\n")
@@ -646,6 +685,10 @@ if a[:2] == ["run", "scripts/test-free-shards.ts"]:
         n = flag("--shard"); r = sc.get("results_" + side, sc["results"]).get(n)
         if sc.get("require_log_dir") and not os.path.isdir(os.path.join(".context", "free-test-logs")):
             print("EEXIST race stand-in: .context/free-test-logs was not created before the shards started"); sys.exit(3)
+        if n in sc.get("hang_shards", []):
+            child = subprocess.Popen(["sleep", "60"])
+            open(os.path.join(os.environ["FAKE_PIDS"], n), "w").write(f"{{os.getpid()}} {{child.pid}}")
+            time.sleep(60)
         for rel in sc.get("home_writes", {{}}).get(n, []):
             target = os.path.join(os.environ["HOME"], rel)
             os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -779,6 +822,33 @@ sys.exit(0)
         r = self.run_suite({**self.FORK_CAUSED, "shard_args": {"not": "a list"}})
         self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
         self.assertIn("buildShardArgs", (self.run_dir / "report.md").read_text())
+
+    def test_sigterm_reaps_every_running_shard_group_before_the_lock_is_released(self):
+        stub = self.root / "stub-bin"
+        stub.mkdir(exist_ok=True)
+        (stub / "bun").write_text(self.STUB.format(python=sys.executable))
+        (stub / "bun").chmod(0o755)
+        (self.root / "scenario.json").write_text(json.dumps({**self.FORK_CAUSED, "hang_shards": ["1", "2"],
+                                                             "shards": [{"shard": 1, "files": ["test/a.test.ts"], "predictedMs": 1},
+                                                                        {"shard": 2, "files": ["test/b.test.ts"], "predictedMs": 1}]}))
+        self.commit_upstream({"other.txt": "new\n"}, "1.1.0.0")
+        pids_dir = self.root / "pids"
+        pids_dir.mkdir()
+        env = {**self.env, "PATH": f"{stub}:{os.environ['PATH']}", "FAKE_CI": str(self.root / "scenario.json"),
+               "FAKE_CALLS": str(self.root / "bun-calls.log"), "FAKE_PIDS": str(pids_dir)}
+        p = subprocess.Popen([sys.executable, str(CLI), "--repo", str(self.repo), "--run-dir", str(self.run_dir), "--mirror", str(self.forge), "--until", "suite"],
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+        deadline = time.monotonic() + 120
+        while len(list(pids_dir.iterdir())) < 2 and time.monotonic() < deadline and p.poll() is None:
+            time.sleep(0.2)
+        self.assertEqual(len(list(pids_dir.iterdir())), 2, "both shards should be running")
+        p.terminate()
+        out, _ = p.communicate(timeout=60)
+        self.assertEqual(p.returncode, 130, out)
+        self.assertFalse((self.run_dir / "lock").exists())
+        pids = [int(x) for f in pids_dir.iterdir() for x in f.read_text().split()]
+        time.sleep(0.5)
+        self.assertEqual([x for x in pids if alive(x)], [], "no shard process or shard child may outlive the run")
 
     def test_a_truncated_containment_line_is_settled_by_the_full_run_window(self):
         log = ("[test:free] shard 1/2 shard cleanup or home containment failed: real home changed while this shard ran (watches ~/.codex only): "
