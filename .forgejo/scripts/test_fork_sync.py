@@ -633,6 +633,9 @@ sc = json.load(open(os.environ["FAKE_CI"]))
 a = [x for x in sys.argv[1:] if x not in ("--no-env-file", "--config=/dev/null")]
 def flag(name):
     return a[a.index(name) + 1]
+if a[:1] == ["-e"] and "buildShardArgs" in a[1]:
+    target = json.loads(a[1].split("buildShardArgs([", 1)[1].split("]", 1)[0])
+    print(json.dumps(sc.get("shard_args", ["test", target, "--timeout=30000", "--max-concurrency=1"]))); sys.exit(0)
 if a[:1] == ["-e"]:
     print(json.dumps(sc.get("tree_mutating", []))); sys.exit(0)
 if a[:2] == ["run", "scripts/test-free-shards.ts"]:
@@ -759,6 +762,23 @@ sys.exit(0)
                             "standalone": {"merge": ["g > a"], "upstream": [], "baseline": []}})
         self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
         self.assertIn("fork-caused failure", (self.run_dir / "report.md").read_text())
+
+    FORK_CAUSED = {"shards": SHARDS, "tree_mutating": ["test/tree.test.ts"], "verify_exit": 1,
+                   "results": {"1": outcome(None, 1, ["test/a.test.ts"], "failed", ["test/a.test.ts"], failures=[("test/a.test.ts", "g > a")]),
+                               "2": outcome(None, 2, ["test/tree.test.ts"])},
+                   "standalone": {"merge": ["g > a"], "upstream": [], "baseline": []}}
+
+    def test_standalone_reruns_take_the_runners_own_shard_arguments(self):
+        self.assertEqual(self.run_suite(self.FORK_CAUSED).returncode, 10)
+        reruns = [c for c in (self.root / "bun-calls.log").read_text().splitlines() if c.startswith("--no-env-file test ")]
+        self.assertTrue(reruns)
+        for c in reruns:
+            self.assertTrue(c.endswith("/test/a.test.ts --timeout=30000 --max-concurrency=1"), c)
+
+    def test_an_unusable_shard_argument_answer_stops_instead_of_guessing(self):
+        r = self.run_suite({**self.FORK_CAUSED, "shard_args": {"not": "a list"}})
+        self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+        self.assertIn("buildShardArgs", (self.run_dir / "report.md").read_text())
 
     def test_a_truncated_containment_line_is_settled_by_the_full_run_window(self):
         log = ("[test:free] shard 1/2 shard cleanup or home containment failed: real home changed while this shard ran (watches ~/.codex only): "

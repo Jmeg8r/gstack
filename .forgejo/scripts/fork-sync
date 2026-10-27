@@ -294,13 +294,26 @@ class Sync:
 
     def run_file(self, wt, test_file, tag):
         log = self.logs / "suite-files" / f"{tag}.log"
-        # Absolute selector: bun treats a relative path as a substring filter, so
-        # test/x.test.ts would also run browse/test/x.test.ts.
-        code, out = run(["bun", "test", str((wt / test_file).resolve())], wt, log=log, timeout=SUITE_FILE_TIMEOUT_S)
+        code, out = run(["bun", *self.shard_args(wt, test_file)], wt, log=log, timeout=SUITE_FILE_TIMEOUT_S)
         try:
             return lib.parse_bun_run(test_file, code, out)
         except lib.SyncError as e:
             raise Stop("suite", [f"{e} (in `{wt.name}`; see `{log}`)"]) from e
+
+    def shard_args(self, wt, test_file):
+        """The tree's own `buildShardArgs([file])`: the per-test timeout, concurrency
+        and exact absolute selector the runner's shards use, so a standalone rerun
+        observes a file the way the suite did (bun's own 5 s default would not)."""
+        target = json.dumps(str((wt / test_file).resolve()))
+        code, out = run(["bun", "--config=/dev/null", "-e",
+                         f"import {{ buildShardArgs }} from './scripts/test-free-shards.ts'; console.log(JSON.stringify(buildShardArgs([{target}], {{ rootDir: process.cwd() }})))"], wt)
+        try:
+            args = json.loads(out.strip().splitlines()[-1]) if code == 0 else None
+        except (json.JSONDecodeError, IndexError):
+            args = None
+        if not (isinstance(args, list) and args[:1] == ["test"] and all(isinstance(a, str) for a in args)):
+            raise Stop("suite", [f"could not read buildShardArgs from scripts/test-free-shards.ts in `{wt.name}` (exit {code}); a rerun without the runner's settings is not comparable:\n```\n{out.strip()[-600:]}\n```"])
+        return args
 
     def tree_mutating(self, wt):
         """The runner's own TREE_MUTATING export; no guessing which shard must run alone."""
