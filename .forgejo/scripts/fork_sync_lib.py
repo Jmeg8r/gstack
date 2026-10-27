@@ -39,12 +39,13 @@ BUN_ERRORS = re.compile(r"^\s*(\d+) errors?$", re.M)
 
 
 def parse_bun_run(test_file, exit_code, output):
-    """Failing tests from one standalone `bun test <file>` run, refusing any run that
-    did not finish. A timeout, a missing `Ran N tests` line, or a failing exit with no
-    named failure means the run is no evidence either way, so it must not count as a
-    clean observation. Unhandled errors between tests count as a failure of their own."""
+    """Failing tests from one standalone `bun test <file>` run. A timeout is a failing
+    run: what it named before the hang plus `<timed out>`, so a hang is compared with
+    upstream like any failure and never reads as clean. A missing `Ran N tests` line or
+    a failing exit with no named failure is no evidence either way and is refused.
+    Unhandled errors between tests count as a failure of their own."""
     if exit_code == TIMEOUT_EXIT:
-        raise SyncError(f"`bun test {test_file}` timed out; an unfinished run cannot be classified")
+        return parse_bun_fails(test_file, output) | {f"{test_file} :: <timed out>"}
     done = BUN_COMPLETED.search(output)
     if not done:
         raise SyncError(f"`bun test {test_file}` exited {exit_code} without bun's `Ran N tests` line; it did not complete")

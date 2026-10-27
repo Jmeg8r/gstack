@@ -214,9 +214,15 @@ class ParseBunRun(unittest.TestCase):
         with self.assertRaises(lib.SyncError):
             lib.parse_bun_run("t.ts", 1, "error: Cannot find module './gone'\n")
 
-    def test_timeout_is_incomplete_even_with_partial_results(self):
-        with self.assertRaises(lib.SyncError):
-            lib.parse_bun_run("t.ts", 124, "(fail) g > a\n[fork-sync] timed out after 600s\n")
+    def test_timeout_is_a_failing_run_that_keeps_its_partial_failures(self):
+        self.assertEqual(lib.parse_bun_run("t.ts", 124, "(fail) g > a\n[fork-sync] timed out after 600s\n"),
+                         {"t.ts :: g > a", "t.ts :: <timed out>"})
+
+    def test_a_hang_on_both_trees_is_upstream_and_a_merge_only_hang_is_fork_caused(self):
+        hang = lib.parse_bun_run("t.ts", 124, "")
+        clean = lib.parse_bun_run("t.ts", 0, " 4 pass\n 0 fail\nRan 4 tests across 1 file.")
+        self.assertEqual(lib.classify([hang], [hang], [hang]), {"t.ts :: <timed out>": "upstream"})
+        self.assertEqual(lib.classify([hang], [clean], [clean]), {"t.ts :: <timed out>": "fork-caused"})
 
     def test_nonzero_exit_with_no_named_failure_is_incomplete(self):
         with self.assertRaises(lib.SyncError):
