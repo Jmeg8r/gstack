@@ -23,18 +23,28 @@ FAIL_SUMMARY = re.compile(r"^\[test:free\] FAIL — (\d+) failing test")
 # The runner's own markers for a run that did not finish or could not name what failed
 # (buildRunEpilogue in scripts/test-free-shards.ts). A crash that passed on its retry
 # is the one `⚠` line that still means the tests ran.
-INCOMPLETE = [re.compile(r"^  ⚠ (?!crashed\+retried: )"), re.compile(r"^  ⏱ "), re.compile(r"exceeded the \d+s wall-clock deadline")]
+INCOMPLETE = [re.compile(r"^  ⚠ (?!crashed\+retried: )"), re.compile(r"^  ⏱ "), re.compile(r"exceeded the \d+s wall-clock deadline"),
+              re.compile(r" exited 0 but .* Treating as FAILED")]
+# A shard whose tests ran but whose sandbox leaked into the real home. Not proof of
+# incomplete coverage, but not accounted for by any named test either.
+CONTAINMENT = re.compile(r" shard cleanup or home containment failed: ")
 
 
 def parse_free_log(text):
-    """Failing tests in a `bun run test --verbose` log, as {file: {"file :: name"}}.
-    Fails closed when the runner says a shard did not finish, a failure has no named
-    result, an error happened between tests, or failures are reported but none named."""
+    """Failing tests in a `bun run test --verbose` log, as ({file: {"file :: name"}},
+    [shard diagnostics]). Fails closed when the runner says a shard did not finish, a
+    failure has no named result, an error happened between tests, or failures are
+    reported but none named. Home-containment failures come back as diagnostics: the
+    caller must account for them, never ignore them."""
     failures = {}
+    diagnostics = []
     reported = 0
     for line in text.splitlines():
         if any(p.search(line) for p in INCOMPLETE):
             raise SyncError(f"the free runner reports an incomplete or unattributed run: {line.strip()!r}; an unfinished suite cannot clear the gate")
+        if CONTAINMENT.search(line):
+            diagnostics.append(line.strip())
+            continue
         m = FAILED_TEST.match(line)
         if m:
             failures.setdefault(m.group(1), set()).add(f"{m.group(1)} :: {TEMP_PATH.sub('', m.group(2)).strip()}")
@@ -48,7 +58,7 @@ def parse_free_log(text):
             reported += int(s.group(1))
     if reported and not failures:
         raise SyncError(f"the free runner reported {reported} failing test(s) but no line names a file; refusing to call the suite clean")
-    return failures
+    return failures, diagnostics
 
 
 BUN_FAIL = re.compile(r"^\(fail\) (.*?)(?: \[[0-9.]+m?s\])?$")
@@ -66,7 +76,7 @@ def parse_bun_fails(test_file, output):
 
 
 TIMEOUT_EXIT = 124
-BUN_COMPLETED = re.compile(r"^Ran \d+ tests? across ", re.M)
+BUN_COMPLETED = re.compile(r"^Ran \d+ tests? across (\d+) files?\b", re.M)
 BUN_ERRORS = re.compile(r"^\s*(\d+) errors?$", re.M)
 
 
@@ -77,8 +87,11 @@ def parse_bun_run(test_file, exit_code, output):
     clean observation. Unhandled errors between tests count as a failure of their own."""
     if exit_code == TIMEOUT_EXIT:
         raise SyncError(f"`bun test {test_file}` timed out; an unfinished run cannot be classified")
-    if not BUN_COMPLETED.search(output):
+    done = BUN_COMPLETED.search(output)
+    if not done:
         raise SyncError(f"`bun test {test_file}` exited {exit_code} without bun's `Ran N tests` line; it did not complete")
+    if done.group(1) != "1":
+        raise SyncError(f"`bun test {test_file}` ran {done.group(1)} files; the selector must match exactly one, or its failures cannot be attributed")
     names = parse_bun_fails(test_file, output)
     errors = sum(int(n) for n in BUN_ERRORS.findall(output))
     if errors:

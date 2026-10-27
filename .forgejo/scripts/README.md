@@ -26,7 +26,7 @@ bin/gstack-detach --label fork-sync -- .forgejo/scripts/fork-sync
 | `merge` | `git merge --no-ff` of upstream into `upgrade/sync-v<VERSION>` conflicts, or the worktree has uncommitted changes. |
 | `fork-delta` | A file the fork changed now matches upstream although upstream never took the fork's version (a dropped fork change). |
 | `checks` | `bun install`, `build:cso`, `gen:skill-docs` (or it leaves drift), `typecheck`, or `typecheck:test` (new diagnostics) fails. |
-| `suite` | A test fails on the merge in every run but never on pure upstream or on the pre-sync fork (`fork-caused`). Pre-existing, flaky and upstream failures are reported only. |
+| `suite` | The runner reports an unfinished run (a killed shard, a missing summary, unhandled errors, failures without names), or a failure no repo test accounts for (a home-containment leak, an unattributed line), or a test fails on the merge in every run but never on pure upstream or the pre-sync fork (`fork-caused`). Pre-existing, flaky, not-reproduced and upstream failures are reported only. Each file is rerun alone with an exact absolute selector, and the run must report exactly one file. |
 | `codex` | The Codex review gate is FAIL (P0/P1, or the review didn't run). PASS and UNVERIFIED continue, and the verdict is posted verbatim. |
 | `hooks-verify` | The global hooks directory changed during the run. It is never restored automatically; the report gives the restore command. |
 | `pr` | The live checkout changed, forge `main` moved, the mirror differs, or the push or `forge-pr create` fails. |
@@ -57,6 +57,7 @@ rm -r <run dir>
 | `--run-dir PATH` | `~/.gstack-dev/fork-sync/v<upstream VERSION>`, or the one unfinished run if there is one |
 | `--mirror URL` (or `FORK_SYNC_MIRROR`) | `https://github.com/Jmeg8r/gstack.git` |
 | `--accept-dropped PATH` (repeatable) | none |
+| `--accept-unaccounted` (continue past suite failures no named test accounts for, each listed in the report) | off |
 | `GSTACK_SKILL_ROOT` (where the Codex probe and validator live) | `~/.claude/skills/gstack` |
 
 ### Exit codes

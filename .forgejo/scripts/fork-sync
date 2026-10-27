@@ -257,7 +257,9 @@ class Sync:
 
     def run_file(self, wt, test_file, tag):
         log = self.logs / "suite-files" / f"{tag}.log"
-        code, out = run(["bun", "test", test_file], wt, log=log, timeout=SUITE_FILE_TIMEOUT_S)
+        # Absolute selector: bun treats a relative path as a substring filter, so
+        # test/x.test.ts would also run browse/test/x.test.ts.
+        code, out = run(["bun", "test", str((wt / test_file).resolve())], wt, log=log, timeout=SUITE_FILE_TIMEOUT_S)
         try:
             return lib.parse_bun_run(test_file, code, out)
         except lib.SyncError as e:
@@ -269,19 +271,20 @@ class Sync:
         log.unlink(missing_ok=True)
         code, out = run(["bun", "run", "test", "--verbose"], self.merge_wt, log=log)
         try:
-            listed = lib.parse_free_log(out)
+            listed, diagnostics = lib.parse_free_log(out)
         except lib.SyncError as e:
             raise Stop("suite", [str(e)]) from e
         files, unattributed = lib.split_attributable(listed, lambda f: (self.merge_wt / f).is_file())
-        if unattributed and not self.args.accept_unattributed:
-            self.section("suite", f"Full free suite failed with {len(unattributed)} failure line(s) that name no repo test file:\n" + "\n".join(f"- `{u}`" for u in unattributed))
-            raise Stop("suite", [f"failure not attributable to a repo test file, so it cannot be compared with upstream: `{u}`" for u in unattributed]
-                       + [f"Inspect `{log}`; if these are known nested-run artifacts, re-run with `--accept-unattributed`."])
-        if code != 0 and not listed:
+        unaccounted = [f"failure naming no repo test file: `{u}`" for u in unattributed] + [f"shard diagnostic: `{d}`" for d in diagnostics]
+        if unaccounted and not self.args.accept_unaccounted:
+            self.section("suite", f"Full free suite: {len(unaccounted)} failure(s) that no named repo test accounts for:\n" + "\n".join(f"- {u}" for u in unaccounted))
+            raise Stop("suite", unaccounted + [f"Inspect `{log}`. If each is understood (for example the Codex app writing its own ~/.codex while the suite ran), re-run with `--accept-unaccounted`; the report will list them."])
+        if code != 0 and not listed and not diagnostics:
             raise Stop("suite", [f"`bun run test` exited {code} with no attributable failures; see `{log}`"])
         summary = next((ln for ln in reversed(out.splitlines()) if ln.startswith("Ran ")), "")
         if not files:
-            self.passed("suite", f"Full free suite clean ({summary}).")
+            accepted = ("\n\nPassed on purpose with --accept-unaccounted:\n" + "\n".join(f"- {u}" for u in unaccounted)) if unaccounted else ""
+            self.passed("suite", f"Full free suite: no failing repo test ({summary}).{accepted}\n\nGlobal hooks after the suite: {self.hooks_verify('suite')}")
             return
         say(f"{len(files)} file(s) had failures; rerunning each alone on merge, upstream and pre-sync fork")
         trees = {"merge": self.merge_wt, "upstream": self.prepared_worktree("upstream", self.pins["github"]),
@@ -317,8 +320,8 @@ class Sync:
         for side, label in (("upstream", "absent upstream (fork-only; judged against the pre-sync fork)"), ("baseline", "absent from the pre-sync fork (new upstream; judged against upstream)")):
             if absent[side]:
                 lines.append(f"\n{len(absent[side])} file(s) {label}:\n" + "\n".join(f"- `{f}`" for f in absent[side]))
-        if unattributed:
-            lines.append(f"\n{len(unattributed)} unattributable failure line(s), passed on purpose with --accept-unattributed:\n" + "\n".join(f"- `{u}`" for u in unattributed))
+        if unaccounted:
+            lines.append(f"\n{len(unaccounted)} unaccounted failure(s), passed on purpose with --accept-unaccounted:\n" + "\n".join(f"- {u}" for u in unaccounted))
         text = "\n".join(lines)
         self.section("suite", text + f"\n\nGlobal hooks after the suite: {self.hooks_verify('suite')}")
         if by["fork-caused"]:
@@ -490,7 +493,7 @@ def main():
     ap.add_argument("--run-dir", type=Path, help=f"run directory (default {RUN_ROOT}/v<upstream VERSION>, or the one unfinished run)")
     ap.add_argument("--mirror", default=os.environ.get("FORK_SYNC_MIRROR", DEFAULT_MIRROR), help="push-mirror URL that must match forge main")
     ap.add_argument("--accept-dropped", action="append", metavar="PATH", help="fork-changed file the merge may drop on purpose (repeatable)")
-    ap.add_argument("--accept-unattributed", action="store_true", help="continue past suite failures that name no repo test file (recorded in the report)")
+    ap.add_argument("--accept-unaccounted", action="store_true", help="continue past suite failures no named repo test accounts for: unattributed lines and home-containment diagnostics (listed in the report)")
     args = ap.parse_args()
     if args.reruns < 1:
         ap.error("--reruns must be at least 1")

@@ -28,13 +28,21 @@ class ParseFreeLog(unittest.TestCase):
             "  ✗ browse/test/b.test.ts (crashed: exited)",
             "[test:free] FAIL — 3 failing test(s) in 2 file(s), 0 crashed worker(s).",
         ])
-        self.assertEqual(lib.parse_free_log(log), {
+        self.assertEqual(lib.parse_free_log(log), ({
             "test/a.test.ts": {"test/a.test.ts :: suite > case one", "test/a.test.ts :: suite > case two"},
             "browse/test/b.test.ts": {"browse/test/b.test.ts :: <crashed>"},
-        })
+        }, []))
 
     def test_clean_run_has_no_failing_files(self):
-        self.assertEqual(lib.parse_free_log("[test:free] PASS — 36 tests, 1 files, 0s."), {})
+        self.assertEqual(lib.parse_free_log("[test:free] PASS — 36 tests, 1 files, 0s."), ({}, []))
+
+    def test_home_containment_failures_are_returned_even_beside_named_failures(self):
+        log = ("  ✗ test/a.test.ts — g > a\n"
+               "[test:free] shard 2/6 shard cleanup or home containment failed: real home changed: ~/.codex/x; retained /tmp/s\n")
+        failures, diagnostics = lib.parse_free_log(log)
+        self.assertEqual(set(failures), {"test/a.test.ts"})
+        self.assertEqual(len(diagnostics), 1)
+        self.assertIn("home containment failed", diagnostics[0])
 
     def test_runner_incompleteness_markers_fail_closed_even_beside_named_failures(self):
         named = "  ✗ test/a.test.ts — suite > case\n"
@@ -42,12 +50,13 @@ class ParseFreeLog(unittest.TestCase):
                        "  ⚠ unhandled error between tests (around test/b.test.ts)",
                        "  ⚠ test process ended before its summary; in flight: test/c.test.ts",
                        "  ⏱ in flight at kill: test/c.test.ts",
-                       "[test:free] shard 3/6 exceeded the 845s wall-clock deadline — killed"]:
+                       "[test:free] shard 3/6 exceeded the 845s wall-clock deadline — killed",
+                       "[test:free] shard 1/6 exited 0 but bun's summary reported 11 file(s), expected 12. Treating as FAILED."]:
             with self.assertRaises(lib.SyncError, msg=marker):
                 lib.parse_free_log(named + marker)
 
     def test_a_crash_that_passed_on_retry_is_not_incomplete(self):
-        self.assertEqual(lib.parse_free_log("  ⚠ crashed+retried: test/d.test.ts\n[test:free] PASS — 3 tests, 1 files, 0s."), {})
+        self.assertEqual(lib.parse_free_log("  ⚠ crashed+retried: test/d.test.ts\n[test:free] PASS — 3 tests, 1 files, 0s."), ({}, []))
 
     def test_reported_failures_without_attributable_lines_fail_closed(self):
         with self.assertRaises(lib.SyncError):
@@ -84,6 +93,10 @@ class ParseBunRun(unittest.TestCase):
     def test_nonzero_exit_with_no_named_failure_is_incomplete(self):
         with self.assertRaises(lib.SyncError):
             lib.parse_bun_run("t.ts", 1, " 4 pass\n 0 fail\nRan 4 tests across 1 file.")
+
+    def test_a_selector_that_ran_more_than_one_file_is_rejected(self):
+        with self.assertRaises(lib.SyncError):
+            lib.parse_bun_run("t.ts", 1, "(fail) g > a\n 3 pass\n 1 fail\nRan 4 tests across 2 files. [20.00ms]")
 
     def test_unhandled_errors_count_as_a_named_failure(self):
         out = "# Unhandled error between tests\n 4 pass\n 0 fail\n 1 error\nRan 4 tests across 1 file."
