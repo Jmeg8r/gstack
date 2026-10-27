@@ -756,6 +756,8 @@ if a[:2] == ["run", "scripts/test-free-shards.ts"]:
         sys.exit(0 if r["status"] == "passed" else 1)
     if "--ci-verify" in a:
         print("[test:free] verify (stub)"); sys.exit(sc.get("verify_exit_" + side, sc["verify_exit"]))
+if a[:1] and a[0].endswith("outside-review-result.ts"):
+    print("VERDICT: stub"); sys.exit(sc.get("codex_gate_exit", 0))
 if a[:2] == ["run", "typecheck:test"]:
     print("test typecheck ratchet: 0 known diagnostics, none new."); sys.exit(0)
 if a[:1] == ["test"]:
@@ -918,6 +920,34 @@ sys.exit(0)
         self.assertEqual((archived / "ci-merge" / "results" / "1.json").read_text(), first)
         self.assertEqual((archived / "logs" / "ci-merge" / "shard-1.log").read_text(), "first attempt\n")
         self.assertTrue((self.run_dir / "ci-merge" / "results" / "1.json").exists(), "the current attempt keeps the usual paths")
+
+    def fake_skill_root(self):
+        root = self.root / "skill"
+        (root / "bin").mkdir(parents=True)
+        (root / "lib").mkdir()
+        (root / "lib" / "outside-review-result.ts").write_text("")
+        (root / "bin" / "gstack-review-log").write_text("#!/bin/sh\necho token\n")
+        (root / "bin" / "gstack-codex-probe").write_text(
+            "#!/bin/sh\nif [ \"$1\" = select-model ]; then echo 'CODEX_SEL: m'; echo 'CODEX_SANDBOX: read-only'; exit 0; fi\n"
+            f"n=$(cat {self.root}/codex-n 2>/dev/null || echo 0); n=$((n+1)); echo $n > {self.root}/codex-n; echo \"review $n\"\n")
+        for f in ("bin/gstack-review-log", "bin/gstack-codex-probe"):
+            (root / f).chmod(0o755)
+        return root
+
+    def test_a_resumed_codex_review_archives_the_previous_attempt(self):
+        passing = {"shards": self.SHARDS, "tree_mutating": ["test/tree.test.ts"], "verify_exit": 0, "codex_gate_exit": 3,
+                   "results": {"1": self.outcome(1, ["test/a.test.ts"]), "2": self.outcome(2, ["test/tree.test.ts"])}}
+        self.assertEqual(self.run_suite(passing).returncode, 0)
+        env = {**self.env, "PATH": f"{self.root / 'stub-bin'}:{os.environ['PATH']}", "FAKE_CI": str(self.root / "scenario.json"),
+               "FAKE_CALLS": str(self.root / "bun-calls.log"), "GSTACK_SKILL_ROOT": str(self.fake_skill_root())}
+        cmd = [sys.executable, str(CLI), "--repo", str(self.repo), "--run-dir", str(self.run_dir), "--mirror", str(self.forge), "--until", "codex"]
+        for _ in range(2):
+            r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=180)
+            self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+        archived = self.run_dir / "attempts" / "1"
+        self.assertEqual((archived / "logs" / "codex.out").read_text(), "review 1\n")
+        self.assertEqual(json.loads((archived / "codex-state.json").read_text())["gate"], "FAIL")
+        self.assertEqual((self.run_dir / "logs" / "codex.out").read_text(), "review 2\n")
 
     def test_a_truncated_containment_line_is_settled_by_the_full_run_window(self):
         log = ("[test:free] shard 1/2 shard cleanup or home containment failed: real home changed while this shard ran (watches ~/.codex only): "

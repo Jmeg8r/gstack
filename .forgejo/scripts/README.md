@@ -4,7 +4,7 @@ These live under `.forgejo/` so they never conflict with upstream on a sync. Not
 
 ## fork-sync
 
-Syncs the `jfcadm/gstack` fork with upstream `garrytan/gstack` up to the merge decision, and no further. Every problem stops the run **before anything is pushed**; re-running resumes from the first stage that hasn't passed. A resumed suite stage first moves the earlier attempt's CI plans, results and shard logs to `attempts/<n>/` in the run directory.
+Syncs the `jfcadm/gstack` fork with upstream `garrytan/gstack` up to the merge decision, and no further. Every problem stops the run **before anything is pushed**; re-running resumes from the first stage that hasn't passed. A resumed suite or Codex stage first moves the earlier attempt's evidence (CI plans, results and shard logs; the review output and verdict) to `attempts/<n>/` in the run directory.
 
 ```bash
 .forgejo/scripts/fork-sync --until checks   # dry run: through the build checks, nothing pushed

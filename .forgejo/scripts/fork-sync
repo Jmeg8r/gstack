@@ -457,25 +457,28 @@ class Sync:
         logs = {x["shard"]: (log_dir / f"shard-{x['shard']}.log").read_text() if (log_dir / f"shard-{x['shard']}.log").exists() else "" for x in plan["shards"]}
         return plan, results, logs, vcode, vout, window
 
-    def archive_ci_evidence(self):
-        """Move an earlier suite attempt's CI plans, results, home windows and shard
-        logs to attempts/<n>/ before a resume replans, so the original failure
-        survives; only the current attempt is ever verified."""
-        found = [d for label in ("merge", "upstream") for d in (self.run_dir / f"ci-{label}", self.logs / f"ci-{label}") if d.exists()]
-        if not found:
+    def archive_attempt(self, what, paths, extra=None):
+        """Move an earlier attempt's evidence (`paths` under the run directory, plus
+        `extra` files to write) to attempts/<n>/ before a resume repeats the work, so
+        the original failure survives; only the current attempt is ever judged."""
+        found = [p for p in paths if p.exists()]
+        if not found and not extra:
             return
         n = 1
         while (self.run_dir / "attempts" / str(n)).exists():
             n += 1
         dest = self.run_dir / "attempts" / str(n)
-        for d in found:
-            target = dest / d.relative_to(self.run_dir)
+        dest.mkdir(parents=True)
+        for p in found:
+            target = dest / p.relative_to(self.run_dir)
             target.parent.mkdir(parents=True, exist_ok=True)
-            d.rename(target)
-        say(f"kept the previous suite attempt's evidence in {dest}")
+            p.rename(target)
+        for name, text in (extra or {}).items():
+            (dest / name).write_text(text)
+        say(f"kept the previous {what} attempt's evidence in {dest}")
 
     def suite(self):
-        self.archive_ci_evidence()
+        self.archive_attempt("suite", [d for label in ("merge", "upstream") for d in (self.run_dir / f"ci-{label}", self.logs / f"ci-{label}")])
         plan, results, logs, vcode, vout, window = self.run_ci(self.merge_wt, "merge")
         files_total = sum(len(x["files"]) for x in plan["shards"])
         if vcode == 0:
@@ -570,6 +573,9 @@ class Sync:
         for p in (probe, review_log, validator):
             if not p.exists():
                 raise Stop("codex", [f"gstack install is missing `{p}`; set GSTACK_SKILL_ROOT or run ./setup"])
+        previous = self.state.data.get("codex")
+        self.archive_attempt("Codex review", [self.logs / n for n in ("codex.log", "codex.out", "codex.err")],
+                             {"codex-state.json": json.dumps(previous, indent=2) + "\n"} if previous else None)
         _, token = run([str(review_log), "--start", "codex-review"], self.merge_wt)
         code, sel = run([str(probe), "select-model", "review"], self.merge_wt, log=self.logs / "codex.log")
         model = next((ln.split(": ", 1)[1] for ln in sel.splitlines() if ln.startswith("CODEX_SEL: ")), None)
