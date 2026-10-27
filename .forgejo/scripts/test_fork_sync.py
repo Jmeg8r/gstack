@@ -100,6 +100,12 @@ class AssessCiResults(unittest.TestCase):
         self.assertEqual(len(a["environmental"]), 1)
         self.assertEqual(a["failing_files"], ["test/b.test.ts"])
 
+    def test_the_session_log_hooks_are_external_writers(self):
+        paths = "~/.claude/session-logs/.lock, ~/.claude/session-logs/index/sessions.db-shm, ~/.claude/session-logs/state.json"
+        a = lib.assess_ci_results(PLAN, [result(1, "failed", [], 1), result(2), result(3)],
+                                  {1: CONTAIN.format(i=1, paths=paths)}, lib.DEFAULT_EXTERNAL_HOME_WRITERS, None)
+        self.assertEqual(a["unaccounted"], [])
+
     def test_containment_touching_any_other_path_is_unaccounted(self):
         log = CONTAIN.format(i=1, paths="~/.claude/backups/.claude.json.backup.1792, ~/.claude/settings.json")
         self.assertEqual(len(self.assess([result(1, "failed", [], 1), result(2), result(3)], {1: log})["unaccounted"]), 1)

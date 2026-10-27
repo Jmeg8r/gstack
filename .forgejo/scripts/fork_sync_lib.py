@@ -71,12 +71,12 @@ def dotenv_files(names):
 
 
 # Paths a concurrently running agent host writes in its own home while the suite
-# runs (Claude Code's config backups, the Codex app's SQLite journal, shell
-# snapshots and locks). The runner's own volatile list misses these; override with
+# runs (Claude Code's config backups and session-log hooks, the Codex app's
+# SQLite journal, shell snapshots and locks). The runner's own volatile list misses these; override with
 # FORK_SYNC_EXTERNAL_HOME_WRITERS (colon-separated globs).
 DEFAULT_EXTERNAL_HOME_WRITERS = [
     "~/.claude/backups/.claude.json.backup.*", "~/.claude/sessions/*.json", "~/.claude/state/*",
-    "~/.claude/.git/*", "~/.claude/memory-sweeper/*",
+    "~/.claude/.git/*", "~/.claude/memory-sweeper/*", "~/.claude/session-logs/*",
     "~/.codex/*.sqlite-wal", "~/.codex/*.sqlite-shm",
     "~/.codex/shell_snapshots/*", "~/.codex/thread-writer-locks/*",
 ]
