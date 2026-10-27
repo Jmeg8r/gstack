@@ -102,6 +102,8 @@ def parse_bun_run(test_file, exit_code, output):
 
 
 RUNNER_EPILOGUE = re.compile(r"^\[test:free\] (PASS|FAIL) — ", re.M)
+RUNNER_PLAN = re.compile(r"^\[test:free\] full suite: \d+ files across (\d+) shard processes[^\n]*?(?:, then (\d+) exclusive [^\n]*)?$", re.M)
+SHARD_RESULT = re.compile(r"^\[test:free\] shard (\d+)/(\d+): \d+ files, \d+s, (pass|fail|timed-out)$", re.M)
 
 
 def suite_completed(exit_code, output):
@@ -112,13 +114,25 @@ def suite_completed(exit_code, output):
         raise SyncError(f"`bun run test` ended abnormally (exit {exit_code}); an interrupted suite cannot clear the gate")
     if not RUNNER_EPILOGUE.search(output):
         raise SyncError("`bun run test` printed no `[test:free] PASS|FAIL` epilogue; the runner did not finish")
+    # Each shard prints its own epilogue, so one shard's PASS/FAIL says nothing about
+    # the others: every planned shard must report a result line.
+    plan = RUNNER_PLAN.search(output)
+    if not plan:
+        raise SyncError("`bun run test` printed no `full suite: N files across S shard processes` plan line; cannot tell which shards had to run")
+    planned = int(plan.group(1)) + int(plan.group(2) or 0)
+    reported = {int(i) for i, n, _ in SHARD_RESULT.findall(output) if int(n) == planned}
+    missing = sorted(set(range(1, planned + 1)) - reported)
+    if missing:
+        raise SyncError(f"the free runner planned {planned} shard(s) but shard(s) {missing} printed no result; unstarted or unfinished shards are not coverage")
 
 
-DOTENV = re.compile(r"^\.env(\..+)?$")
+# What bun auto-loads: .env, .env.local, .env.<NODE_ENV>, .env.<NODE_ENV>.local.
+# Templates such as the tracked .env.example are never loaded.
+DOTENV = re.compile(r"^\.env(\.(development|production|test))?(\.local)?$")
 
 
 def dotenv_files(names):
-    """Files bun would load as dotenv from a working directory (.env, .env.<mode>, …)."""
+    """Files bun would auto-load as dotenv from a working directory."""
     return sorted(n for n in names if DOTENV.match(n))
 
 

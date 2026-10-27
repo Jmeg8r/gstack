@@ -168,7 +168,9 @@ class BlockingDirty(unittest.TestCase):
 
 
 class SuiteCompleted(unittest.TestCase):
-    EPILOGUE = "  ✗ test/a.test.ts — g > a\n[test:free] FAIL — 1 failing test(s) in 1 file(s), 0 crashed worker(s). Full log: x\n"
+    PLAN = "[test:free] full suite: 30 files across 2 shard processes (duration-packed), then 1 exclusive host-state file(s) serially\n"
+    SHARDS = "[test:free] shard 2/3: 15 files, 9s, fail\n[test:free] shard 1/3: 14 files, 8s, pass\n[test:free] shard 3/3: 1 files, 0s, pass\n"
+    EPILOGUE = PLAN + "  ✗ test/a.test.ts — g > a\n[test:free] FAIL — 1 failing test(s) in 1 file(s), 0 crashed worker(s). Full log: x\n" + SHARDS
 
     def test_normal_failing_exit_with_the_epilogue_is_complete(self):
         lib.suite_completed(1, self.EPILOGUE)
@@ -177,6 +179,19 @@ class SuiteCompleted(unittest.TestCase):
         with self.assertRaises(lib.SyncError):
             lib.suite_completed(-9, self.EPILOGUE)
 
+    def test_a_planned_shard_without_its_result_line_is_incomplete(self):
+        with self.assertRaises(lib.SyncError):
+            lib.suite_completed(1, self.EPILOGUE.replace("[test:free] shard 3/3: 1 files, 0s, pass\n", ""))
+
+    def test_no_plan_line_is_incomplete(self):
+        with self.assertRaises(lib.SyncError):
+            lib.suite_completed(1, self.EPILOGUE.replace(self.PLAN, ""))
+
+    def test_plan_without_an_exclusive_phase_counts_only_the_concurrent_shards(self):
+        out = ("[test:free] full suite: 30 files across 2 shard processes (duration-packed)\n"
+               "[test:free] PASS — 9 tests, 30 files, 9s.\n[test:free] shard 1/2: 15 files, 9s, pass\n[test:free] shard 2/2: 15 files, 9s, pass\n")
+        lib.suite_completed(0, out)
+
     def test_missing_epilogue_is_incomplete(self):
         with self.assertRaises(lib.SyncError):
             lib.suite_completed(1, "  ✗ test/a.test.ts — g > a\n")
@@ -184,8 +199,11 @@ class SuiteCompleted(unittest.TestCase):
 
 class DotenvFiles(unittest.TestCase):
     def test_finds_every_dotenv_variant_bun_would_load(self):
-        names = [".env", ".env.local", ".env.test", ".envrc-not", "env", ".gitignore", "README.md"]
-        self.assertEqual(lib.dotenv_files(names), [".env", ".env.local", ".env.test"])
+        names = [".env", ".env.local", ".env.test", ".env.production.local", ".envrc-not", "env", ".gitignore", "README.md"]
+        self.assertEqual(lib.dotenv_files(names), [".env", ".env.local", ".env.production.local", ".env.test"])
+
+    def test_templates_bun_never_loads_are_not_dotenv(self):
+        self.assertEqual(lib.dotenv_files([".env.example", ".env.sample", ".env.template"]), [])
 
 
 class SplitAttributable(unittest.TestCase):
