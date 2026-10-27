@@ -8,6 +8,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import shutil
 import signal
 import subprocess
 import time
@@ -84,6 +85,31 @@ class InterruptedRun(unittest.TestCase):
 
 class RunToFiles(unittest.TestCase):
     SPAWN = "sleep 60 & echo $! > {pid}; wait"
+    # A child that leaves our group for its own, as GNU timeout does.
+    NESTED = ("import os, subprocess, sys; os.setpgid(0, 0); c = subprocess.Popen(['sleep', '60']); "
+              "open(sys.argv[1], 'w').write(str(c.pid)); c.wait()")
+
+    def test_a_timeout_also_reaps_a_descendant_that_moved_to_its_own_group(self):
+        cli = load_cli()
+        with tempfile.TemporaryDirectory() as d:
+            pid = Path(d) / "pid"
+            code = cli.run_to_files(["sh", "-c", f'"{sys.executable}" -c "{self.NESTED}" {pid}; wait'], d, Path(d) / "out", Path(d) / "err", timeout=2)
+            self.assertEqual(code, lib.TIMEOUT_EXIT)
+            time.sleep(0.5)
+            self.assertFalse(alive(int(pid.read_text())), "the nested group's child must not survive")
+
+    @unittest.skipUnless(shutil.which("gtimeout") or shutil.which("timeout"), "needs GNU timeout")
+    def test_the_real_gnu_timeout_wrapper_path_is_reaped(self):
+        # `; wait` keeps sh as the parent, as the probe's bash is, instead of
+        # exec'ing the wrapper into our own group where it could not nest.
+        cli = load_cli()
+        wrapper = shutil.which("gtimeout") or shutil.which("timeout")
+        with tempfile.TemporaryDirectory() as d:
+            pid = Path(d) / "pid"
+            code = cli.run_to_files(["sh", "-c", f'{wrapper} 300 sh -c "sleep 60 & echo \\$! > {pid}; wait"; wait'], d, Path(d) / "out", Path(d) / "err", timeout=2)
+            self.assertEqual(code, lib.TIMEOUT_EXIT)
+            time.sleep(0.5)
+            self.assertFalse(alive(int(pid.read_text())), "Codex under the timeout wrapper must not survive")
 
     def test_the_outer_timeout_reaps_the_whole_group_and_reads_as_a_timeout(self):
         cli = load_cli()

@@ -109,21 +109,57 @@ def reaped(procs):
         raise
 
 
+def descendant_groups(pid):
+    """The process groups of `pid` and all its descendants, from one `ps` snapshot."""
+    ps = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid="], capture_output=True, text=True)
+    if ps.returncode != 0:
+        say(f"warning: `ps` failed (exit {ps.returncode}); only process group {pid} can be stopped")
+        return {pid}
+    children, group = {}, {}
+    for row in ps.stdout.splitlines():
+        f = row.split()
+        if len(f) == 3 and all(x.isdigit() for x in f):
+            p, parent, g = map(int, f)
+            children.setdefault(parent, []).append(p)
+            group[p] = g
+    seen, todo = set(), [pid]
+    while todo:
+        p = todo.pop()
+        if p not in seen:
+            seen.add(p)
+            todo.extend(children.get(p, []))
+    return {pid} | {group[p] for p in seen if p in group}
+
+
+def signal_group(pgid, sig):
+    """Send `sig` to a group; False when no process of ours is left in it."""
+    try:
+        os.killpg(pgid, sig)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
 def kill_group(proc):
-    """SIGTERM the process group, then SIGKILL whatever is left after a short grace."""
+    """SIGTERM every process group the process and its descendants are in, then
+    SIGKILL whatever is left after a short grace. The tree is read first, once:
+    a wrapper such as GNU timeout moves itself into a group of its own, and SIGTERM
+    reparents survivors, which would hide them from a second look."""
+    groups = descendant_groups(proc.pid)
     for sig in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.killpg(proc.pid, sig)
-        except ProcessLookupError:
-            return
-        try:
-            proc.wait(timeout=KILL_GRACE_S)
-            if sig == signal.SIGTERM:
-                os.killpg(proc.pid, 0)
-        except ProcessLookupError:
-            return
-        except subprocess.TimeoutExpired:
-            continue
+        live = [g for g in groups if signal_group(g, sig)]
+        deadline = time.monotonic() + KILL_GRACE_S
+        while live and time.monotonic() < deadline:
+            proc.poll()
+            live = [g for g in live if signal_group(g, 0)]
+            if live:
+                time.sleep(0.1)
+        if not live:
+            break
+    try:
+        proc.wait(timeout=KILL_GRACE_S)
+    except subprocess.TimeoutExpired:
+        say(f"warning: process {proc.pid} survived SIGKILL")
 
 
 def git(cwd, *args):
