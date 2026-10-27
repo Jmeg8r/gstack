@@ -44,8 +44,8 @@ CONTAIN = ("[test:free] shard {i}/3 shard cleanup or home containment failed: re
 
 
 class AssessCiResults(unittest.TestCase):
-    def assess(self, results, logs=None):
-        return lib.assess_ci_results(PLAN, results, logs or {}, EXTERNAL)
+    def assess(self, results, logs=None, window=None):
+        return lib.assess_ci_results(PLAN, results, logs or {}, EXTERNAL, window)
 
     def test_all_passing_shards_have_nothing_to_compare(self):
         a = self.assess([result(1), result(2), result(3)])
@@ -103,6 +103,18 @@ class AssessCiResults(unittest.TestCase):
         log = CONTAIN.format(i=1, paths="~/.claude/backups/.claude.json.backup.1792 (+93 more)")
         self.assertEqual(len(self.assess([result(1, "failed", [], 1), result(2), result(3)], {1: log})["unaccounted"]), 1)
 
+    def test_a_truncated_list_is_environmental_when_the_whole_run_window_changed_only_external_paths(self):
+        log = CONTAIN.format(i=1, paths="~/.codex/a.sqlite-wal (+93 more)")
+        a = self.assess([result(1, "failed", [], 1), result(2), result(3)], {1: log}, window=["~/.codex/a.sqlite-wal", "~/.claude/backups/.claude.json.backup.9"])
+        self.assertEqual(a["unaccounted"], [])
+        self.assertIn("full snapshot", a["environmental"][0])
+
+    def test_a_truncated_list_names_the_window_paths_outside_the_external_list(self):
+        log = CONTAIN.format(i=1, paths="~/.codex/a.sqlite-wal (+93 more)")
+        a = self.assess([result(1, "failed", [], 1), result(2), result(3)], {1: log}, window=["~/.codex/a.sqlite-wal", "~/.gstack/config.yaml"])
+        self.assertEqual(len(a["unaccounted"]), 1)
+        self.assertIn("~/.gstack/config.yaml", a["unaccounted"][0])
+
     def test_more_unattributed_failures_than_containment_lines_is_unaccounted(self):
         log = CONTAIN.format(i=1, paths="~/.codex/state_5.sqlite-wal")
         self.assertEqual(len(self.assess([result(1, "failed", [], 2), result(2), result(3)], {1: log})["unaccounted"]), 1)
@@ -142,6 +154,22 @@ class FocusedTests(unittest.TestCase):
                    "docs/changes/x/plan.md", ".forgejo/scripts/fork-sync"]
         got = lib.focused_test_files(changed, list(sources) + ["test/codex-hardening.test.ts"], lambda f: sources.get(f, ""))
         self.assertEqual(got, ["test/codex-hardening.test.ts", "test/outside-review-result.test.ts", "test/plain-name.test.ts", "test/probe.test.ts"])
+
+
+class HomeSnapshot(unittest.TestCase):
+    def test_diff_names_every_changed_path_and_skips_volatile_ones(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            (home / ".claude" / "projects").mkdir(parents=True)
+            (home / ".claude" / "settings.json").write_text("{}")
+            (home / ".codex").mkdir()
+            before = lib.home_snapshot(home, [".claude", ".codex"], [".claude/projects"])
+            (home / ".claude" / "settings.json").write_text('{"changed": true}')
+            (home / ".claude" / "projects" / "log.jsonl").write_text("x")
+            (home / ".codex" / "deep" / "er").mkdir(parents=True)
+            (home / ".codex" / "deep" / "er" / "f").write_text("y")
+            after = lib.home_snapshot(home, [".claude", ".codex"], [".claude/projects"])
+            self.assertEqual(lib.home_changes(before, after), ["~/.claude/settings.json", "~/.codex/deep", "~/.codex/deep/er", "~/.codex/deep/er/f"])
 
 
 class ExclusiveShards(unittest.TestCase):
@@ -590,6 +618,10 @@ if a[:2] == ["run", "scripts/test-free-shards.ts"]:
     side = "upstream" if "/upstream" in os.getcwd() else "merge"
     if "--ci-run" in a:
         n = flag("--shard"); r = sc.get("results_" + side, sc["results"]).get(n)
+        for rel in sc.get("home_writes", {{}}).get(n, []):
+            target = os.path.join(os.environ["HOME"], rel)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            open(target, "a").write("x")
         print(sc.get("logs", {{}}).get(n, ""))
         if r is None:
             sys.exit(1)
@@ -695,6 +727,17 @@ sys.exit(0)
                             "standalone": {"merge": ["g > a"], "upstream": [], "baseline": []}})
         self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
         self.assertIn("fork-caused failure", (self.run_dir / "report.md").read_text())
+
+    def test_a_truncated_containment_line_is_settled_by_the_full_run_window(self):
+        log = ("[test:free] shard 1/2 shard cleanup or home containment failed: real home changed while this shard ran (watches ~/.codex only): "
+               "~/.codex/a.sqlite-wal (+40 more). Give the writer a private HOME. Shard files: x; retained /tmp/s")
+        base = {"shards": self.SHARDS, "tree_mutating": ["test/tree.test.ts"], "verify_exit": 1, "logs": {"1": log},
+                "results": {"1": self.outcome(1, ["test/a.test.ts"], "failed", ["test/a.test.ts"], 1, [("test/a.test.ts", "g > a")]),
+                            "2": self.outcome(2, ["test/tree.test.ts"])},
+                "standalone": {"merge": ["g > a"], "upstream": ["g > a"], "baseline": ["g > a"]}}
+        r = self.run_suite({**base, "home_writes": {"1": [".codex/a.sqlite-wal", ".gstack/config.yaml"]}})
+        self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+        self.assertIn("~/.gstack/config.yaml", (self.run_dir / "report.md").read_text())
 
     def test_containment_outside_agent_host_paths_stops_unless_accepted(self):
         log = ("[test:free] shard 1/2 shard cleanup or home containment failed: real home changed while this shard ran (watches ~/.claude only): "

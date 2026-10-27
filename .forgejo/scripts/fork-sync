@@ -354,9 +354,12 @@ class Sync:
         alone = lib.exclusive_shards(plan, self.tree_mutating(wt))
         together = [x["shard"] for x in plan["shards"] if x["shard"] not in alone]
         say(f"free suite on {label}: {len(plan['shards'])} shards from the runner's CI plan ({len(together)} concurrent, then {len(alone)} alone)")
+        before = lib.home_snapshot(Path.home())
         self.run_ci_shards(wt, log_dir, plan_file, results_dir, together)
         for n in alone:
             self.run_ci_shards(wt, log_dir, plan_file, results_dir, [n])
+        window = lib.home_changes(before, lib.home_snapshot(Path.home()))
+        (ci / "home-changes.txt").write_text("\n".join(window) + ("\n" if window else ""))
         vcode, vout = run(["bun", "run", "scripts/test-free-shards.ts", "--ci-verify", str(plan_file), "--results", str(results_dir)], wt, log=self.logs / f"ci-verify-{label}.log")
         results = []
         for f in sorted(results_dir.glob("*.json")):
@@ -365,15 +368,15 @@ class Sync:
             except json.JSONDecodeError:
                 raise Stop("suite", [f"`{f}` is not valid JSON; that {label} shard did not finish writing its result"])
         logs = {x["shard"]: (log_dir / f"shard-{x['shard']}.log").read_text() if (log_dir / f"shard-{x['shard']}.log").exists() else "" for x in plan["shards"]}
-        return plan, results, logs, vcode, vout
+        return plan, results, logs, vcode, vout, window
 
     def suite(self):
-        plan, results, logs, vcode, vout = self.run_ci(self.merge_wt, "merge")
+        plan, results, logs, vcode, vout, window = self.run_ci(self.merge_wt, "merge")
         files_total = sum(len(x["files"]) for x in plan["shards"])
         if vcode == 0:
             self.passed("suite", f"Free suite: `--ci-verify` passed, {files_total} files across {len(plan['shards'])} shards, every shard complete.\n\nGlobal hooks after the suite: {self.hooks_verify('suite')}")
             return
-        a = lib.assess_ci_results(plan, results, logs, self.external_writers)
+        a = lib.assess_ci_results(plan, results, logs, self.external_writers, window)
         if a["problems"]:
             raise Stop("suite", a["problems"] + [f"`--ci-verify` (exit {vcode}): {vout.strip().splitlines()[-1] if vout.strip() else 'no output'}"])
         if a["unaccounted"] and not self.args.accept_unaccounted:
@@ -383,8 +386,8 @@ class Sync:
         if a["gaps"]:
             say(f"{len(a['gaps'])} merge shard(s) gave no usable coverage; running the same CI plan on pure upstream to compare")
             upstream_wt = self.prepared_worktree("upstream", self.pins["github"])
-            uplan, uresults, ulogs, uvcode, _ = self.run_ci(upstream_wt, "upstream")
-            ua = {"problems": [], "gaps": []} if uvcode == 0 else lib.assess_ci_results(uplan, uresults, ulogs, self.external_writers)
+            uplan, uresults, ulogs, uvcode, _, uwindow = self.run_ci(upstream_wt, "upstream")
+            ua = {"problems": [], "gaps": []} if uvcode == 0 else lib.assess_ci_results(uplan, uresults, ulogs, self.external_writers, uwindow)
             if ua["problems"]:
                 raise Stop("suite", [f"the upstream control run is not evidence: {p}" for p in ua["problems"]])
             try:

@@ -6,6 +6,7 @@
 import fnmatch
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 
@@ -74,10 +75,56 @@ def dotenv_files(names):
 # FORK_SYNC_EXTERNAL_HOME_WRITERS (colon-separated globs).
 DEFAULT_EXTERNAL_HOME_WRITERS = [
     "~/.claude/backups/.claude.json.backup.*", "~/.claude/sessions/*.json", "~/.claude/state/*",
+    "~/.claude/.git/*",
     "~/.codex/*.sqlite-wal", "~/.codex/*.sqlite-shm",
     "~/.codex/shell_snapshots/*", "~/.codex/thread-writer-locks/*",
 ]
 CONTAINMENT_LINE = re.compile(r"^\[test:free\] shard (\d+)/\d+ shard cleanup or home containment failed: real home changed while this shard ran \([^)]*\): (.*?)\. Give the writer", re.M)
+
+
+# The runner's watched home surfaces and the live-session paths it skips
+# (scripts/lib/free-home-guard.ts FREE_HOME_SURFACES / FREE_HOME_VOLATILE).
+HOME_SURFACES = [".gstack", ".claude", ".codex", ".agents", ".config/gstack"]
+HOME_VOLATILE = [
+    ".claude/projects", ".claude/todos", ".claude/shell-snapshots", ".claude/statsig", ".claude/ide",
+    ".claude/session-env", ".claude/file-history", ".claude/debug", ".claude/telemetry", ".claude/history.jsonl",
+    ".claude/.credentials.json", ".codex/sessions", ".codex/archived_sessions", ".codex/log", ".codex/history.jsonl",
+    ".codex/auth.json",
+]
+
+
+def home_snapshot(home, surfaces=HOME_SURFACES, volatile=HOME_VOLATILE):
+    """Every file, link and directory under the watched surfaces, untruncated, so a
+    run window's real-home changes can be listed in full (the runner caps its list).
+    Directory mtimes are ignored, as the runner does."""
+    home = Path(home)
+    skip = {Path(v) for v in volatile}
+    snap = {}
+    for surface in surfaces:
+        root = home / surface
+        if not root.exists():
+            continue
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            rel_dir = Path(dirpath).relative_to(home)
+            dirnames[:] = [d for d in dirnames if rel_dir / d not in skip]
+            for d in dirnames:
+                snap[str(rel_dir / d)] = "dir"
+            for f in filenames:
+                rel = rel_dir / f
+                if rel in skip:
+                    continue
+                try:
+                    st = (home / rel).lstat()
+                except FileNotFoundError:
+                    continue
+                snap[str(rel)] = f"{'link' if os.path.islink(home / rel) else 'file'}:{st.st_size}:{st.st_mtime_ns}"
+    return snap
+
+
+def home_changes(before, after):
+    """Paths added, removed or changed between two snapshots, as `~/<path>`."""
+    keys = set(before) | set(after)
+    return sorted(f"~/{k}" for k in keys if before.get(k) != after.get(k))
 
 
 def containment_paths(log_text, shard):
@@ -101,7 +148,7 @@ def exclusive_shards(plan, tree_mutating):
     return [s["shard"] for s in plan["shards"] if s["files"] and all(f in tree_mutating for f in s["files"])]
 
 
-def assess_ci_results(plan, results, shard_logs, external_patterns):
+def assess_ci_results(plan, results, shard_logs, external_patterns, window_changes=None):
     """Judge `--ci-run` results that `--ci-verify` rejected.
 
     problems      results that are not evidence at all: missing, duplicate or foreign
@@ -111,7 +158,9 @@ def assess_ci_results(plan, results, shard_logs, external_patterns):
     unaccounted   failures no named test explains (stop unless accepted)
     environmental containment failures touching only external agent-host paths
     failing_files files with named failures, for the paired comparison
-    failures      {file: {"file :: test name"}} from the runner's named failures"""
+    failures      {file: {"file :: test name"}} from the runner's named failures
+    window_changes, when given, is fork-sync's own untruncated list of real-home
+    changes over the whole run; it settles containment lines the runner truncated."""
     problems, unaccounted, environmental, gaps = [], [], [], []
     failing, failures = set(), {}
     by_shard = {}
@@ -165,8 +214,14 @@ def assess_ci_results(plan, results, shard_logs, external_patterns):
                 failures.setdefault(fl["file"], set()).add(f"{fl['file']} :: {TEMP_PATH.sub('', str(fl.get('testName', ''))).strip()}")
         if unattr:
             lists = containment_paths(shard_logs.get(n, ""), n)
+            window_external = window_changes is not None and all(is_external_writer(p, external_patterns) for p in window_changes)
             if len(lists) == unattr and all(l is not None and all(is_external_writer(p, external_patterns) for p in l) for l in lists):
                 environmental.append(f"shard {n}: real-home writes by agent hosts only: {', '.join(p for l in lists for p in l)}")
+            elif len(lists) == unattr and any(l is None for l in lists) and window_external:
+                environmental.append(f"shard {n}: the runner truncated its path list; fork-sync's own full snapshot of the run window shows only agent-host writes ({len(window_changes)} paths)")
+            elif len(lists) == unattr and any(l is None for l in lists) and window_changes is not None:
+                outside = [p for p in window_changes if not is_external_writer(p, external_patterns)]
+                unaccounted.append(f"shard {n}: home containment failed, and the run window changed paths outside the external-writer list: {', '.join(outside[:20])}" + (f" (+{len(outside) - 20} more)" if len(outside) > 20 else ""))
             else:
                 why = "a truncated path list" if any(l is None for l in lists) else (
                     f"{unattr} unattributed failure(s), {len(lists)} containment line(s)" if len(lists) != unattr else
