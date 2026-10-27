@@ -19,7 +19,7 @@ import { getHostConfig } from '../../hosts/index';
 import { outsideVoiceFor, outsideVoiceGuard, outsideVoiceInvocation, outsideVoicePreflight, outsideVoiceProvenance, generateOutsideVoiceRouting } from './outside-voice';
 
 // Domain modules
-import { generatePreamble } from './preamble';
+import { generateSkillPreamble } from './preamble-hoist';
 import { generateTestFailureTriage } from './preamble';
 import { generateDesignMethodology, generateDesignHardRules, generateDesignOutsideVoices, generateDesignReviewLite, generateDesignSketch, generateDesignSetup, generateDesignMockup, generateDesignShotgunGeneration, generateDesignShotgunLoop, generateTasteProfile, generateUXPrinciples, generateOverusedFonts, generateDesignSlopBullets, generateDesignDetector, generateDesignMdCheck } from './design';
 import { generateTestBootstrap, generateTestCoverageAuditPlan, generateTestCoverageAuditShip, generateTestCoverageGateShip } from './testing';
@@ -39,6 +39,7 @@ import { generateDxFramework, generateDxErrorCompact, generateDxErrorItems } fro
 import { generateGBrainContextLoad, generateGBrainSaveResults, generateBrainPreflight, generateBrainCacheRefresh, generateBrainWriteBack } from './gbrain';
 import { generateTasksSectionEmit, generateTasksSectionAggregate } from './tasks-section';
 import { SECTION, SECTION_INDEX } from './sections';
+import { DESIGN_CRAFT_RULE, DESIGN_PERSUADE_CHECKS } from './design-craft';
 import { generateRedactInvocationBlock } from './redact-doc';
 import { generateFreeTextFile } from './free-text-file';
 import { FOREGROUND_DISPATCH_NOTE, codexSelect } from './constants';
@@ -55,6 +56,7 @@ import { generateCoordinatorContract } from './coordinator-contract';
 import { generateAutoplanDriverCodes, generateAutoplanDriverCommands, generateAutoplanDriverFiles, generateAutoplanDriverGate, generateAutoplanDriverPhases, generateAutoplanDriverResultFormat } from './autoplan-driver';
 import { generateQAScope, generateQAExploratory, generateQAFunctional, generateQAResource, generateQAReview, generateQAReviewPreflight, generateQAMethodReads } from './qa';
 import { generateVoiceTriggerRouting } from './voice-triggers';
+import { generateTranscriptDiscovery, generateTranscriptSources } from './transcripts';
 
 export const RESOLVERS: Record<string, ResolverFn> = {
   AUTOPLAN_PUBLICATION_HOOK: generateAutoplanPublicationHook,
@@ -88,7 +90,7 @@ export const RESOLVERS: Record<string, ResolverFn> = {
   SNAPSHOT_FLAGS: generateSnapshotFlags,
   BROWSE_SETUP: generateBrowseSetup,
   BROWSE_FALLBACK: generateBrowseFallback,
-  PREAMBLE: generatePreamble,
+  PREAMBLE: generateSkillPreamble,
   ASIDE_SETUP: generateAsideSetup,
   ASIDE_COOKBOOK: generateAsideCookbook,
   ASIDE_RESEARCH: generateAsideResearch,
@@ -109,6 +111,8 @@ export const RESOLVERS: Record<string, ResolverFn> = {
   DESIGN_DETECTOR: generateDesignDetector,
   DESIGN_MD_CHECK: generateDesignMdCheck,
   DESIGN_SLOP_BULLETS: generateDesignSlopBullets,
+  DESIGN_CRAFT_RULE,
+  DESIGN_PERSUADE_CHECKS,
   UX_PRINCIPLES: generateUXPrinciples,
   DESIGN_OUTSIDE_VOICES: generateDesignOutsideVoices,
   DESIGN_REVIEW_LITE: generateDesignReviewLite,
@@ -189,4 +193,6 @@ export const RESOLVERS: Record<string, ResolverFn> = {
   AUTOPLAN_DRIVER_CODES: generateAutoplanDriverCodes,
   SECTION,
   SECTION_INDEX,
+  TRANSCRIPT_SOURCES: generateTranscriptSources,
+  TRANSCRIPT_DISCOVERY: generateTranscriptDiscovery,
 };

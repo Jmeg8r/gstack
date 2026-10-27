@@ -5,14 +5,33 @@ import { observeQAWrites, type QAWriteObservation } from './qa-functional-observ
 import { nativeCalls } from './qa-checkpoint-evidence';
 import type { SkillTestResult } from './session-runner';
 import { DOC_PATH, type DocsScenario, type fixtureDocs } from './docsync-fixture';
-import { docsNativeInterface } from './docsync-interface';
+import { docsNativeInterface, DOCS_AUDIT_RECORD, DOCS_AUDIT_RECORD_PATHS, DOCS_AUDIT_RESET, DOCS_TMP_EXCLUDE, docsCapsCommand } from './docsync-interface';
 import { sliceBetween } from './skill-fixture';
 import { readOnlyCommandAllowed } from './read-only-commands';
 
 export { docsNativeInterface };
 
 export async function observeDocsWrites(fixture: ReturnType<typeof fixtureDocs>) {
-  return observeQAWrites(fixture.repo, { atomicTargets: [DOC_PATH] });
+  return observeQAWrites(fixture.repo, { atomicTargets: [DOC_PATH, DOCS_AUDIT_RECORD] });
+}
+
+/** Temp files the Write/Edit tool renamed onto the receipt record (`<record>.tmp.<pid>.<12 hex>`): created, written and closed
+ *  under the record's directory, then moved onto the record by a cookie-paired MOVED_FROM/MOVED_TO, and not left behind. */
+function docsRecordSources(observation: QAWriteObservation): Set<string> {
+  const sources = new Set<string>();
+  const events = observation.events;
+  for (const [index, event] of events.entries()) {
+    if (event.path !== DOCS_AUDIT_RECORD || event.mask !== 0x80 || !Number.isInteger(event.cookie) || event.cookie <= 0) continue;
+    const pair = events.flatMap((candidate, at) => candidate.cookie === event.cookie ? [at] : []);
+    if (pair.length !== 2 || pair[1] !== index) continue;
+    const source = events[pair[0]];
+    if (source.mask !== 0x40 || !source.path.startsWith(DOCS_AUDIT_RECORD + '.tmp.') || !/^\.tmp\.[1-9]\d*\.[0-9a-f]{12}$/.test(source.path.slice(DOCS_AUDIT_RECORD.length))
+      || Object.hasOwn(observation.before, source.path) || Object.hasOwn(observation.after, source.path) || observation.changed.includes(source.path)) continue;
+    const lifecycle = events.filter(candidate => candidate.path === source.path);
+    if (lifecycle.at(-1) !== source || lifecycle.some(candidate => candidate !== source && (candidate.cookie !== 0 || ![0x100, 0x2, 0x4, 0x8].includes(candidate.mask)))) continue;
+    sources.add(source.path);
+  }
+  return sources;
 }
 
 type DocsWriteContext = {
@@ -136,8 +155,9 @@ export function docsWriteFailures(observation: QAWriteObservation, allowed: stri
   const failures = [...observation.failures];
   if (!observation.complete) failures.push('incomplete docs write observation');
   const atomicSources = docsAtomicSources(observation, allowed, context);
+  const recordSources = docsRecordSources(observation);
   for (const file of new Set([...observation.events.map(e => e.path), ...observation.changed])) {
-    if (file !== '.qa-state/.observer-check' && !allowed.includes(file) && !atomicSources.has(file))
+    if (file !== '.qa-state/.observer-check' && !allowed.includes(file) && !DOCS_AUDIT_RECORD_PATHS.includes(file) && !atomicSources.has(file) && !recordSources.has(file))
       failures.push(`forbidden docs write: ${file}${atomicSources.deniedAt && path.dirname(file) === path.dirname(DOC_PATH) ? ` (atomic replacement unproven at ${atomicSources.deniedAt})` : ''}`);
     if (allowed.includes(file) && observation.before[file] && observation.after[file] &&
         observation.before[file].split(':')[0] !== observation.after[file].split(':')[0]) failures.push(`document mode changed: ${file}`);
@@ -230,6 +250,9 @@ function unwrapHarmlessRead(text: string, fixture: ReturnType<typeof fixtureDocs
 export function docsCommandAllowed(command: string, fixture: ReturnType<typeof fixtureDocs>, scripts: string[] = []): boolean {
   const text = command.trim();
   if (docsPreambleCommands(fixture).some(block => block.trim() === text)) return true;
+  // The section prints the cap gate with the ~/.claude/skills/gstack prefix; in the fixture HOME is fixture.home, so that form names the same installed binary.
+  if (text === DOCS_TMP_EXCLUDE || text === DOCS_AUDIT_RESET || text === docsCapsCommand(fixture.skills.split(path.sep).join('/')) ||
+    (text === docsCapsCommand('~/.claude/skills/gstack') && fixture.skills === path.join(fixture.home, '.claude/skills/gstack'))) return true;
   if (readOnlyCommandAllowed(text, docsReadOnlyScope(fixture)) || docsComposedReadAllowed(text, fixture)) return true;
   const insert = /^cat (['"]?)([^\s'"]+)\1 >> (['"]?)([^\s'"]+)\3$/.exec(text);
   if (insert) return [insert[2], insert[4]].every(file => path.isAbsolute(file) && /\.md$/i.test(file) &&
@@ -422,7 +445,12 @@ function docsPrivateArtifact(file: string, fixture: ReturnType<typeof fixtureDoc
     path.basename(file) !== 'actor-state.json' && path.basename(actual) !== 'actor-state.json';
 }
 
-/** A candidate call at a wrong binary path that does not exist exited 127 before anything ran; it is ignored only when the same command at the declared path follows and runs. */
+/**
+ * A candidate call at a wrong binary path that does not exist exited 127 before anything ran; it is ignored only when
+ * the same command at the declared path runs: after the slip for snapshot and compare, whose recovery the lifecycle
+ * needs, and anywhere in the transcript for --help, which reads nothing the agent still has to recover (gate
+ * 40323989742: the parent read the usage at the declared path, mistyped the path on a second --help, then went on).
+ */
 function candidateNotFound(calls: SkillTestResult['toolCalls'], index: number, fixture: ReturnType<typeof fixtureDocs>, scripts: string[]): boolean {
   const command = String(calls[index].input?.command ?? '').trim();
   const binary = command.split(' ')[0]!;
@@ -436,7 +464,8 @@ function candidateNotFound(calls: SkillTestResult['toolCalls'], index: number, f
     if (!['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) return false;
   }
   const retry = candidate + command.slice(binary.length);
-  return docsCommandAllowed(retry, fixture, scripts) && calls.slice(index + 1).some(call =>
+  const candidates = retry === `${candidate} --help` ? calls.filter((_, position) => position !== index) : calls.slice(index + 1);
+  return docsCommandAllowed(retry, fixture, scripts) && candidates.some(call =>
     call.tool === 'Bash' && String(call.input?.command ?? '').trim() === retry && !call.output.startsWith('Exit code'));
 }
 
@@ -451,8 +480,10 @@ export function docsToolFailures(result: SkillTestResult, fixture: ReturnType<ty
       const file = path.resolve(fixture.repo, call.input?.file_path ?? '');
       const actual = actualWritePath(file);
       const productWrite = within(file, fixture.repo) || (actual !== null && within(actual, repo));
-      if (readOnly && productWrite) failures.push('read-only docs write attempt');
-      const allowedDoc = file === path.join(fixture.repo, DOC_PATH) && actual === authoredDoc;
+      // Step 14.5's receipt record is housekeeping every scenario may write, a read-only audit included; the document stays read-only.
+      const recordWrite = file === path.join(fixture.repo, DOCS_AUDIT_RECORD) && actual === path.join(repo, DOCS_AUDIT_RECORD);
+      if (readOnly && productWrite && !recordWrite) failures.push('read-only docs write attempt');
+      const allowedDoc = (file === path.join(fixture.repo, DOC_PATH) && actual === authoredDoc) || recordWrite;
       if (productWrite && !allowedDoc) {
         failures.push('non-document product write attempt');
       }

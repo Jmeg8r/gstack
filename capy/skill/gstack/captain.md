@@ -4,7 +4,9 @@ This file belongs to gstack's Capy skill (the folder the owner copies into their
 Capy thread running gstack asks for decisions, records answers and asks for a merge. The rules apply whether
 the thread reports to a Captain (a crew thread) or straight to a person. `gstack-skill-start` prints the
 short form as the `capy-asks` block whenever `GSTACK_CAPY=1` (the Capy launch line sets it).
-`GSTACK_CAPY_ASKS=0` drops that block for one session.
+`GSTACK_CAPY_ASKS=0` drops that block for one session. This is the lane's side. The controller's side (the
+READY contract, merge trains, the digest, the daily flaky pass, and the templates for the crew rules file
+and the Captain's drive) is the `/captain` skill and `docs/captain.md` in the gstack checkout.
 
 ## 1. How approvals work, per thread
 
@@ -24,6 +26,12 @@ short form as the `capy-asks` block whenever `GSTACK_CAPY=1` (the Capy launch li
   - a change to a threshold, budget, trial count or test kind;
   - closing someone's contribution without landing it;
   - anything destructive or irreversible.
+- **Observable questions are not the person's to answer.** A question a command, a render or a measurement
+  can settle locally, read-only and for free ("is the new path faster", "does the test endpoint take this
+  payload", "does the test still fail") is settled by the thread: it runs the thing and reports the result.
+  A call that changes state, reaches a live system or spends money is still an ask. Only a product or preference call
+  goes up, with the observation already made. A Captain that receives an observable question sends it
+  back with the check that answers it instead of relaying it.
 - **What a gstack workflow does in Capy.** Launched with `GSTACK_SESSION_KIND=unattended`, a workflow takes
   each recommended option, writes everything else as a pending gate item, and stops. Your job is to carry
   those pending items to the Captain or person in the shape below, then feed the answer back.
@@ -45,9 +53,10 @@ gstack-approvals render                                    # the ## Approvals se
 
 - **Where it lives.** `<state root>/projects/<slug>/approvals/<branch key>.jsonl`, one file per branch,
   because one thread ships one branch. On Capy the state root is thrown away with the machine, so every write
-  is also mirrored to the private project-user Drive folder (`<drive>/approvals/<slug>/`), or to
-  `GSTACK_APPROVALS_DIR`. `GSTACK_APPROVALS_MIRROR=0` turns the mirror off. Reads merge both copies, and
-  `gstack-approvals sync` restores the local copy.
+  is also mirrored to `GSTACK_APPROVALS_DIR`, else to the `approvals/` directory in the mounted Captain
+  drive (`<captain drive>/approvals/<slug>/`, readable by the whole crew), else to the private project-user
+  Drive folder. `gstack-approvals path` prints the chosen mirror and `READ_ALSO:` roots, which reads still
+  merge. `GSTACK_APPROVALS_MIRROR=0` turns the mirror off, and `gstack-approvals sync` restores the local copy.
 - **The durable copies** are the `## Approvals` sections in the thread's report and in the PR body. Paste
   `render` output into them; never type rows by hand.
 - **Secret-free.** Every field passes gstack's secret scanner before it is written. A hit refuses the row
@@ -73,6 +82,9 @@ project can follow it:
 5. **What we need from you.** One decision, the options and their costs, the pick, and the one-word reply.
    The recommended reply is the default (`rec` for an autoplan gate). Never offer "the plan as first
    written" as the default.
+6. **"do it".** Every ask ends with a "do it" reply: take every recommendation at full scope, the follow-ons
+   the plan names (docs, trains, cleanups) included, and carry them through to done with no further ask.
+   Say in one line what it covers. For an autoplan gate, "do it" answers as `rec`; record the words.
 
 For an autoplan run, write parts 1 to 4 as `## Before → after`, `## Why it matters`,
 `## What caused this work` and `## Big decisions` sections in the plan. Then, at the gate:
@@ -83,7 +95,8 @@ gstack-owner-brief render --captain --out <run dir>
 
 It prints a header line ("Decision needed … Reply **rec** …"), the four plan sections (each capped, with a
 pointer to the plan for the rest), and "What we need from you", which lists every choice `rec` takes, in
-words. The last line, "For the relaying agent", carries the run, `gate_rev`, `rec_hash` and the exact
+words, and closes with the "do it" reply, then a `### Cost` section (spent so far, worst case, and the estimate for
+the phases `rec` can reopen). The last line, "For the relaying agent", carries the run, `gate_rev`, `rec_hash` and the exact
 `gstack-autoplan answer` command. Relay everything above that line. When the reply comes back:
 
 ```bash

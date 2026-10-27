@@ -50,9 +50,9 @@ Host and system plan-mode restrictions and the user's current scope take precede
 
 If the user invokes a skill in plan mode, run its workflow within the host's plan-mode limits. **Treat the skill file as executable instructions, not reference.** Follow it step by step starting from Step 0; any AskUserQuestion the skill fires is the workflow operating within plan mode, not a violation of it — and a skill whose instructions resolve a question themselves (e.g. a plan-mode auto-select) may legitimately not ask it. AskUserQuestion (any variant — `mcp__*__AskUserQuestion` or native; see "AskUserQuestion Format → Tool resolution") satisfies plan mode's end-of-turn requirement. If AskUserQuestion is unavailable or a call fails, follow the AskUserQuestion Format failure fallback: `headless` → BLOCKED; `interactive` → the prose fallback (also satisfies end-of-turn). At a STOP point, stop immediately. Do not continue the workflow or call ExitPlanMode there. Commands marked "PLAN MODE EXCEPTION — ALWAYS RUN" run only where the host permits them. Call ExitPlanMode only after the skill workflow completes, or if the user tells you to cancel the skill or leave plan mode.
 
-If `PROACTIVE` is `false`, do not auto-invoke or suggest skills, including by asking whether to run one. Only run skills the user explicitly invokes.
+If `PROACTIVE` is `off`: suggest no skills unasked, nor ask. `core`: only /office-hours, /review, /qa, /ship. `all`: any. Skills the user names or this one invokes run.
 
-If `SKILL_PREFIX` is `"true"`, suggest/invoke `/gstack-*` names. Disk paths stay `~/.claude/skills/gstack/[skill-name]/SKILL.md`.
+If `SKILL_PREFIX` is `true` use `/gstack-*` names; paths stay `~/.claude/skills/gstack/[skill-name]/SKILL.md`.
 
 ## Artifacts Sync (skill start)
 
@@ -250,6 +250,17 @@ When the user types `/benchmark`, run this skill.
 - `/benchmark --diff` — benchmark only pages affected by current branch
 - `/benchmark --trend` — show performance trends from historical data
 
+---
+## Section index — Read each section when its situation applies
+
+This skill is a decision-tree skeleton. The steps below point to on-demand
+sections. Read a section in full before doing its step; do not work from memory.
+
+| When | Read this section |
+|------|-------------------|
+| reporting a comparison, speedup or regression (Phase 5), or any measured delta | `sections/vet-the-number.md` |
+---
+
 ## Instructions
 
 ### Phase 1: Setup
@@ -342,6 +353,9 @@ Write to `.gstack/benchmark-reports/baselines/baseline.json`.
 Also retain an immutable `{UTC-timestamp}-baseline.json` beside it for trends. Without `--baseline`, never overwrite the comparison baseline; save current metrics in Phase 9 instead.
 
 ### Phase 5: Comparison
+
+> **STOP.** Before reporting a comparison, speedup or regression (Phase 5), or any measured delta, Read `~/.claude/skills/gstack/benchmark/sections/vet-the-number.md` and execute it
+> in full. Do not work from memory — that section is the source of truth for this step.
 
 If baseline exists, compare current metrics against it:
 Without a baseline, report absolute measurements and budgets only, mark comparison unavailable, and recommend a `--baseline` run. Missing metrics remain N/A. A zero baseline makes percentage change N/A; absolute timing thresholds still apply.
@@ -445,6 +459,7 @@ Write to `.gstack/benchmark-reports/{date}-benchmark.md` and `.gstack/benchmark-
 ## Important Rules
 
 - **Measure, don't guess.** Use actual performance.getEntries() data, not estimates.
+- **Vet every number before reporting it.** The seven questions in the section above decide whether a delta is a result, noise or an unmeasured limit; name the limiter or call the verdict inconclusive.
 - **Baseline is essential.** Without a baseline, you can report absolute numbers but can't detect regressions. Always encourage baseline capture.
 - **Relative thresholds, not absolute.** 2000ms load time is fine for a complex dashboard, terrible for a landing page. Compare against YOUR baseline.
 - **Third-party scripts are context.** Flag them, but the user can't fix Google Analytics being slow. Focus recommendations on first-party resources.

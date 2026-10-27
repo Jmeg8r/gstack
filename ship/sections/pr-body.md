@@ -20,7 +20,8 @@ Write the text into each printed file with your file-write tool (Claude Code's W
    gh pr view <pr-number> --json title -q .title | ~/.claude/skills/gstack/bin/gstack-pr-title-rewrite.sh <new-version> --stdin > "$TITLE_FILE" || exit 1
    ```
    GitLab reads `glab mr view <pr-number> --output json | jq -r .title` into the same pipe.
-2. For a new PR/MR, write `v<NEW_VERSION> <type>: <summary>` into the file with your file-write tool.
+2. For a new PR/MR, write `v<NEW_VERSION> <type>: <summary>` into the file with your file-write tool;
+   `<summary>` names what the user gets, not the mechanism.
 3. Every created or updated title MUST start with `v$NEW_VERSION `; check the file with
    `grep -Eq '^v<new-version>( |$)' "$TITLE_FILE"` and never publish an unprefixed title.
 4. **NO_VERSION:** replaces items 1-3: keep an existing title (the platform title
@@ -74,8 +75,18 @@ The PR/MR body should contain these sections (never reuse a prior run's body):
 
 ```
 ## Summary
-<Read `git log origin/<base>..HEAD --oneline`. Group every substantive commit by
-theme, excluding VERSION/CHANGELOG bookkeeping. Do not paste the commit list.>
+<Open with the problem in the user's words (what they hit, saw or asked), then the fix
+and what they get now; themes from `git log origin/<base>..HEAD --oneline` after that,
+minus VERSION/CHANGELOG bookkeeping. Never an inventory or a commit list. BAD: "Adds
+gstack-prose-lint, wires Steps 13 and 19, refreshes the goldens." GOOD: "Nobody reads a
+CHANGELOG entry twice, so autopilot words shipped every release. /ship now lints the entry
+before the commit and names each line to rewrite.">
+
+## Blast radius
+<One or two sentences: what else the change touches (callers, consumers, generated
+files, hosts) and the one fact that makes that safe, with the rung of the evidence
+ladder the fact reached (file:line read, walked failure path, script ran, repro). The
+ladder is the `/investigate` skill's Blast radius section, when present.>
 
 ## Test Coverage
 <coverage diagram from Step 7, or "All new code paths have test coverage.">
@@ -90,13 +101,16 @@ details for cards whose file type has no known comment syntax.>
 ZERO-RUN lane never reaches this body unresolved.>
 
 ## Pre-Landing Review
-<findings from Step 9 code review, or "No issues found.">
+<findings from Step 9 code review, or "No issues found."; then Step 9.4's `REVIEW_LOOP:` line.>
 <Gate edits: Step 9's latest `Gate edits:` line verbatim — `none detected (...)`,
 `N listed, M read, K findings — J kept, R restored, O open`, `partial (...)` or
 `UNAVAILABLE — ...`; never `none detected` for partial or UNAVAILABLE. Under it, each
 kept finding's `gate`, path and `reason`, and each open finding's `gate` and path.
 Identity and reason only; no hunk text.>
 <Outside review: its verdict; `unverified` or `unavailable` is listed as missing coverage with its reason, never as passed.>
+
+<Step 9.4's saved `## Deferred findings` and `## Review notes` sections, verbatim, as their own
+sections here; omit each when empty. References only: never a closing keyword.>
 
 ## Exploratory QA
 <Step 9's current surfaces/charters, reproducers, approved regressions and red/green
@@ -150,7 +164,10 @@ Unavailable/inconclusive is never PASS.>
 its saved section file, inserted unchanged by the compose block's `DOCS_SECTION_FILE` lines.
 A blocked audit shipped under a user exception has no section file: state its
 blocked status, scope and exception here and drop the block's `DOCS_SECTION_FILE` guard
-and its `cat -- "$DOCS_SECTION_FILE" && echo &&` step.>
+and its `cat -- "$DOCS_SECTION_FILE" && echo &&` step. The exception is one line,
+word for word as Step 14.5 saved it in `.gstack/tmp/docs-audit.json`:
+`Documentation exception: accepted by <accepted_by> <date> via <via>: <reason>`;
+the receipt write below refuses (`DOCS_AUDIT_BLOCKED`) when the body lacks it.>
 <Always include the status and reviewed scope: updated, current, or blocked with the actual user's named risk exception. Never omit this section or reuse another invocation's audit.>
 
 ## Test plan
@@ -191,6 +208,7 @@ PR_BODY_FILE=$(mktemp "${TMPDIR:-/tmp}/gstack-pr-body.XXXXXX") || { echo "ERROR:
 BODY_TOP_FILE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp/<body-top-file-name>"
 BODY_REST_FILE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp/<body-rest-file-name>"
 [ -s "$BODY_TOP_FILE" ] && [ -s "$BODY_REST_FILE" ] || { echo "Not composed: $BODY_TOP_FILE or $BODY_REST_FILE is empty, so the body was never written. Write both, then rerun." >&2; exit 1; }
+~/.claude/skills/gstack/bin/gstack-prose-lint "$BODY_TOP_FILE" --sections 'Why,Summary,Blast radius' --gate >&2 || { echo "Not composed: fix what gstack-prose-lint printed above (a PROSE: line is a sentence to rewrite in the draft; a usage line means the draft lost a heading), then rerun." >&2; exit 1; }
 { awk 1 "$BODY_TOP_FILE" && cat -- "$DOCS_SECTION_FILE" && echo && awk 1 "$BODY_REST_FILE"; } > "$PR_BODY_FILE" || exit 1
 rm -f "$BODY_TOP_FILE" "$BODY_REST_FILE"
 echo "PR_BODY_FILE: $PR_BODY_FILE"
@@ -201,12 +219,26 @@ per-lane counts (`{"<lane>":{"pass":N,"fail":N,"skip":N}}`) to
 `.gstack/tmp/ship-gate.json` with your file-write tool, then:
 
 ```bash
-~/.claude/skills/gstack/bin/gstack-ship-receipt write --pr <pr-number> --base <base> --gate @.gstack/tmp/ship-gate.json --pregate .gstack/tmp/pregate.json --issues @.gstack/tmp/issues.json --body "$PR_BODY_FILE"
+rm -f .gstack/tmp/review-loop.json
+~/.claude/skills/gstack/bin/gstack-review-scope summary --since "$REVIEW_SINCE" --out .gstack/tmp/review-loop.json &&
+~/.claude/skills/gstack/bin/gstack-ship-receipt write --pr <pr-number> --base <base> --gate @.gstack/tmp/ship-gate.json --pregate .gstack/tmp/pregate.json --issues @.gstack/tmp/issues.json --review-loop @.gstack/tmp/review-loop.json --docs @.gstack/tmp/docs-audit.json --body "$PR_BODY_FILE"
 ```
+
+`--docs` reads the record Step 14.5 saved (`{status, scope[, exception]}`): the
+receipt carries it as `docs`, and a `blocked` status without the owner's exception,
+or a body missing the exception line, is `DOCS_AUDIT_BLOCKED` with nothing written.
+
+The summary reads this branch's review log for the invocation's passes (its
+`REVIEW_LOOP:` line is the one the Pre-Landing Review section carries). The `&&`
+matters: a summary that refuses (no pass matched `REVIEW_SINCE`) must not let `write`
+record a stale or empty loop file.
 
 Add `--receipt .gstack/tmp/tree-receipt.json` only when Step 16 wrote it (gate-ahead).
 New PR/MR: omit `--pr`, then rerun with the number after creation and repost the body.
-Its `SHIP_RECEIPT:` line opens the completion message. `RECEIPT_INVALID` names the bad
+Its `SHIP_RECEIPT:` line opens the completion message. The posted receipt is what
+`gstack-ship-queue ready`, `train build` and `verify --train` require (`QUEUE_RECEIPT_MISSING`,
+`QUEUE_RECEIPT_STALE`, no flag around them), so /ship runs before every READY and after any
+push. `RECEIPT_INVALID` names the bad
 field: fix that input file and rerun; nothing was written. `ISSUE_LINKS_MISSING`: add
 the named line under `## Issues` and rerun. `PREGATE_STALE` means rerun
 `gstack-pregate` on the stamped tree; `PREGATE_REMOTE_UNCLEARED` needs
