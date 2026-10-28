@@ -242,14 +242,26 @@ function severityTokens(text: string): Severity[] {
  * findings, but one [P2] issue" still reads the P2 (sovereign-forge #188 run 2).
  * Its input keeps a word where inline code was, so "No `await` [P1]: ..." is
  * a finding, not a negation (Codex P2 on gstack #21).
+ * The run must also be about findings: a finding noun follows it ("zero [P1]
+ * findings"), or, after no/neither/nor, the clause ends ("no [P1] and no
+ * [P2]."). "Division by zero [P1]" and "always zero [P1] — x.ts:4" are
+ * findings (Codex P2 on gstack #21, exec probe).
  */
 const CODE_PLACEHOLDER = ' code ';
-const NEGATED_TAG_BEFORE = /(?<![\w-])(?:no|zero|neither|nor|without(?:\s+any)?|not\s+(?:a|any|one))\s+(?:\[P[0-3]\][\t ]*(?:,|\/|\bor\b|\band\b|\bnor\b)?[\t ]*)*$/i;
+const NEGATED_TAG_BEFORE = /(?<![\w-])(no|zero|neither|nor|without(?:\s+any)?|not\s+(?:a|any|one))\s+(?:\[P[0-3]\][\t ]*(?:,|\/|\bor\b|\band\b|\bnor\b)?[\t ]*(?:\bno\b[\t ]*)?)*$/i;
+const TAG_RUN_AFTER = '(?:[\\t ]*(?:,|\\/|\\bor\\b|\\band\\b|\\bnor\\b)?[\\t ]*(?:\\bno\\b[\\t ]*)?\\[P[0-3]\\])*';
+const NOUN_AFTER_TAGS = new RegExp(`^${TAG_RUN_AFTER}(?:-level)?[\\t ]+(?:(?:severity|priority)[\\t ]+|or[\\t ]+(?:above|higher)[\\t ]+)?${FINDING_NOUN}`, 'i');
+const CLAUSE_END_AFTER_TAGS = new RegExp(`^${TAG_RUN_AFTER}[\\t ]*(?:[.;,!]|$)`);
 function bracketTags(text: string): Severity[] {
   return [...text.matchAll(/\[(P[0-3])\]|^(P[0-3]):/gm)].filter(m => {
     if (!m[1]) return true;
     const lineStart = text.lastIndexOf('\n', m.index! - 1) + 1;
-    return !NEGATED_TAG_BEFORE.test(text.slice(lineStart, m.index));
+    const lineEnd = text.indexOf('\n', m.index!);
+    const negator = text.slice(lineStart, m.index).match(NEGATED_TAG_BEFORE)?.[1]?.toLowerCase();
+    if (!negator) return true;
+    const after = text.slice(m.index! + m[0].length, lineEnd < 0 ? undefined : lineEnd);
+    const ends = /^(?:no|neither|nor)$/.test(negator) && CLAUSE_END_AFTER_TAGS.test(after);
+    return !(NOUN_AFTER_TAGS.test(after) || ends);
   }).map(m => (m[1] ?? m[2]) as Severity);
 }
 

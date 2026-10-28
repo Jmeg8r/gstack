@@ -57,6 +57,10 @@ describe('real tagged findings are still read', () => {
     // Codex P2 on gstack #21: a removed inline-code span must not leave a bare "No " before the tag.
     ['- No `await` [P1]: the handler returns before the write completes.\n- [P2] naming', 'P1'],
     ['Without `fsync` [P0] the ledger loses its last row.', 'P0'],
+    // Codex P2 on gstack #21 (exec probe): "zero" here is the defect, not a negation of findings.
+    ['- Retry count is always zero [P1] — lib/retry.ts:42\n- [P2] naming', 'P1'],
+    ['- Division by zero [P1]\n- [P2] naming', 'P1'],
+    ['- [P2] naming\n- Fails with no [P1] when the cache is cold', 'P1'],
   ] as const) {
     test(`${level}: ${text.split('\n')[0]}`, () => {
       expect(highest(text)).toBe(level);
