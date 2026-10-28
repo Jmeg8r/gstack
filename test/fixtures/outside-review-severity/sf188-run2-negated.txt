@@ -1,0 +1,11 @@
+No [P1] or [P2] findings at `7439afe`. The run-1 finding is fixed.
+
+- **Exception handling:** `1e9999999999999999999` now becomes a `LedgerError` at `bin/blast-radius.py:1125`. An in-memory two-ledger check confirmed that the affected ledger falls back to its raw diff while the clean ledger remains digested. Boundary probes covering positive and negative exponents, zero, and long coefficients found no additional escaping exception.
+- **Canonicalization:** 10,000 generated non-Decimal values from the JSON data model matched the old `json.dumps(sort_keys=True, ensure_ascii=False, separators=(",", ":"))` output exactly, including nested containers, Unicode, escapes, and surrogate characters. Decimal precision and number/string separation passed. The documented `1e0`/`1` numeric equivalence remains.
+- **Regression coverage:** The tests cover scalar and nested precision changes, appended-value tallies, number/string separation, Decimal-key rejection, and per-ledger overflow fallback. Focused in-memory execution caught all four new or changed mutants. The Decimal-key mutant fails with `TypeError` when the incorrectly admitted key reaches `json.dumps`; the real implementation rejects it with `LedgerError`.
+- **Python 3.9:** The focused checks passed on both Python 3.9.6 and 3.13.2.
+- **Stem rule:** None of the newly introduced whole words matched a Python module stem among 11,212 eligible tracked Python paths across 83 local repository HEAD snapshots. The sweep found Farrier’s `ledger.py` as a positive control. This verifies local snapshots, not current remote branches.
+
+The requested `LEDGER_MUTANT_RUN=1` suite could not complete because the read-only sandbox prevents its temporary Git repositories from being created. The focused checks above ran without filesystem writes; the complete suite and end-to-end gate tests remain unverified in this session. No repository files were changed.
+
+HIGHEST: none

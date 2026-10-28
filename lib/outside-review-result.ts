@@ -235,6 +235,21 @@ function severityTokens(text: string): Severity[] {
     ...[...text.matchAll(TABLE_P)].map(m => m[1] as Severity)];
 }
 
+/**
+ * A bracketed tag anywhere in a line counts, unless a negation governs it:
+ * "No [P1] or [P2] findings", "without any [P0]/[P1] regressions", "neither
+ * [P0] nor [P1]". The negation must lead an unbroken run of tags, so "No [P1]
+ * findings, but one [P2] issue" still reads the P2 (sovereign-forge #188 run 2).
+ */
+const NEGATED_TAG_BEFORE = /(?<![\w-])(?:no|zero|neither|nor|without(?:\s+any)?|not\s+(?:a|any|one))\s+(?:\[P[0-3]\][\t ]*(?:,|\/|\bor\b|\band\b|\bnor\b)?[\t ]*)*$/i;
+function bracketTags(text: string): Severity[] {
+  return [...text.matchAll(/\[(P[0-3])\]|^(P[0-3]):/gm)].filter(m => {
+    if (!m[1]) return true;
+    const lineStart = text.lastIndexOf('\n', m.index! - 1) + 1;
+    return !NEGATED_TAG_BEFORE.test(text.slice(lineStart, m.index));
+  }).map(m => (m[1] ?? m[2]) as Severity);
+}
+
 /** The first line with a P0-P3 token in label position that no severity form reads. */
 function firstUnparsed(text: string): string | undefined {
   const lines = text.split('\n');
@@ -252,8 +267,7 @@ export function classifyOutsideReview(input: OutsideReviewInput): OutsideReviewC
   const plain = plainReview(input.text);
   const reviewed = input.gate !== 'proposal';
   const code = withoutCode(input.text), plainCode = plainReview(code);
-  const levels = [...[...plainCode.matchAll(/\[(P[0-3])\]|^(P[0-3]):/gm)].map(m => (m[1] ?? m[2]) as Severity),
-    ...severityTokens(code), ...(reviewed ? severityWords(code) : [])];
+  const levels = [...bracketTags(plainCode), ...severityTokens(code), ...(reviewed ? severityWords(code) : [])];
   const findings = { highest: levels.length ? levels.sort()[0]! : null };
   const ran = execution(input);
   if (ran.state === 'unavailable') return { execution: ran, findings, verdict: 'unavailable', reason: ran.reason, detail: ran.detail };
