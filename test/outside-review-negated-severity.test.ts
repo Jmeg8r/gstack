@@ -54,6 +54,9 @@ describe('real tagged findings are still read', () => {
     ['No [P0] issues; [P1] the cache never expires.', 'P1'],
     ['No new tests cover the retry path [P1].', 'P1'],
     ['- [P2] naming drift\nNo [P1] findings.', 'P2'],
+    // Codex P2 on gstack #21: a removed inline-code span must not leave a bare "No " before the tag.
+    ['- No `await` [P1]: the handler returns before the write completes.\n- [P2] naming', 'P1'],
+    ['Without `fsync` [P0] the ledger loses its last row.', 'P0'],
   ] as const) {
     test(`${level}: ${text.split('\n')[0]}`, () => {
       expect(highest(text)).toBe(level);

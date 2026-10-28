@@ -206,7 +206,7 @@ function plainReview(text: string): string {
  * (`- \`P1\`: x`, `Severity: \`High\``, a table cell) is formatting and stays.
  */
 const CODE_LABEL_BEFORE = /^[\t ]*(?:>[\t ]*)?(?:#{1,6}[\t ]+|[-+*][\t ]+|\(?\d{1,3}[.)][\t ]+)?(?:\*\*|__)?$|\b(?:severity|priority)[\t ]*[:=][\t ]*(?:\*\*|__)?$|\|[\t ]*(?:\*\*)?$/i;
-function withoutCode(text: string): string {
+function withoutCode(text: string, blank = ' '): string {
   let fence: string | undefined;
   return text.split(/\r?\n/).map(line => {
     const marker = /^[\t ]*(`{3,}|~{3,})/.exec(line)?.[1];
@@ -216,7 +216,7 @@ function withoutCode(text: string): string {
     }
     if (marker) { fence = marker; return ''; }
     return line.replace(/`([^`]+)`/g, (span, inner: string, at: number) =>
-      inner.trim() === 'NO_FINDINGS' || /^\[?(?:P[0-3]|critical|high|medium|low)\]?$/i.test(inner.trim()) && CODE_LABEL_BEFORE.test(line.slice(0, at)) ? inner : ' ');
+      inner.trim() === 'NO_FINDINGS' || /^\[?(?:P[0-3]|critical|high|medium|low)\]?$/i.test(inner.trim()) && CODE_LABEL_BEFORE.test(line.slice(0, at)) ? inner : blank);
   }).join('\n');
 }
 
@@ -240,7 +240,10 @@ function severityTokens(text: string): Severity[] {
  * "No [P1] or [P2] findings", "without any [P0]/[P1] regressions", "neither
  * [P0] nor [P1]". The negation must lead an unbroken run of tags, so "No [P1]
  * findings, but one [P2] issue" still reads the P2 (sovereign-forge #188 run 2).
+ * Its input keeps a word where inline code was, so "No `await` [P1]: ..." is
+ * a finding, not a negation (Codex P2 on gstack #21).
  */
+const CODE_PLACEHOLDER = ' code ';
 const NEGATED_TAG_BEFORE = /(?<![\w-])(?:no|zero|neither|nor|without(?:\s+any)?|not\s+(?:a|any|one))\s+(?:\[P[0-3]\][\t ]*(?:,|\/|\bor\b|\band\b|\bnor\b)?[\t ]*)*$/i;
 function bracketTags(text: string): Severity[] {
   return [...text.matchAll(/\[(P[0-3])\]|^(P[0-3]):/gm)].filter(m => {
@@ -267,7 +270,7 @@ export function classifyOutsideReview(input: OutsideReviewInput): OutsideReviewC
   const plain = plainReview(input.text);
   const reviewed = input.gate !== 'proposal';
   const code = withoutCode(input.text), plainCode = plainReview(code);
-  const levels = [...bracketTags(plainCode), ...severityTokens(code), ...(reviewed ? severityWords(code) : [])];
+  const levels = [...bracketTags(plainReview(withoutCode(input.text, CODE_PLACEHOLDER))), ...severityTokens(code), ...(reviewed ? severityWords(code) : [])];
   const findings = { highest: levels.length ? levels.sort()[0]! : null };
   const ran = execution(input);
   if (ran.state === 'unavailable') return { execution: ran, findings, verdict: 'unavailable', reason: ran.reason, detail: ran.detail };
