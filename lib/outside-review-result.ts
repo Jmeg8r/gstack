@@ -235,6 +235,33 @@ function severityTokens(text: string): Severity[] {
     ...[...text.matchAll(TABLE_P)].map(m => m[1] as Severity)];
 }
 
+/**
+ * Tagged sentences that say there are no findings, matched exactly. James's
+ * decision (2026-10-28): an allowlist built from what reviews emitted, not a
+ * negation heuristic (sovereign-forge #188 run 2 posted FAIL on "No [P1] or
+ * [P2] findings at `7439afe`."; the digest PRs used "[P2] none: no findings."
+ * and "[P2] none"). Only whitespace and case are normalized; an entry may be
+ * followed only by " at <one inline-code ref>" and then the sentence end. Any
+ * other wording keeps its tags, so a near-miss fails closed. A sentence counts
+ * only if it ends in sentence punctuation, or is the whole line with a blank
+ * line or the end after it: a wrapped line could continue with "except ..."
+ * (Codex P2 on gstack #21, comment 28453).
+ */
+const CLEAN_TAGGED_PHRASES = ['No [P1] or [P2] findings', '[P2] none: no findings', '[P2] none'];
+const CLEAN_TAGGED_SENTENCE = new RegExp(
+  `^(?:${CLEAN_TAGGED_PHRASES.map(p => p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})(?: at \`[^\`]+\`)?\\.?$`, 'i');
+function withoutCleanTagged(text: string): string {
+  const lines = text.split('\n');
+  return lines.map((line, i) => {
+    const ended = !lines[i + 1]?.trim();
+    return line.split(/(?<=[.!?;])(?=\s)/).map(sentence => {
+      const said = sentence.trim();
+      const complete = /[.!?;]$/.test(said) || (said === line.trim() && ended);
+      return complete && CLEAN_TAGGED_SENTENCE.test(said.replace(/\s+/g, ' ')) ? sentence.replace(/\S/g, ' ') : sentence;
+    }).join('');
+  }).join('\n');
+}
+
 /** The first line with a P0-P3 token in label position that no severity form reads. */
 function firstUnparsed(text: string): string | undefined {
   const lines = text.split('\n');
@@ -251,7 +278,7 @@ function verdictNotReady(plain: string): boolean {
 export function classifyOutsideReview(input: OutsideReviewInput): OutsideReviewClassification {
   const plain = plainReview(input.text);
   const reviewed = input.gate !== 'proposal';
-  const code = withoutCode(input.text), plainCode = plainReview(code);
+  const code = withoutCode(withoutCleanTagged(input.text)), plainCode = plainReview(code);
   const levels = [...[...plainCode.matchAll(/\[(P[0-3])\]|^(P[0-3]):/gm)].map(m => (m[1] ?? m[2]) as Severity),
     ...severityTokens(code), ...(reviewed ? severityWords(code) : [])];
   const findings = { highest: levels.length ? levels.sort()[0]! : null };

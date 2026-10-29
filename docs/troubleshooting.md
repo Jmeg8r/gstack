@@ -161,6 +161,13 @@ the readiness dashboard and the PR body, and never count it as a pass.
   label position that none of these forms reads (`## P1/P2 findings`) makes the
   review [`unverified`](#outside-review-unparsed-severity), never `clean`. Code
   fences and inline code are quotes, not labels.
+- **Tagged "no findings" sentences.** Exactly three are read as no finding:
+  `No [P1] or [P2] findings`, `[P2] none: no findings.` and `[P2] none`,
+  optionally followed by ` at <one inline-code ref>` (`` at `7439afe` ``) and
+  the sentence end. Only whitespace and case may differ. The sentence must end
+  in punctuation, or be the whole line with a blank line or the end after it;
+  a line the next one could continue keeps its tags. Any other wording
+  ("zero [P1] findings", "No [P1] findings except ...") keeps its tags.
 - **Severity words in label position.** `Severity: High`, `Priority: low`, a
   line that starts with `High:`, `High —`, `[High]` or `**High**` (after an
   optional heading, bullet or number), a bold `**High**` anywhere, or a table
