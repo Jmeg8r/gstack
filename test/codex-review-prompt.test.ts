@@ -14,7 +14,7 @@ const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-review-prompt-'));
 afterAll(() => fs.rmSync(TMP, { recursive: true, force: true }));
 
 function git(cwd: string, ...args: string[]) {
-  const r = spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, encoding: 'utf8' });
+  const r = spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, encoding: 'utf8', timeout: 30_000 });
   if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
   return r.stdout.trim();
 }
@@ -30,7 +30,7 @@ fs.writeFileSync(path.join(repo, 'a.ts'), 'export const a = 2;\n');
 git(repo, 'commit', '-q', '-am', 'change');
 
 function build(args: string[], env: Record<string, string> = {}) {
-  const r = spawnSync(BIN, args, { cwd: repo, encoding: 'utf8', env: { ...process.env, ...env } });
+  const r = spawnSync(BIN, args, { cwd: repo, encoding: 'utf8', env: { ...process.env, ...env }, timeout: 30_000 });
   return { status: r.status, stdout: r.stdout, stderr: r.stderr };
 }
 
@@ -71,8 +71,94 @@ describe('gstack-codex-review-prompt', () => {
     expect(r.stderr).toMatch(/\d+ bytes.*limit 10/);
   });
 
+  test('--commit reviews exactly that commit, not what came after it', () => {
+    const changeSha = git(repo, 'rev-parse', 'HEAD');
+    fs.writeFileSync(path.join(repo, 'later.ts'), 'export const later = true;\n');
+    git(repo, 'add', 'later.ts');
+    git(repo, 'commit', '-q', '-m', 'later');
+    try {
+      const r = build(['--commit', changeSha]);
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain(`Scope: commit ${changeSha}`);
+      expect(r.stdout).toContain('+export const a = 2;');
+      expect(r.stdout).not.toContain('later');
+      expect(build(['--commit', 'deadbeef']).stdout).toBe('');
+    } finally {
+      git(repo, 'reset', '-q', '--hard', changeSha);
+    }
+  });
+
+  test('--uncommitted reviews staged, unstaged and untracked changes', () => {
+    fs.writeFileSync(path.join(repo, 'a.ts'), 'export const a = 3;\n');
+    fs.writeFileSync(path.join(repo, 'staged.ts'), 'export const staged = 1;\n');
+    git(repo, 'add', 'staged.ts');
+    fs.writeFileSync(path.join(repo, 'untracked.ts'), 'export const untracked = 1;\n');
+    try {
+      const r = build(['--uncommitted']);
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('Scope: uncommitted changes against HEAD');
+      for (const s of ['+export const a = 3;', '+export const staged = 1;', '+export const untracked = 1;']) expect(r.stdout).toContain(s);
+      expect(r.stdout).not.toContain('+export const a = 2;');
+    } finally {
+      git(repo, 'reset', '-q', '--hard', 'HEAD');
+      fs.rmSync(path.join(repo, 'untracked.ts'), { force: true });
+    }
+  });
+
+  test('an empty diff is never a review: base at HEAD and an empty commit fail closed', () => {
+    for (const r of [build(['HEAD']), build(['--uncommitted'])]) {
+      expect(r.status).not.toBe(0);
+      expect(r.stdout).toBe('');
+      expect(r.stderr).toContain('empty diff');
+    }
+    git(repo, 'commit', '-q', '--allow-empty', '-m', 'empty');
+    try {
+      const r = build(['--commit', 'HEAD']);
+      expect(r.status).not.toBe(0);
+      expect(r.stdout).toBe('');
+    } finally {
+      git(repo, 'reset', '-q', '--hard', 'HEAD~1');
+    }
+  });
+
+  test('base mode includes untracked files, from any directory', () => {
+    fs.mkdirSync(path.join(repo, 'sub'), { recursive: true });
+    fs.writeFileSync(path.join(repo, 'new-root.ts'), 'export const fresh = 1;\n');
+    try {
+      for (const cwd of [repo, path.join(repo, 'sub')]) {
+        const r = spawnSync(BIN, ['main'], { cwd, encoding: 'utf8', timeout: 30_000 });
+        expect(r.status).toBe(0);
+        expect(r.stdout).toContain('+export const fresh = 1;');
+        expect(r.stdout).toContain('+export const a = 2;');
+      }
+    } finally {
+      fs.rmSync(path.join(repo, 'new-root.ts'), { force: true });
+      fs.rmSync(path.join(repo, 'sub'), { recursive: true, force: true });
+    }
+  });
+
+  test('an untracked symlink is shown as its target, not dropped with an error', () => {
+    fs.symlinkSync(TMP, path.join(repo, 'linked-dir'));
+    try {
+      const r = build(['main']);
+      expect(r.status).toBe(0);
+      expect(r.stderr).toBe('');
+      expect(r.stdout).toContain('new file mode 120000');
+      expect(r.stdout).toContain(`+${TMP}`);
+    } finally {
+      fs.rmSync(path.join(repo, 'linked-dir'), { force: true });
+    }
+  });
+
+  test('user diff config (external diff, textconv) cannot replace the patch', () => {
+    const r = build(['main'], { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'diff.external', GIT_CONFIG_VALUE_0: '/bin/echo' });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('+export const a = 2;');
+  });
+
   test('a missing focus file or bad arguments fail with usage, nothing on stdout', () => {
-    for (const args of [[], ['main', '--focus-file', path.join(TMP, 'absent')], ['main', '--bogus']]) {
+    for (const args of [[], ['main', '--focus-file', path.join(TMP, 'absent')], ['main', '--bogus'],
+      ['main', '--uncommitted'], ['--commit'], ['--commit', 'HEAD', 'main']]) {
       const r = build(args);
       expect(r.status).not.toBe(0);
       expect(r.stdout).toBe('');
