@@ -206,7 +206,7 @@ function plainReview(text: string): string {
  * (`- \`P1\`: x`, `Severity: \`High\``, a table cell) is formatting and stays.
  */
 const CODE_LABEL_BEFORE = /^[\t ]*(?:>[\t ]*)?(?:#{1,6}[\t ]+|[-+*][\t ]+|\(?\d{1,3}[.)][\t ]+)?(?:\*\*|__)?$|\b(?:severity|priority)[\t ]*[:=][\t ]*(?:\*\*|__)?$|\|[\t ]*(?:\*\*)?$/i;
-function withoutCode(text: string, blank = ' '): string {
+function withoutCode(text: string): string {
   let fence: string | undefined;
   return text.split(/\r?\n/).map(line => {
     const marker = /^[\t ]*(`{3,}|~{3,})/.exec(line)?.[1];
@@ -216,7 +216,7 @@ function withoutCode(text: string, blank = ' '): string {
     }
     if (marker) { fence = marker; return ''; }
     return line.replace(/`([^`]+)`/g, (span, inner: string, at: number) =>
-      inner.trim() === 'NO_FINDINGS' || /^\[?(?:P[0-3]|critical|high|medium|low)\]?$/i.test(inner.trim()) && CODE_LABEL_BEFORE.test(line.slice(0, at)) ? inner : blank);
+      inner.trim() === 'NO_FINDINGS' || /^\[?(?:P[0-3]|critical|high|medium|low)\]?$/i.test(inner.trim()) && CODE_LABEL_BEFORE.test(line.slice(0, at)) ? inner : ' ');
   }).join('\n');
 }
 
@@ -236,40 +236,21 @@ function severityTokens(text: string): Severity[] {
 }
 
 /**
- * A bracketed tag anywhere in a line counts, unless a negation governs it:
- * "No [P1] or [P2] findings", "without any [P0]/[P1] regressions", "neither
- * [P0] nor [P1]". The negation must lead an unbroken run of tags, so "No [P1]
- * findings, but one [P2] issue" still reads the P2 (sovereign-forge #188 run 2).
- * Its input keeps a word where inline code was, so "No `await` [P1]: ..." is
- * a finding, not a negation (Codex P2 on gstack #21).
- * The run must also be about findings: a finding noun follows it ("zero [P1]
- * findings"), or, after no/neither/nor, the clause ends ("no [P1] and no
- * [P2]."). "Division by zero [P1]" and "always zero [P1] — x.ts:4" are
- * findings (Codex P2 on gstack #21, exec probe).
- * An exception in the same clause keeps the tag: "No [P1] issues other than
- * the auth check" reports a P1 (Codex P2 on gstack #21, exec review). The
- * clause may wrap onto the next lines; it ends at a blank line or list item.
+ * Tagged sentences that say there are no findings, matched exactly. James's
+ * decision (2026-10-28): an allowlist built from what reviews emitted, not a
+ * negation heuristic (sovereign-forge #188 run 2 posted FAIL on "No [P1] or
+ * [P2] findings at `7439afe`."; the digest PRs used "[P2] none: no findings."
+ * and "[P2] none"). Only whitespace and case are normalized; an entry may be
+ * followed only by " at <one inline-code ref>" and then the sentence end. Any
+ * other wording keeps its tags, so a near-miss fails closed.
  */
-const CODE_PLACEHOLDER = ' code ';
-const NEGATED_TAG_BEFORE = /(?<![\w-])(no|zero|neither|nor|without(?:\s+any)?|not\s+(?:a|any|one))\s+(?:\[P[0-3]\][\t ]*(?:,|\/|\bor\b|\band\b|\bnor\b)?[\t ]*(?:\bno\b[\t ]*)?)*$/i;
-const TAG_RUN_AFTER = '(?:[\\t ]*(?:,|\\/|\\bor\\b|\\band\\b|\\bnor\\b)?[\\t ]*(?:\\bno\\b[\\t ]*)?\\[P[0-3]\\])*';
-const NOUN_AFTER_TAGS = new RegExp(`^${TAG_RUN_AFTER}(?:-level)?[\\t ]+(?:(?:severity|priority)[\\t ]+|or[\\t ]+(?:above|higher)[\\t ]+)?${FINDING_NOUN}`, 'i');
-const CLAUSE_END_AFTER_TAGS = new RegExp(`^${TAG_RUN_AFTER}[\\t ]*(?:[.;,!]|$)`);
-const CLAUSE_BREAK = /\n[\t ]*(?:$|[-*+#|>]|\d+[.)])/m;
-const EXCEPTION_IN_CLAUSE = /^[^.;!]*\b(?:except|other\s+than|apart\s+from|aside\s+from|besides|beyond|save\s+for|but\s+for)\b/i;
-function bracketTags(text: string): Severity[] {
-  return [...text.matchAll(/\[(P[0-3])\]|^(P[0-3]):/gm)].filter(m => {
-    if (!m[1]) return true;
-    const lineStart = text.lastIndexOf('\n', m.index! - 1) + 1;
-    const lineEnd = text.indexOf('\n', m.index!);
-    const negator = text.slice(lineStart, m.index).match(NEGATED_TAG_BEFORE)?.[1]?.toLowerCase();
-    if (!negator) return true;
-    const after = text.slice(m.index! + m[0].length, lineEnd < 0 ? undefined : lineEnd);
-    const ends = /^(?:no|neither|nor)$/.test(negator) && CLAUSE_END_AFTER_TAGS.test(after);
-    const rest = text.slice(m.index! + m[0].length);
-    const clause = rest.slice(0, rest.search(CLAUSE_BREAK) < 0 ? undefined : rest.search(CLAUSE_BREAK)).replace(/\s+/g, ' ');
-    return !(NOUN_AFTER_TAGS.test(after) || ends) || EXCEPTION_IN_CLAUSE.test(clause);
-  }).map(m => (m[1] ?? m[2]) as Severity);
+const CLEAN_TAGGED_PHRASES = ['No [P1] or [P2] findings', '[P2] none: no findings', '[P2] none'];
+const CLEAN_TAGGED_SENTENCE = new RegExp(
+  `^(?:${CLEAN_TAGGED_PHRASES.map(p => p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})(?: at \`[^\`]+\`)?\\.?$`, 'i');
+function withoutCleanTagged(text: string): string {
+  return text.split('\n').map(line => line.split(/(?<=[.!?;])(?=\s)/)
+    .map(sentence => CLEAN_TAGGED_SENTENCE.test(sentence.trim().replace(/\s+/g, ' ')) ? sentence.replace(/\S/g, ' ') : sentence)
+    .join('')).join('\n');
 }
 
 /** The first line with a P0-P3 token in label position that no severity form reads. */
@@ -288,8 +269,9 @@ function verdictNotReady(plain: string): boolean {
 export function classifyOutsideReview(input: OutsideReviewInput): OutsideReviewClassification {
   const plain = plainReview(input.text);
   const reviewed = input.gate !== 'proposal';
-  const code = withoutCode(input.text), plainCode = plainReview(code);
-  const levels = [...bracketTags(plainReview(withoutCode(input.text, CODE_PLACEHOLDER))), ...severityTokens(code), ...(reviewed ? severityWords(code) : [])];
+  const code = withoutCode(withoutCleanTagged(input.text)), plainCode = plainReview(code);
+  const levels = [...[...plainCode.matchAll(/\[(P[0-3])\]|^(P[0-3]):/gm)].map(m => (m[1] ?? m[2]) as Severity),
+    ...severityTokens(code), ...(reviewed ? severityWords(code) : [])];
   const findings = { highest: levels.length ? levels.sort()[0]! : null };
   const ran = execution(input);
   if (ran.state === 'unavailable') return { execution: ran, findings, verdict: 'unavailable', reason: ran.reason, detail: ran.detail };
