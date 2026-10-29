@@ -15,7 +15,7 @@ import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'node:os';
-import { CODEX_MODEL_CONFIG_FLAG, CODEX_REVIEW_MODEL_CONFIG_FLAG, CODEX_WEB_SEARCH_FLAG, codexSelect } from '../scripts/resolvers/constants';
+import { CODEX_MODEL_CONFIG_FLAG, CODEX_WEB_SEARCH_FLAG, codexSelect } from '../scripts/resolvers/constants';
 
 const ROOT = path.join(import.meta.dir, '..');
 const DEPRECATED = '--enable web_search_cached';
@@ -115,20 +115,21 @@ describe('codex frontier model flag is present', () => {
     expect(() => execFileSync('bash', ['-c', `printf '%s\\n' ${CODEX_MODEL_CONFIG_FLAG}`], { encoding: 'utf8', timeout: 5000, stdio: 'pipe' })).toThrow();
   });
 
-  test('native review overrides both model settings with the same selection', () => {
+  test('structured reviews send the review-role selection to codex exec as model', () => {
+    // select-model review still picks the reviewer (config review_model first); exec takes it as model.
     for (const [env, config, expected] of [
       [{}, undefined, 'gpt-6-astra'],
       [{ GSTACK_CODEX_MODEL: 'custom-codex' }, 'review_model = "gpt-5.6-luna"\n', 'custom-codex'],
       [{}, 'model = "gpt-5.6-terra"\nreview_model = "gpt-5.6-luna"\n', 'gpt-5.6-luna'],
     ] as const) {
-      const argv = flagArgv(CODEX_REVIEW_MODEL_CONFIG_FLAG, 'review', { ...env }, config);
-      expect(argv).toEqual(['-c', `review_model="${expected}"`, '-c', `model="${expected}"`, '-c', 'skills.include_instructions=false']);
+      expect(flagArgv(CODEX_MODEL_CONFIG_FLAG, 'review', { ...env }, config)).toEqual(['-c', `model="${expected}"`, '-c', 'skills.include_instructions=false']);
     }
     for (const file of ['codex/sections/review-mode.md', 'review/sections/adversarial.md', 'ship/sections/adversarial.md']) {
       const rendered = fs.readFileSync(path.join(ROOT, file), 'utf8');
-      const calls = rendered.split('\n').filter(line => line.includes('codex review --base') && line.includes('2>'));
+      expect(rendered).not.toContain('codex review --base');
+      const calls = rendered.split('\n').filter(line => line.includes('codex exec - ') && line.includes('2>'));
       expect(calls.length).toBeGreaterThan(0);
-      for (const call of calls) expect(call).toContain(CODEX_REVIEW_MODEL_CONFIG_FLAG);
+      for (const call of calls) expect(call).toContain(CODEX_MODEL_CONFIG_FLAG);
     }
   });
 

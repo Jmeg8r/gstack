@@ -1710,13 +1710,22 @@ describe('Codex skill', () => {
     // The old assertion banned the substring `--base <base> -c '...'`, which
     // the correct scoped form also contains — it could not tell the two apart,
     // so it effectively banned the fix.
+    //
+    // Structured reviews now run through `codex exec` with a prompt built by
+    // gstack-codex-review-prompt, which owns the scope (merge-base diff), so
+    // no file needs a scoped native call; the parse rule below still holds
+    // for any `codex review` line that remains.
     for (const rel of ['codex/SKILL.md', 'review/SKILL.md', 'ship/SKILL.md']) {
       // ship's AND review's codex commands moved into sections/adversarial.md;
       // codex's own scoped invocation lives in sections/review-mode.md (T9 carve).
       const content = rel === 'ship/SKILL.md' ? readShipUnion()
         : rel === 'review/SKILL.md' ? readSkillUnion('review')
         : readSkillUnion('codex');
-      expect(content).toMatch(/codex\s+review\s+--base\b/);
+      // The built prompt file is exactly what codex exec reads on stdin.
+      const built = content.match(/gstack-codex-review-prompt"? [^\n]*> ?("\$\w+")/);
+      expect(built, rel).not.toBeNull();
+      const target = built![1].replace(/[$]/g, '\\$');
+      expect(content).toMatch(new RegExp(`codex exec - [^\\n]*< ?${target}`));
       const offending: string[] = [];
       for (const line of content.split('\n')) {
         if (line.includes('`codex review`')) continue;

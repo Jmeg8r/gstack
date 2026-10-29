@@ -29,7 +29,7 @@ import { generateAntiShortcutClause, generateSpecReviewLoop, generateBenefitsFro
 import { generateCodexSecondOpinion, generateAdversarialStep, generateCodexPlanReview, generateCodexDocReview } from './outside-voice-steps';
 import { generateImplementationModelHandoff } from './plan-review';
 import { generateScopeDrift, generateCrossReviewDedup, generateSharedCodeReuse } from './review-scope';
-import { generateSlugEval, generateSlugSetup, generateBaseBranchDetect, generateDeployBootstrap, generateQAMethodology, generateCoAuthorTrailer, generateChangelogWorkflow, generateCodexWebSearchFlag, generateCodexModelConfigFlag, generateCodexReviewModelConfigFlag, generateClaudeModelFlag, generateSetupCommand } from './utility';
+import { generateSlugEval, generateSlugSetup, generateBaseBranchDetect, generateDeployBootstrap, generateQAMethodology, generateCoAuthorTrailer, generateChangelogWorkflow, generateCodexWebSearchFlag, generateCodexModelConfigFlag, generateClaudeModelFlag, generateSetupCommand } from './utility';
 import { generateLearningsSearch, generateLearningsLog } from './learnings';
 import { generateConfidenceCalibration } from './confidence';
 import { generateGateScanBlock } from './gate-scan';
@@ -73,7 +73,6 @@ export const RESOLVERS: Record<string, ResolverFn> = {
   SLUG_SETUP: generateSlugSetup,
   CODEX_WEB_SEARCH_FLAG: generateCodexWebSearchFlag,
   CODEX_MODEL_CONFIG_FLAG: generateCodexModelConfigFlag,
-  CODEX_REVIEW_MODEL_CONFIG_FLAG: generateCodexReviewModelConfigFlag,
   CODEX_SELECT: (_ctx, args) => codexSelect(args?.[0] === 'review' ? 'review' : 'exec', undefined, args?.[1] ? { budgetSecs: Number(args[1]), optional: true } : undefined),
   CLAUDE_MODEL_FLAG: generateClaudeModelFlag,
   REDACT_INVOCATION_BLOCK: generateRedactInvocationBlock,

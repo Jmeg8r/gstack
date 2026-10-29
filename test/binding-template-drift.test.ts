@@ -119,11 +119,11 @@ describe('content-binding template drift', () => {
     expect(army).toContain('--finish DESIGN_START');
     const codex = rendered('codex/sections/review-mode.md');
     const starts = [...codex.matchAll(/gstack-review-log --start codex-review/g)];
-    expect(starts).toHaveLength(2);
-    const nativeReview = codex.indexOf(`run-with-timeout --user-invoked --effort high --request-effort '<effort-level>' 330 codex review`);
-    expect(nativeReview).toBeGreaterThan(-1);
-    expect(starts[0].index).toBeLessThan(nativeReview);
-    expect(starts[1].index).toBeLessThan(codex.indexOf('git diff "<base>...HEAD"'));
+    // One review path: the token is captured before the prompt (and its diff) is built.
+    expect(starts).toHaveLength(1);
+    const built = codex.indexOf('gstack-codex-review-prompt <scope>');
+    expect(built).toBeGreaterThan(-1);
+    expect(starts[0].index).toBeLessThan(built);
     expect(codex).toContain('--finish CODEX_REVIEW_START');
     expect(codex).toContain('"completed":COMPLETED,"converged":CONVERGED');
     expectMentions(codex, [['until', 'genuine', 'fixes']], 'codex');
