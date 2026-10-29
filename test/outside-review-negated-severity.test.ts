@@ -36,6 +36,8 @@ describe('a negated [Pn] tag is not a finding', () => {
     'The change ships without any [P0]/[P1] regressions.',
     'Nothing here rises to a finding: no [P1] and no [P2].',
     'Neither [P0] nor [P1] issues remain.',
+    // A wrapped clause stops at a list item, so the next bullet's words cannot unnegate it.
+    'No [P1] issues remain.\n- Other than style, the diff is fine.',
   ]) {
     test(`negated: ${text}`, () => {
       expect(highest(text)).toBeNull();
@@ -65,6 +67,7 @@ describe('real tagged findings are still read', () => {
     ['No [P1] issues other than the missing authorization check.\n- [P2] The error message names the wrong flag.', 'P1'],
     ['No [P0] findings except the dropped write in lib/store.ts:40.', 'P0'],
     ['No [P1] regressions apart from the race in the lock release.', 'P1'],
+    ['No [P1] issues\nother than the missing authorization check.\n- [P2] Naming drift', 'P1'],
   ] as const) {
     test(`${level}: ${text.split('\n')[0]}`, () => {
       expect(highest(text)).toBe(level);

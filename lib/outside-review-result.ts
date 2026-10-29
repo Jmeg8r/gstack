@@ -247,13 +247,15 @@ function severityTokens(text: string): Severity[] {
  * [P2]."). "Division by zero [P1]" and "always zero [P1] — x.ts:4" are
  * findings (Codex P2 on gstack #21, exec probe).
  * An exception in the same clause keeps the tag: "No [P1] issues other than
- * the auth check" reports a P1 (Codex P2 on gstack #21, exec review).
+ * the auth check" reports a P1 (Codex P2 on gstack #21, exec review). The
+ * clause may wrap onto the next lines; it ends at a blank line or list item.
  */
 const CODE_PLACEHOLDER = ' code ';
 const NEGATED_TAG_BEFORE = /(?<![\w-])(no|zero|neither|nor|without(?:\s+any)?|not\s+(?:a|any|one))\s+(?:\[P[0-3]\][\t ]*(?:,|\/|\bor\b|\band\b|\bnor\b)?[\t ]*(?:\bno\b[\t ]*)?)*$/i;
 const TAG_RUN_AFTER = '(?:[\\t ]*(?:,|\\/|\\bor\\b|\\band\\b|\\bnor\\b)?[\\t ]*(?:\\bno\\b[\\t ]*)?\\[P[0-3]\\])*';
 const NOUN_AFTER_TAGS = new RegExp(`^${TAG_RUN_AFTER}(?:-level)?[\\t ]+(?:(?:severity|priority)[\\t ]+|or[\\t ]+(?:above|higher)[\\t ]+)?${FINDING_NOUN}`, 'i');
 const CLAUSE_END_AFTER_TAGS = new RegExp(`^${TAG_RUN_AFTER}[\\t ]*(?:[.;,!]|$)`);
+const CLAUSE_BREAK = /\n[\t ]*(?:$|[-*+#|>]|\d+[.)])/m;
 const EXCEPTION_IN_CLAUSE = /^[^.;!]*\b(?:except|other\s+than|apart\s+from|aside\s+from|besides|beyond|save\s+for|but\s+for)\b/i;
 function bracketTags(text: string): Severity[] {
   return [...text.matchAll(/\[(P[0-3])\]|^(P[0-3]):/gm)].filter(m => {
@@ -264,7 +266,9 @@ function bracketTags(text: string): Severity[] {
     if (!negator) return true;
     const after = text.slice(m.index! + m[0].length, lineEnd < 0 ? undefined : lineEnd);
     const ends = /^(?:no|neither|nor)$/.test(negator) && CLAUSE_END_AFTER_TAGS.test(after);
-    return !(NOUN_AFTER_TAGS.test(after) || ends) || EXCEPTION_IN_CLAUSE.test(after);
+    const rest = text.slice(m.index! + m[0].length);
+    const clause = rest.slice(0, rest.search(CLAUSE_BREAK) < 0 ? undefined : rest.search(CLAUSE_BREAK)).replace(/\s+/g, ' ');
+    return !(NOUN_AFTER_TAGS.test(after) || ends) || EXCEPTION_IN_CLAUSE.test(clause);
   }).map(m => (m[1] ?? m[2]) as Severity);
 }
 
