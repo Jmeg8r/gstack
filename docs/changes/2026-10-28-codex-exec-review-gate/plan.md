@@ -47,3 +47,33 @@ linear: pending
 - `-c developer_instructions` on native review: ignored (probe).
 - Letting Codex run `git diff` itself: scope drift.
 - Relaxing the validator to accept clean prose: ruled out by James.
+
+## Deviations
+- The builder also takes `--commit <sha>` and `--uncommitted` (R1 named only
+  `<base>`), so `/codex review` keeps its three scopes on one path. Tests cover both.
+- `/codex review` had two paths (native scoped review, and `codex exec` with a
+  hand-written prompt for custom focus). They are now one: the builder with an
+  optional `--focus-file`. Tests that counted two dispatch blocks or two
+  `--start codex-review` tokens now count one.
+- R7 is implemented as `exit 1` before Codex runs (the block stops with
+  "Not run: the review prompt could not be built"), not as a non-zero exit fed
+  to the validator. Nothing is sent, so nothing is validated.
+- `CODEX_REVIEW_MODEL_CONFIG_FLAG` (`-c review_model=...`) is removed: no
+  template uses it once native review is gone. `select-model review` still
+  reads `review_model` from config, and exec receives the result as `model`.
+- The builder sets `BASH_COMPAT=50` (its prompt heredoc is over 512 bytes; the
+  heredoc pipe-deadlock guard requires it).
+- Tests that encoded native-only rationale were rewritten for exec: skill
+  validation (scope), codex-hardening (sandbox pin, gate text), web-search flag
+  (model), skill isolation (boundary now lives in the builder), outside-voice
+  invocation (argv, sandbox), binding drift, model-role and effort counts.
+  Size pins for the review skill were lowered and the copilot/factory codex
+  pins deleted; both skills shrank.
+- Adversarial review (T3, 2026-10-28) found that an empty diff built a valid
+  prompt, and a model asked for NO_FINDINGS would pass it (P1). The builder now
+  exits 1 on an empty diff. Also from that review: base mode includes untracked
+  files (R4 said `git diff <merge-base>`, which skips them, while the docs said
+  working tree included), untracked symlinks are shown as their target, and
+  `--no-ext-diff --no-textconv` keep user diff config out of the patch. The
+  builder lists untracked files from the top level. Each fix has a test that
+  failed first.
