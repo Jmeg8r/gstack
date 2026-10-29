@@ -620,7 +620,7 @@ describe('manual /codex entry: explicit role only, paid probe only for the dispa
     const template = fs.readFileSync(path.join(ROOT, 'codex', 'sections', `${file}.md.tmpl`), 'utf8');
     const selections = [...template.matchAll(/\{\{CODEX_SELECT:(exec|review):(\d+)\}\}/g)];
     test(`${file}: every dispatch block selects then, with the role only, probes that same model under the block's own deadline`, () => {
-      expect(selections.length).toBe(file === 'review-mode' ? 2 : 1);
+      expect(selections.length).toBe(1);
       expect(template.match(/\{\{CODEX_SELECT/g)!.length).toBe(selections.length);
       for (const block of template.split(/\{\{CODEX_SELECT:/).slice(1)) {
         const [kind, budget] = block.split('}}')[0]!.split(':');

@@ -172,9 +172,9 @@ For other modes, retain the native pass above; do not dispatch it again.
 
 If `CODEX_MODE` is `ready` or `unverified` and either `DIFF_TOTAL >= 200` or the user requested the override above:
 
-Prepare a structured review prompt requesting severity-tagged findings ([P0]-[P3]) or a final line with only NO_FINDINGS. Preserve the base-branch scope including committed changes and working-tree changes.
+The command below builds the structured review prompt itself; do not write one.
 
-Run Codex’s built-in structured review with the selected base. It supplies its own prompt and accepts no custom prompt file with --base. Require severity-tagged findings (including native P1:/P2: labels) or an explicit no-findings conclusion; arbitrary prose or a refusal is missing coverage.
+Run the structured Codex review with the selected base; `codex exec` sends the built prompt. Require severity-tagged findings or a final line with only NO_FINDINGS; arbitrary prose or a refusal is missing coverage.
 
 ```bash
 # GSTACK_ACTIVE_HOST names the harness, never the model.
@@ -192,7 +192,7 @@ _REPO_ROOT=$(git rev-parse --show-toplevel) || { echo 'ERROR: not in a git repo'
 _OUTSIDE_TMP=$(mktemp -d "${TMPDIR:-/tmp}/gstack-outside.XXXXXXXX") || exit 1
 trap 'rm -rf "$_OUTSIDE_TMP"' EXIT
 _OUTSIDE_INPUT="$_OUTSIDE_TMP/prompt"
-: >"$_OUTSIDE_INPUT" || exit 1
+"$HOME/.claude/skills/gstack/bin/gstack-codex-review-prompt" '<base>' >"$_OUTSIDE_INPUT" || exit 1
 
 _CODEX_PROBE="$HOME/.claude/skills/gstack/bin/gstack-codex-probe"
 _CODEX_OUT=$("$_CODEX_PROBE" select-model review) || exit 1
@@ -201,12 +201,12 @@ _CODEX_SANDBOX_MODE=$(echo "$_CODEX_OUT" | sed -n 's/^CODEX_SANDBOX: //p')
 "$_CODEX_PROBE" check-sandbox || exit 1
 "$_CODEX_PROBE" show-first-use-notice
 _OUTSIDE_EXIT=0
-"$_CODEX_PROBE" run-with-timeout --effort high 540 codex review --base '<base>' -c "sandbox_mode=\"${_CODEX_SANDBOX_MODE:?}\"" -c "review_model=\"${_CODEX_SEL:?}\"" -c "model=\"${_CODEX_SEL:?}\"" -c skills.include_instructions=false -c 'web_search="cached"' < /dev/null >"$_OUTSIDE_TMP/text" 2>"$_OUTSIDE_TMP/stderr" || _OUTSIDE_EXIT=$?
-cat "$_OUTSIDE_TMP/text"
+"$_CODEX_PROBE" run-with-timeout --effort high 540 codex exec - -C "$_REPO_ROOT" -s "${_CODEX_SANDBOX_MODE:?}" -c "model=\"${_CODEX_SEL:?}\"" -c skills.include_instructions=false -c 'web_search="cached"' --json -o "$_OUTSIDE_TMP/text" <"$_OUTSIDE_INPUT" >"$_OUTSIDE_TMP/events" 2>"$_OUTSIDE_TMP/stderr" || _OUTSIDE_EXIT=$?
+cat "$_OUTSIDE_TMP/text" 2>/dev/null || tail -n 20 "$_OUTSIDE_TMP/events"
 
 cat "$_OUTSIDE_TMP/stderr" >&2 || { [ "$_OUTSIDE_EXIT" -ne 0 ] || _OUTSIDE_EXIT=1; }
 _OUTSIDE_RC=0
-bun --no-env-file --config=/dev/null "$HOME/.claude/skills/gstack/lib/outside-review-result.ts" --label 'Codex outside review' --exit "$_OUTSIDE_EXIT" --stderr "$_OUTSIDE_TMP/stderr" structured "$_OUTSIDE_TMP/text" || _OUTSIDE_RC=$?
+bun --no-env-file --config=/dev/null "$HOME/.claude/skills/gstack/lib/outside-review-result.ts" --label 'Codex outside review' --exit "$_OUTSIDE_EXIT" --stderr "$_OUTSIDE_TMP/stderr" --events "$_OUTSIDE_TMP/events" structured "$_OUTSIDE_TMP/text" || _OUTSIDE_RC=$?
 case "$_OUTSIDE_RC" in
   0|3) ;;
   4) echo 'OUTSIDE_STATUS: unverified provider=codex host=claude'; exit 4 ;;
@@ -217,7 +217,7 @@ echo 'OUTSIDE_STATUS: completed provider=codex host=claude'
 
 Use Bash `timeout: 600000`; show the full response in a `tool-output` fence. Require successful execution and valid markers. Refusal, empty/malformed output, missing score/severity/completion markers, timeout or CLI failure means `outside_status: unavailable`. P0/P1 findings block like native ones; `OUTSIDE_STATUS: unverified` is missing coverage. Retain the required native pass without duplicating it; it cannot complete outside coverage. Scratch cleanup is automatic.
 
-The Codex backend uses `codex review --base` without a positional prompt: those arguments are mutually exclusive. Never drop --base to resolve an argv error; prompt-only review changes the diff scope.
+The Codex backend sends `gstack-codex-review-prompt <base>` (merge-base diff, committed and working-tree, plus the output contract) through `codex exec`; native `codex review` takes no prompt, so it never prints NO_FINDINGS.
 
 Present output under `CODEX SAYS (code review):` inside a `tool-output` fence.
 Only a completed response with severity tags or an explicit no-findings conclusion establishes the gate. P0/P1 findings (`[P0]`/`[P1]` or native `P0:`/`P1:` labels; `VERDICT: findings`) → GATE: FAIL. Completed without P0/P1 → GATE: PASS. Refusal, failure, missing markers or `OUTSIDE_STATUS: unverified` → GATE: MISSING COVERAGE; no fix question.

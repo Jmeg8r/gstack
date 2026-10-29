@@ -11,7 +11,7 @@
 import { describe, expect, test } from 'bun:test';
 import * as fs from 'fs';
 import * as path from 'path';
-import { CODEX_MODEL_CONFIG_FLAG, CODEX_REVIEW_MODEL_CONFIG_FLAG, CODEX_SKILLS_ISOLATION_FLAG } from '../scripts/resolvers/constants';
+import { CODEX_MODEL_CONFIG_FLAG, CODEX_SKILLS_ISOLATION_FLAG } from '../scripts/resolvers/constants';
 import { expectMentions } from './helpers/prompt-structure';
 
 const ROOT = path.join(import.meta.dir, '..');
@@ -36,7 +36,6 @@ describe('Codex skill isolation (#2847)', () => {
   test('the model flags carry the isolation flag, so every model-flag site is isolated', () => {
     expect(CODEX_SKILLS_ISOLATION_FLAG).toBe('-c skills.include_instructions=false');
     expect(CODEX_MODEL_CONFIG_FLAG).toContain(CODEX_SKILLS_ISOLATION_FLAG);
-    expect(CODEX_REVIEW_MODEL_CONFIG_FLAG).toContain(CODEX_SKILLS_ISOLATION_FLAG);
   });
 
   test('every wrapped Codex exec/review call in generated skills disables the skill catalog', () => {
@@ -57,7 +56,8 @@ describe('Codex skill isolation (#2847)', () => {
   });
 
   test('outside-voice and /codex prompt boundaries name the Codex skill roots and forbid skill use', () => {
-    const sources = ['scripts/resolvers/outside-voice-steps.ts', ...['review-mode', 'challenge-mode', 'consult-mode'].map(m => `codex/sections/${m}.md.tmpl`)];
+    // Structured reviews (/codex review, outside voice) carry the boundary inside the built prompt.
+    const sources = ['scripts/resolvers/outside-voice-steps.ts', 'bin/gstack-codex-review-prompt', ...['challenge-mode', 'consult-mode'].map(m => `codex/sections/${m}.md.tmpl`)];
     for (const rel of sources) {
       const text = fs.readFileSync(path.join(ROOT, rel), 'utf8');
       const boundaries = text.split('\n').filter(line => /do not read or execute any files under/i.test(line));

@@ -194,6 +194,28 @@ the readiness dashboard and the PR body, and never count it as a pass.
 Outside-review prompts ask the reviewer to label each finding Critical, High,
 Medium or Low, so most reviews land on `findings` or `clean`.
 
+**Structured Codex reviews** (`/codex review` and the Codex outside review in
+/review and /ship) are stricter. `gstack-codex-review-prompt` builds one prompt
+(the merge-base diff and an output contract) and `codex exec` sends it. A review
+with no `[P0]`-`[P3]` tag is `clean` only when it ends with a line containing
+only `NO_FINDINGS`; anything else is `unverified`. Native `codex review --base`
+is not used because it takes no prompt and so never prints that line.
+
+<a id="codex-review-prompt"></a>
+### `Not run: the review prompt could not be built` / `cannot resolve the merge-base of '<base>' and HEAD` / `empty diff for <base>` / `diff for <base> is N bytes, over the limit M`
+
+**Meaning.** `gstack-codex-review-prompt` stopped before Codex ran, so nothing
+was reviewed. Either the base does not share history with HEAD (or does not
+exist locally), there is nothing to review (an empty diff is never a pass), or
+the diff is larger than `GSTACK_CODEX_REVIEW_MAX_DIFF_BYTES` (default 600000).
+The diff is never truncated.
+
+**Fix.** For the base: `git fetch` it, or name a base that exists. For size:
+review a smaller range (`--commit <sha>`), or raise the limit for this run with
+`GSTACK_CODEX_REVIEW_MAX_DIFF_BYTES=<bytes>` if the model's context can hold it.
+
+**Expected result.** The review runs and prints a `GATE:` line.
+
 <a id="sourced-helper-location"></a>
 ### `gstack: cannot load gstack-codex-probe` / `gstack: cannot locate <helper> (shell: ...)` / `CODEX_MODE: helper_unavailable`
 
@@ -326,7 +348,9 @@ severity tags.
 
 **Meaning.** The review completed but had no severity tag or label and gave
 no explicit no-findings conclusion, so no pass or fail can be read from it
-([how the verdict is read](#outside-review-verdict)).
+([how the verdict is read](#outside-review-verdict)). For a structured Codex
+review this means Codex did not follow the output contract: no tag and no
+final `NO_FINDINGS` line.
 
 **What is kept.** The full answer is shown above.
 

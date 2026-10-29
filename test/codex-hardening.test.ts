@@ -710,20 +710,26 @@ describe('codex skeleton+sections union: review sandbox + fail-closed gate + tim
   for (const relPath of ['codex tmpl union', 'codex rendered union'] as const) {
     const read = () => readCodexUnion(relPath === 'codex tmpl union' ? 'tmpl' : 'rendered');
 
-    test(`${relPath}: (a) every scoped codex review invocation pins sandbox_mode from the selected sandbox`, () => {
-      const invocations = read()
+    test(`${relPath}: (a) the structured review runs codex exec on the built prompt, sandboxed by the selection`, () => {
+      const content = read();
+      const runs = content
         .split('\n')
-        .filter((l) => /run-with-timeout\s+(?:--user-invoked\s+)?(?:--effort\s+\w+\s+(?:--request-effort\s+'[^']*'\s+)?)?\d+\s+codex\s+review\b/.test(l));
-      expect(invocations.length).toBeGreaterThanOrEqual(1);
-      for (const line of invocations) {
+        .filter((l) => /run-with-timeout\s+(?:--user-invoked\s+)?(?:--effort\s+\w+\s+(?:--request-effort\s+'[^']*'\s+)?)?\d+\s+codex\s+(?:exec|review)\b/.test(l));
+      // Native `codex review` takes no prompt, so it can never print NO_FINDINGS
+      // (change 2026-10-28-codex-exec-review-gate); no wrapped call may use it.
+      expect(runs.filter((l) => /\scodex\s+review\b/.test(l))).toEqual([]);
+      const reviews = runs.filter((l) => l.includes('< "$_PROMPT_FILE"'));
+      expect(reviews.length).toBe(1);
+      expect(content).toMatch(/gstack-codex-review-prompt <scope>[^\n]*> "\$_PROMPT_FILE"/);
+      for (const line of runs) {
         // select-model reports read-only (full access only for
         // GSTACK_CODEX_NO_SANDBOX=1, test/codex-model-probe.test.ts); :? stops
         // an unselected command instead of inheriting config.toml's default.
-        expect(line).toContain('sandbox_mode=\\"${_CODEX_SANDBOX_MODE:?}\\"');
-        // `codex review` has no -s/--sandbox flag (verified 0.147.0) — the
-        // config override is the only lever. `-s read-only` here would fail
-        // at argv parsing, which check (b) would then read as a gate FAIL.
-        expect(line).not.toMatch(/\s-s\s+read-only\b/);
+        // `exec resume` has no -s flag, so it pins the same value through -c.
+        const pinned = /\scodex exec resume\s/.test(line)
+          ? line.includes('sandbox_mode=\\"${_CODEX_SANDBOX_MODE:?}\\"')
+          : line.includes('-s "${_CODEX_SANDBOX_MODE:?}"');
+        expect(pinned, line).toBe(true);
       }
     });
 
@@ -741,20 +747,22 @@ describe('codex skeleton+sections union: review sandbox + fail-closed gate + tim
       expect(content).toContain('`_CODEX_EXIT` is non-zero (including 124) → **GATE: FAIL**');
       expect(content).toContain('empty or whitespace-only → **GATE: FAIL**');
       expect(content).toContain('`[P0]`');
-      expect(content).toContain('PASS is only reachable through check 5');
+      expect(content).toContain('PASS is only reachable through checks 4 and 6');
     });
 
-    test(`${relPath}: (b2) a clean untagged review is UNVERIFIED, and P2/P3-only output can PASS (#2769)`, () => {
+    test(`${relPath}: (b2) a clean review passes only on NO_FINDINGS, untagged prose is UNVERIFIED, P2/P3-only can PASS (#2769)`, () => {
       const content = read();
+      expect(content).toContain('has a line containing only\n      `NO_FINDINGS` that its conclusion agrees with → **GATE: PASS**');
       expect(content).toContain(
-        'anywhere → **GATE: UNVERIFIED** (Codex completed and tagged nothing; read\n      the output above)',
+        'no `NO_FINDINGS` line → **GATE: UNVERIFIED** (Codex completed without\n      following the output contract; read the output above)',
       );
-      expect(content).toContain('GATE: UNVERIFIED (Codex completed and tagged nothing; read the output above)');
+      expect(content).toContain('GATE: UNVERIFIED (Codex completed without following the output contract; read the output above)');
       expect(content).toContain('(only P2/P3 advisory) →\n      **GATE: PASS**');
       expect(content).not.toContain('**GATE: FAIL** (fail-closed: untagged output');
       expect(content).toContain('"unverified" if UNVERIFIED');
-      // The captured clean review from the real CLI carries no severity tag, so
-      // check 4 is the branch it takes; the captured P2 review takes check 5.
+      // The captured clean review from native `codex review` carries no tag and
+      // no NO_FINDINGS line, so it takes check 5 (UNVERIFIED): the reason the
+      // review moved to codex exec. The captured P2 review takes check 6.
       const fixtures = path.join(ROOT, 'test', 'fixtures', 'codex-review');
       const clean = fs.readFileSync(path.join(fixtures, 'clean-review.stdout.txt'), 'utf-8');
       const p2 = fs.readFileSync(path.join(fixtures, 'p2-review.stdout.txt'), 'utf-8');
@@ -762,6 +770,7 @@ describe('codex skeleton+sections union: review sandbox + fail-closed gate + tim
       const blocking = (t: string) => /\[P[01]\]|(^|\s)P[01]:/m.test(t);
       expect(clean.trim().length).toBeGreaterThan(0);
       expect(tagged(clean)).toBe(false);
+      expect(clean).not.toMatch(/^NO_FINDINGS$/m);
       expect(tagged(p2)).toBe(true);
       expect(blocking(p2)).toBe(false);
     });

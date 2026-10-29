@@ -1,5 +1,5 @@
 import type { TemplateContext } from './types';
-import { CODEX_MODEL_CONFIG_FLAG, CODEX_REVIEW_MODEL_CONFIG_FLAG, CODEX_WEB_SEARCH_FLAG } from './constants';
+import { CODEX_MODEL_CONFIG_FLAG, CODEX_WEB_SEARCH_FLAG } from './constants';
 import { CLAUDE_CAPTURE_EVAL_MODEL } from '../../lib/eval-model';
 
 /**
@@ -18,10 +18,6 @@ export function generateCodexWebSearchFlag(_ctx: TemplateContext): string {
  */
 export function generateCodexModelConfigFlag(_ctx: TemplateContext): string {
   return CODEX_MODEL_CONFIG_FLAG;
-}
-
-export function generateCodexReviewModelConfigFlag(_ctx: TemplateContext): string {
-  return CODEX_REVIEW_MODEL_CONFIG_FLAG;
 }
 
 export function generateClaudeModelFlag(_ctx: TemplateContext): string {

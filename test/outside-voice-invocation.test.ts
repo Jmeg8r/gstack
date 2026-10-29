@@ -236,12 +236,14 @@ describe('generated outside-review dispatch', () => {
   test('Codex structured review preserves its base argument and accepts concrete severities', () => {
     const result = invoke('claude',{structuredBase:'main',gate:'structured'},{FAKE_RESPONSE:'[P1] Seeded data-loss bug\nREVIEW_COMPLETE'});
     expect(result.status).toBe(0);
-    expect(capture().args.slice(0,3)).toEqual(['review','--base','main']);
-    // Native review carries the review-kind selection in both settings and no skill catalog (#2914, #2847).
-    expect(capture().args).toContain('review_model="gpt-6-astra"');
+    // codex exec reads the built prompt on stdin; the base reaches it as the merge-base scope line.
+    expect(capture().args.slice(0,2)).toEqual(['exec','-']);
+    expect(capture().prompt).toContain('(merge-base of main and HEAD)');
+    expect(capture().prompt).toContain('a final line containing only NO_FINDINGS');
+    // The review-kind selection and no skill catalog (#2914, #2847).
     expect(capture().args).toContain('model="gpt-6-astra"');
     expect(capture().args).toContain('skills.include_instructions=false');
-    expect(capture().prompt).toBe('');
+    expect(capture().args).toContain('--json');
     // Completion is distinct from approval; the caller retains the P1 fail gate.
     expect(validateOutsideReview('[P1] Seeded data-loss bug','structured')).toEqual({completed:true,gate:'fail'});
     for (const [severity, gate] of [['P1', 'fail'], ['P2', 'pass']]) {
@@ -295,7 +297,7 @@ describe('generated outside-review dispatch', () => {
       expect(failed.status).toBe(1);
       expect(failed.stderr).toContain(SANDBOX_LINE);
       expect(failed.stdout).not.toContain('OUTSIDE_STATUS: completed');
-      expect(capture().args).toContain('sandbox_mode="read-only"');
+      expect(capture().args.slice(capture().args.indexOf('-s'), capture().args.indexOf('-s') + 2)).toEqual(['-s', 'read-only']);
       const healthy = invoke('claude', { structuredBase: 'main', gate: 'structured' }, {
         FAKE_RESPONSE: '[P2] naming nit', FAKE_STDERR_FILE: path.join(FIX, 'review-healthy.stderr') });
       expect(healthy.status).toBe(0);
@@ -309,7 +311,7 @@ describe('generated outside-review dispatch', () => {
       expect(capture().args.slice(capture().args.indexOf('-s'), capture().args.indexOf('-s') + 2)).toEqual(['-s', 'danger-full-access']);
       expect(exec.stderr).toContain('WARNING: GSTACK_CODEX_NO_SANDBOX=1: Codex runs this review without a sandbox');
       expect(invoke('claude', { structuredBase: 'main', gate: 'structured' }, { ...env, FAKE_RESPONSE: '[P2] nit' }).status).toBe(0);
-      expect(capture().args).toContain('sandbox_mode="danger-full-access"');
+      expect(capture().args.slice(capture().args.indexOf('-s'), capture().args.indexOf('-s') + 2)).toEqual(['-s', 'danger-full-access']);
       expect(invoke('claude', {}, { GSTACK_CODEX_NO_SANDBOX: 'true' }).status).toBe(0);
       expect(capture().args.slice(capture().args.indexOf('-s'), capture().args.indexOf('-s') + 2)).toEqual(['-s', 'read-only']);
     });

@@ -82,8 +82,6 @@ const SELECTED_MODEL = '${_CODEX_SEL:?}';
 export const CODEX_SANDBOX_REF = '${_CODEX_SANDBOX_MODE:?}';
 /** Requires codexSelect('exec') earlier in the same block. */
 export const CODEX_MODEL_CONFIG_FLAG = `-c "model=\\"${SELECTED_MODEL}\\"" ${CODEX_SKILLS_ISOLATION_FLAG}`;
-/** Requires codexSelect('review'); native review prefers review_model, so both carry the selection. */
-export const CODEX_REVIEW_MODEL_CONFIG_FLAG = `-c "review_model=\\"${SELECTED_MODEL}\\"" ${CODEX_MODEL_CONFIG_FLAG}`;
 /** The executed probe; pathRewrites map the Claude path per host. */
 export const CODEX_PROBE_PATH = '~/.claude/skills/gstack/bin/gstack-codex-probe';
 
