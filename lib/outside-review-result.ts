@@ -242,15 +242,24 @@ function severityTokens(text: string): Severity[] {
  * [P2] findings at `7439afe`."; the digest PRs used "[P2] none: no findings."
  * and "[P2] none"). Only whitespace and case are normalized; an entry may be
  * followed only by " at <one inline-code ref>" and then the sentence end. Any
- * other wording keeps its tags, so a near-miss fails closed.
+ * other wording keeps its tags, so a near-miss fails closed. A sentence counts
+ * only if it ends in sentence punctuation, or is the whole line with a blank
+ * line or the end after it: a wrapped line could continue with "except ..."
+ * (Codex P2 on gstack #21, comment 28453).
  */
 const CLEAN_TAGGED_PHRASES = ['No [P1] or [P2] findings', '[P2] none: no findings', '[P2] none'];
 const CLEAN_TAGGED_SENTENCE = new RegExp(
   `^(?:${CLEAN_TAGGED_PHRASES.map(p => p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})(?: at \`[^\`]+\`)?\\.?$`, 'i');
 function withoutCleanTagged(text: string): string {
-  return text.split('\n').map(line => line.split(/(?<=[.!?;])(?=\s)/)
-    .map(sentence => CLEAN_TAGGED_SENTENCE.test(sentence.trim().replace(/\s+/g, ' ')) ? sentence.replace(/\S/g, ' ') : sentence)
-    .join('')).join('\n');
+  const lines = text.split('\n');
+  return lines.map((line, i) => {
+    const ended = !lines[i + 1]?.trim();
+    return line.split(/(?<=[.!?;])(?=\s)/).map(sentence => {
+      const said = sentence.trim();
+      const complete = /[.!?;]$/.test(said) || (said === line.trim() && ended);
+      return complete && CLEAN_TAGGED_SENTENCE.test(said.replace(/\s+/g, ' ')) ? sentence.replace(/\S/g, ' ') : sentence;
+    }).join('');
+  }).join('\n');
 }
 
 /** The first line with a P0-P3 token in label position that no severity form reads. */

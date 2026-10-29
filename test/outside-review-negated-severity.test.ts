@@ -40,10 +40,14 @@ describe('an allowlisted clean phrasing is not a finding', () => {
     '[P2] none: no findings.',
     '[P2] none',
     '[P2] none.',
+    // A bare line (no closing punctuation) counts only when a blank line or the end follows it.
+    'No [P1] or [P2] findings\n\nThe diff only renames a helper.',
+    '[P2] none\n',
   ]) {
     test(`allowlisted: ${text}`, () => {
       expect(highest(text)).toBeNull();
-      expect(highest(`${text}\n${REC}`, 'review')).toBeNull();
+      // A blank line ends a bare allowlisted line; directly followed by text it could continue.
+      expect(highest(`${text}\n\n${REC}`, 'review')).toBeNull();
     });
   }
 });
@@ -66,6 +70,12 @@ describe('near-misses of the allowlist keep their tags (fail closed)', () => {
     ['[P2] none: no findings, except naming.', 'P2'],
     ['[P2] none yet', 'P2'],
     ['No [P1] issues remain.\n- Other than style, the diff is fine.', 'P1'],
+    // Codex P2, comment 28453: a line that may continue on the next one fails closed.
+    ['No [P1] or [P2] findings\nexcept the missing authorization check.\n- [P3] Rename the helper.', 'P1'],
+    ['No [P1] or [P2] findings\nexcept the missing authorization check', 'P1'],
+    ['[P2] none: no findings\nexcept the naming drift.', 'P2'],
+    ['[P2] none\nyet; one naming nit remains.', 'P2'],
+    ['No [P1] or [P2] findings\nRecommendation: approve because the change keeps its data.', 'P1'],
   ] as const) {
     test(`${level}: ${text.split('\n')[0]}`, () => {
       expect(highest(text)).toBe(level);
