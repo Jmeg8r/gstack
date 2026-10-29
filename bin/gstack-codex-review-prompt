@@ -71,7 +71,8 @@ case "$mode" in
       echo "cannot resolve commit '$target'; nothing was reviewed" >&2; exit 1
     }
     scope_line="Scope: commit $sha"
-    git show "${DIFF_OPTS[@]}" --format= --patch "$sha" > "$diff_file" ;;
+    # A merge's default combined diff hides what it brought in; review it against its first parent.
+    git show "${DIFF_OPTS[@]}" --diff-merges=first-parent --format= --patch "$sha" > "$diff_file" ;;
   uncommitted)
     scope_line='Scope: uncommitted changes against HEAD (staged, unstaged and untracked)'
     git diff "${DIFF_OPTS[@]}" HEAD > "$diff_file"

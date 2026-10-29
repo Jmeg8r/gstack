@@ -88,6 +88,25 @@ describe('gstack-codex-review-prompt', () => {
     }
   });
 
+  test('--commit on a merge reviews everything it brought in against its first parent', () => {
+    const head = git(repo, 'rev-parse', 'HEAD');
+    git(repo, 'checkout', '-q', '-b', 'side', baseSha);
+    fs.writeFileSync(path.join(repo, 'side.ts'), 'export const side = 1;\n');
+    git(repo, 'add', 'side.ts');
+    git(repo, 'commit', '-q', '-m', 'side');
+    git(repo, 'checkout', '-q', 'feature');
+    git(repo, 'merge', '-q', '--no-ff', '-m', 'merge side', 'side');
+    try {
+      const r = build(['--commit', 'HEAD']);
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('+export const side = 1;');
+      expect(r.stdout).not.toContain('+export const a = 2;');
+    } finally {
+      git(repo, 'reset', '-q', '--hard', head);
+      git(repo, 'branch', '-q', '-D', 'side');
+    }
+  });
+
   test('--uncommitted reviews staged, unstaged and untracked changes', () => {
     fs.writeFileSync(path.join(repo, 'a.ts'), 'export const a = 3;\n');
     fs.writeFileSync(path.join(repo, 'staged.ts'), 'export const staged = 1;\n');
