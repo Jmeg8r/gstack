@@ -61,6 +61,10 @@ describe('real tagged findings are still read', () => {
     ['- Retry count is always zero [P1] — lib/retry.ts:42\n- [P2] naming', 'P1'],
     ['- Division by zero [P1]\n- [P2] naming', 'P1'],
     ['- [P2] naming\n- Fails with no [P1] when the cache is cold', 'P1'],
+    // An exception keeps the tag: the negation does not cover it (Codex P2, exec review of #21).
+    ['No [P1] issues other than the missing authorization check.\n- [P2] The error message names the wrong flag.', 'P1'],
+    ['No [P0] findings except the dropped write in lib/store.ts:40.', 'P0'],
+    ['No [P1] regressions apart from the race in the lock release.', 'P1'],
   ] as const) {
     test(`${level}: ${text.split('\n')[0]}`, () => {
       expect(highest(text)).toBe(level);
