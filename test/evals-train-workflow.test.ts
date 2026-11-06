@@ -193,9 +193,10 @@ describe('without a train block nothing changes (the inert proof)', () => {
 });
 
 describe('under a train block (the gate edits, each only on its mode)', () => {
-  test('a PR push starts no paid slice: route, readiness and the free screening summary only', () => {
+  test('a PR push starts no paid slice and waits for nothing: route, the image and the free screening summary only', () => {
     const sim = simulate(evals, { github: pr(), inputs: {}, outputs: { route: { ...ROUTE, ...train, mode: 'pr-summary' } } });
-    expect(sim.jobs).toEqual(['build-image', 'readiness', 'route', 'screen-summary']);
+    expect(sim.jobs).toEqual(['build-image', 'route', 'screen-summary']);
+    expect(simulate(evals, { github: pr(), inputs: {}, outputs: { route: { ...ROUTE, mode: 'pr' } } }).jobs).toContain('readiness');
     const summary = evals.jobs['screen-summary']!;
     expect(summary.permissions).toEqual({ contents: 'read' });
     expect(JSON.stringify(summary)).not.toMatch(/secrets\.|restore-deps|bun install/);
@@ -223,7 +224,20 @@ describe('under a train block (the gate edits, each only on its mode)', () => {
     expect(sim.steps('slices-report')).not.toContain('Write the train record');
     expect(sim.step('slices-comment', 'Post PR comment')!.env).toMatchObject({ PR_NUMBER: '42', SCREEN_POLICY: 'narrow', SCREEN_MERGE_SHA: SHA.merge });
     const superseded = simulate(evals, { github: dispatch(), inputs, outputs: { route: { ...route, superseded: 'true' } } });
-    expect(superseded.jobs).toEqual(['build-image', 'route']);
+    expect(superseded.jobs).toEqual(['route']);
+  });
+
+  test('build-image keys and builds the CI image from the commit the slices test, only after the route accepts the run', () => {
+    const inputs = { ...INPUTS, evals_all: false, nonce: 'pr.screen.narrow-x', expected_sha: SHA.merge, base_ref: 'main', base_sha: SHA.base, screen_pr: '42', screen_merge_sha: SHA.merge, screen_policy: 'narrow' };
+    const route = { ...ROUTE, ...train, mode: 'screen', screen_head: SHA.screenHead, screen_base: SHA.screenBase, screen_branch: 'feature' };
+    const screen = simulate(evals, { github: dispatch(), inputs, outputs: { route } });
+    expect(screen.checkout('build-image')?.ref).toBe(SHA.merge);
+    expect(screen.checkout('build-image')?.ref).toBe(screen.checkout('eval-slices')?.ref);
+    expect(screen.checkout('build-image')?.['persist-credentials']).toBe(false);
+    const steps = evals.jobs['build-image']!.steps;
+    expect(steps.findIndex(st => st.uses?.startsWith('actions/checkout@'))).toBeLessThan(steps.findIndex(st => st.id === 'meta'));
+    expect(simulate(evals, { github: dispatch(), inputs, outputs: { route }, results: { route: 'failure' } }).jobs).not.toContain('build-image');
+    for (const github of [pr(), dispatch()]) expect(simulate(evals, { github, inputs: github.event_name === 'pull_request' ? {} : INPUTS, outputs: { route: { ...ROUTE, mode: github.event_name === 'pull_request' ? 'pr' : 'dispatch' } } }).checkout('build-image')?.ref).toBe(SHA.main);
   });
 
   test('a train gate runs the full gate, writes its record from the report and publishes the check; it never reuses or binds', () => {
@@ -261,9 +275,9 @@ describe('under a train block (the gate edits, each only on its mode)', () => {
     expect(job.steps.find(st => st.name === 'Verify the prefix checkout')!.run).toContain('echo "short=${PREFIX_SHA:0:12}"');
   });
 
-  test('a refused dispatch starts nothing paid', () => {
+  test('a refused dispatch starts nothing paid and builds no image', () => {
     const sim = simulate(evals, { github: dispatch('train/t1'), inputs: { ...INPUTS, nonce: 'gate.bisect-x' }, outputs: { route: { ...ROUTE, mode: '' } }, results: { route: 'failure' } });
-    expect(sim.jobs).toEqual(['build-image', 'route']);
+    expect(sim.jobs).toEqual(['route']);
   });
 });
 
@@ -391,13 +405,19 @@ describe.skipIf(!Bun.which('jq') || !Bun.which('bash'))('the route job reads the
   const block = { gate_workflow: 'evals.yml', free_workflow: 'free-tests.yml', full_gate_check: 'gstack/full-gate', record_artifact: 'gstack-train-record', max_size: 5, fill_hours: 3, screen_selection: 'none', trial_reservation_usd: 1.5 };
 
   test('no policy, no train block, or an invalid one: train=false, and a PR push routes pr', () => {
-    for (const policy of [undefined, { bump: 'patch' }, { bump: 'patch', train: null }, { train: { ...block, record_artifact: 'bad name!' } }, '{not json']) {
+    for (const policy of [undefined, { bump: 'patch' }, { bump: 'patch', train: null }, { train: { ...block, record_artifact: 'bad name!' } }]) {
       const fx = fixture(policy);
       const out = run(policyStep.run!, fx.dir, { BASE_SHA: fx.base, DEFAULT_BRANCH: 'main' });
       expect(out, JSON.stringify(policy)).toEqual({ train: 'false' });
       expect(run(routeStep.run!, fx.dir, { GITHUB_EVENT_NAME: 'pull_request', TRAIN_POLICY: out.train! })).toEqual({ mode: 'pr' });
       fs.rmSync(fx.dir, { recursive: true, force: true });
     }
+  });
+
+  test('a policy that is not JSON fails the route instead of routing as before (GSTA-203 H1)', () => {
+    const fx = fixture('{not json');
+    expect(() => run(policyStep.run!, fx.dir, { BASE_SHA: fx.base, DEFAULT_BRANCH: 'main' })).toThrow('.gstack/ship-policy.json is not valid JSON');
+    fs.rmSync(fx.dir, { recursive: true, force: true });
   });
 
   test('a train block names the record artifact and check, and a PR push routes pr-summary', () => {
@@ -435,6 +455,28 @@ describe('evals-main-backstop.yml', () => {
     expect(policy.run).not.toContain('bun');
     const gate = job.steps.find(st => st.name === 'Gate main unless a green train covers its tree')!;
     expect(gate.if).toBe("steps.policy.outputs.train == 'true'");
+    expect(gate.id).toBe('gate');
     expect(gate.run).toContain('scripts/train-backstop.ts run --repo "$GITHUB_REPOSITORY" --branch "$GITHUB_REF_NAME" --sha "$GITHUB_SHA"');
+    expect(gate.run).toContain('--outputs "$GITHUB_OUTPUT"');
+    expect(job.outputs).toEqual({ action: '${{ steps.gate.outputs.action }}' });
+  });
+
+  // The weekly release (scripts/release-cut.ts) reads the per-commit verdict as
+  // the main-backstop check run: a superseded push exits 0 but is neutral there.
+  test('the main-backstop check run is published from its own code-free job: success for covered|gated, neutral for inert|superseded|deferred, failure otherwise', () => {
+    const job = backstopWf.jobs['backstop-check']!;
+    expect(job.needs).toBe('backstop');
+    expect(job.if).toBe("${{ !cancelled() && needs.backstop.outputs.action != '' }}");
+    expect(job.permissions).toEqual({ checks: 'write' });
+    expect(job.steps.map(st => st.uses).filter(Boolean)).toEqual([]);
+    expect(job.steps).toHaveLength(1);
+    const publish = job.steps[0]!;
+    expect(publish.env).toEqual({ GH_TOKEN: '${{ github.token }}', ACTION: '${{ needs.backstop.outputs.action }}' });
+    expect(publish.run).toContain('covered|gated) conclusion=success ;;');
+    expect(publish.run).toContain('inert|superseded|deferred) conclusion=neutral ;;');
+    expect(publish.run).toContain('frozen|failed) conclusion=failure ;;');
+    expect(publish.run).toContain('*) echo "::error::unknown backstop action');
+    expect(publish.run).toContain('-f name=main-backstop -f head_sha="$GITHUB_SHA" -f status=completed -f conclusion="$conclusion"');
+    expect(publish.run).not.toContain('bun');
   });
 });

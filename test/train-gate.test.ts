@@ -13,7 +13,7 @@ import { classifyGate } from '../lib/ship-queue-train-verdict';
 import { buildRunManifest, type PaidRunManifest } from '../scripts/lib/paid-plan';
 import { buildReceipt } from '../lib/tree-receipt';
 import {
-  FULL_GATE_USD, JUDGE_FILE, MAX_BISECT_CASES, MAX_PREFIXES, bisectMatrix, buildTrainRecord, fullGateCases, gitIn, routeDispatch, runBisectPrefix,
+  FULL_GATE_USD, MAX_BISECT_CASES, MAX_PREFIXES, bisectMatrix, buildTrainRecord, fullGateCases, gitIn, routeDispatch, runBisectPrefix,
   screenSummary, stampFreeTree, trainPrefixes, type BisectPlan, type RouteInput,
 } from '../scripts/train-gate';
 import { loadPolicyFromHead } from '../lib/ship-policy';
@@ -54,6 +54,20 @@ describe('routeDispatch: every run keeps its mode, and train inputs are validate
     expect((route({ ...screen, trainPolicy: false }) as { error: string }).error).toContain('needs a train block');
   });
 
+  // Value: protects=the release gate's bisect (lib/release-gate.ts) routes on its own release-gate/<id> ref under a release_gate policy, names its own
+  // prefix artifact, keeps every train bisect check (nonce, head, cases, prefixes), and is refused without the policy or on any other ref;
+  // fails_when=a release bisect needs a train block (it stops working once trains go), a release-gate/ ref routes without a release_gate policy, or a
+  // train/ bisect starts accepting the release policy alone; why_new=the bisect test below covers train/<nonce> only; seam=none; no_claim=a live run
+  test('a release bisect runs on release-gate/<id> under a release_gate policy, with the train checks and its own artifact', () => {
+    const bisect = { nonce: bisectNonce, refName: 'release-gate/abc123-aaaaaaaaaaaa', expectedSha: A, cases: 'case-a', prefixShas: B, releasePolicy: true };
+    expect(route(bisect)).toEqual({ mode: 'bisect', cases: ['case-a'], prefixes: [B], artifact: 'gstack-release-record' });
+    expect((route({ ...bisect, releasePolicy: false, trainPolicy: true }) as { error: string }).error).toContain('needs a release_gate block');
+    expect((route({ ...bisect, prefixShas: C }) as { error: string }).error).toContain('is not an ancestor');
+    expect((route({ ...bisect, expectedSha: B }) as { error: string }).error).toContain('is not the train head');
+    expect((route({ ...bisect, refName: 'train/t1', trainPolicy: false }) as { error: string }).error).toContain('needs a train block');
+    expect((route({ ...bisect, refName: 'main' }) as { error: string }).error).toContain('runs on train/<nonce>');
+  });
+
   test('a bisect needs a bisect nonce on train/<nonce>, the train head, plan case ids and ancestor prefixes', () => {
     const bisect = { nonce: bisectNonce, refName: 'train/t1', expectedSha: A, cases: 'case-a, review/SKILL.md workflow', prefixShas: `${A},${B}`, trainPolicy: true };
     expect(route(bisect)).toEqual({ mode: 'bisect', cases: ['case-a', 'review/SKILL.md workflow'], prefixes: [A, B] });
@@ -89,13 +103,14 @@ describe('routeDispatch: every run keeps its mode, and train inputs are validate
 });
 
 describe('train record: the census comes from the run\'s own manifest, first attempt only', () => {
-  const [j1, j2] = Object.keys(LLM_JUDGE_TOUCHFILES) as [string, string];
+  const [j1, j2] = ['hermetic-canary', 'hermetic-sentinel'];
+  const ruleFile = 'test/skill-e2e-hermetic-canary.test.ts';
   const behavior = 'shared-libs-opportunity-judgment';
-  const judgeEntry = buildRunManifest({ tier: 'gate', profile: 'full', sliceCount: 1, evalsAll: true, env: { EVALS_ALL: '1' } }).entries.find(e => e.file === JUDGE_FILE)!;
+  const ruleEntry = buildRunManifest({ tier: 'gate', profile: 'full', sliceCount: 1, evalsAll: true, env: { EVALS_ALL: '1' } }).entries.find(e => e.file === ruleFile)!;
   const trialFiles = [1, 2, 3].map(t => `test/skill-e2e-shared-libs-periodic.test.ts#${behavior}~t${t}`);
-  const manifest = { version: 1, tier: 'gate', evalsAll: true, sliceCount: 2, selectionReason: 'evals_all', profile: 'full', selection: { e2e: null, judges: [j1, j2] },
+  const manifest = { version: 1, tier: 'gate', evalsAll: true, sliceCount: 2, selectionReason: 'evals_all', profile: 'full', selection: { e2e: null, judges: [] },
     entries: [
-      { ...judgeEntry, slice: 1 },
+      { ...ruleEntry, slice: 1 },
       ...trialFiles.map(file => ({ file, slice: 2, status: 'planned', trial: { kind: 'behavior', panel: { n: 3, k: 2 }, quarantined: false } })),
     ] } as unknown as PaidRunManifest;
   type Slice = { index: number; attempt?: number; files?: string[]; checkpoint?: true };
@@ -104,7 +119,7 @@ describe('train record: the census comes from the run\'s own manifest, first att
     const dir = path.join(scratch, `report-${++n}`);
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify(manifest));
-    const outcomes = o.outcomes ?? [j1, j2].map(id => ({ case: id, kind: 'judge', attempt: 1, outcome: 'passed', cost_usd: 0.25 }))
+    const outcomes = o.outcomes ?? [j1, j2].map(id => ({ case: id, kind: 'rule', attempt: 1, outcome: 'passed', cost_usd: 0.25 }))
       .concat([1, 2, 3].map(trial => ({ case: behavior, kind: 'behavior', trial, attempt: 1, outcome: 'passed', cost_usd: 1 })));
     fs.writeFileSync(path.join(dir, 'trial-outcomes.jsonl'), outcomes.map(line => JSON.stringify(line)).join('\n') + '\n');
     if (o.collector !== null) fs.writeFileSync(path.join(dir, 'collector-outcomes.json'), JSON.stringify(o.collector ?? { verdict: { verdict: 'GREEN' }, census: { unattributed: [] }, panels: [] }));
@@ -112,7 +127,7 @@ describe('train record: the census comes from the run\'s own manifest, first att
       const at = path.join(dir, `paid-slice-${s.index}-a${s.attempt ?? 1}`);
       fs.mkdirSync(at, { recursive: true });
       fs.writeFileSync(path.join(at, `slice-${s.index}.json`), JSON.stringify({ version: 1, tier: 'gate', sliceIndex: s.index, sliceCount: 2, attempt: s.attempt ?? 1,
-        ...(s.checkpoint ? { checkpoint: true } : {}), outcomes: (s.files ?? (s.index === 1 ? [JUDGE_FILE] : trialFiles)).map(file => ({ files: [file], status: 'passed' })) }));
+        ...(s.checkpoint ? { checkpoint: true } : {}), outcomes: (s.files ?? (s.index === 1 ? [ruleFile] : trialFiles)).map(file => ({ files: [file], status: 'passed' })) }));
     }
     return dir;
   }
@@ -124,19 +139,19 @@ describe('train record: the census comes from the run\'s own manifest, first att
   test('a complete census of passing cases is GREEN, and T1 classifies it GREEN', () => {
     const record = build(report());
     expect(record).toMatchObject({ schema: 1, kind: 'train-gate', nonce: 'gate.train-x', head_sha: A, tree: B, verdict: 'GREEN', run: { id: 7 } });
-    expect(record.census).toEqual({ complete: true, planned: { rule: 1, judge: 2 }, executed: { rule: 1, judge: 2 }, unbound: 0, partial_shards: 0, cancelled_shards: 0, killed_before_upload: 0 });
+    expect(record.census).toEqual({ complete: true, planned: { rule: 3, judge: 0 }, executed: { rule: 3, judge: 0 }, unbound: 0, partial_shards: 0, cancelled_shards: 0, killed_before_upload: 0 });
     expect(record.panels.map(p => [p.case, p.status, p.cost_usd])).toEqual([[j2, 'PASS', 0.25], [j1, 'PASS', 0.25], [behavior, 'PASS', 3]].sort((a, b) => (a[0]! < b[0]! ? -1 : 1)));
     expect(classify(record)).toBe('GREEN');
   });
 
   test('a slice killed before its upload step is incomplete, never passed over, and a re-run attempt cannot fill it', () => {
-    const killed = build(report({ slices: [{ index: 1 }], outcomes: [j1, j2].map(id => ({ case: id, kind: 'judge', attempt: 1, outcome: 'passed' })) }));
+    const killed = build(report({ slices: [{ index: 1 }], outcomes: [j1, j2].map(id => ({ case: id, kind: 'rule', attempt: 1, outcome: 'passed' })) }));
     expect(killed.verdict).toBe('RED');
-    expect(killed.census).toMatchObject({ complete: false, killed_before_upload: 1, executed: { rule: 0, judge: 2 } });
+    expect(killed.census).toMatchObject({ complete: false, killed_before_upload: 1, executed: { rule: 2, judge: 0 } });
     expect(classify(killed)).toBe('INCOMPLETE');
     const rerun = build(report({ slices: [{ index: 1 }, { index: 2, attempt: 2 }], outcomes: [
-      ...[j1, j2].map(id => ({ case: id, kind: 'judge', attempt: 1, outcome: 'passed' })), ...[1, 2, 3].map(trial => ({ case: behavior, kind: 'behavior', trial, attempt: 2, outcome: 'passed' }))] }));
-    expect(rerun.census).toMatchObject({ complete: false, killed_before_upload: 1, executed: { rule: 0, judge: 2 } });
+      ...[j1, j2].map(id => ({ case: id, kind: 'rule', attempt: 1, outcome: 'passed' })), ...[1, 2, 3].map(trial => ({ case: behavior, kind: 'behavior', trial, attempt: 2, outcome: 'passed' }))] }));
+    expect(rerun.census).toMatchObject({ complete: false, killed_before_upload: 1, executed: { rule: 2, judge: 0 } });
     expect(rerun.verdict).toBe('RED');
   });
 
@@ -151,8 +166,8 @@ describe('train record: the census comes from the run\'s own manifest, first att
   });
 
   test('a failed case is a red VERDICT panel T1 bisects on', () => {
-    const record = build(report({ outcomes: [{ case: j1, kind: 'judge', attempt: 1, outcome: 'failed', failure_class: 'assertion' },
-      { case: j2, kind: 'judge', attempt: 1, outcome: 'passed' }, ...[1, 2, 3].map(trial => ({ case: behavior, kind: 'behavior', trial, attempt: 1, outcome: 'passed' }))],
+    const record = build(report({ outcomes: [{ case: j1, kind: 'rule', attempt: 1, outcome: 'failed', failure_class: 'assertion' },
+      { case: j2, kind: 'rule', attempt: 1, outcome: 'passed' }, ...[1, 2, 3].map(trial => ({ case: behavior, kind: 'behavior', trial, attempt: 1, outcome: 'passed' }))],
       collector: { verdict: { verdict: 'RED' }, census: { unattributed: [] }, panels: [] } }));
     expect(record.verdict).toBe('RED');
     expect(record.panels.find(p => p.case === j1)).toMatchObject({ status: 'FAIL', red_class: 'VERDICT' });
@@ -160,12 +175,12 @@ describe('train record: the census comes from the run\'s own manifest, first att
   });
 
   test('rule 16: a case the report resolved FLAKY is a PASS naming both runs, and the train is GREEN; without the record it stays red', () => {
-    const outcomes = [{ case: j1, kind: 'judge', attempt: 1, outcome: 'failed', failure_class: 'assertion' },
-      { case: j2, kind: 'judge', attempt: 1, outcome: 'passed' }, ...[1, 2, 3].map(trial => ({ case: behavior, kind: 'behavior', trial, attempt: 1, outcome: 'passed' }))];
-    const flake = { schema: 1, kind: 'gate-flake', case: j1, case_kind: 'judge', first: { attempt: 1, phase: 'first', where: 'attempt 1 (paid-slice-1-a1)' },
+    const outcomes = [{ case: j1, kind: 'rule', attempt: 1, outcome: 'failed', failure_class: 'assertion' },
+      { case: j2, kind: 'rule', attempt: 1, outcome: 'passed' }, ...[1, 2, 3].map(trial => ({ case: behavior, kind: 'behavior', trial, attempt: 1, outcome: 'passed' }))];
+    const flake = { schema: 1, kind: 'gate-flake', case: j1, case_kind: 'rule', first: { attempt: 1, phase: 'first', where: 'attempt 1 (paid-slice-1-a1)' },
       rerun: { attempt: 1, phase: 'rerun', where: 'attempt 1 rerun (paid-rerun-1-a1)' } };
     const record = build(report({ outcomes, collector: { verdict: { verdict: 'GREEN' }, census: { unattributed: [] }, panels: [], flaky: [flake] } }));
-    expect(record.panels.find(p => p.case === j1)).toEqual({ case: j1, kind: 'judge', status: 'PASS', red_class: null, cost_usd: null,
+    expect(record.panels.find(p => p.case === j1)).toEqual({ case: j1, kind: 'rule', status: 'PASS', red_class: null, cost_usd: null,
       flaky: { first: 'attempt 1 (paid-slice-1-a1)', rerun: 'attempt 1 rerun (paid-rerun-1-a1)' } });
     expect(record.verdict).toBe('GREEN');
     expect(classify(record)).toBe('GREEN');
@@ -224,6 +239,57 @@ describe('prefix trees modulo stamps', () => {
     expect(stampFreeTree(git, 'f'.repeat(40), repo.work, policy)).toHaveProperty('error');
   });
 
+  // Value: protects=a gated-to-current diff git cannot produce refuses with its cause instead of reading as 'no changes'
+  //   (GST-448); fails_when=buildReceipt treats a failed diff as an empty one or drops why it failed; seam=a missing blob; no_claim=none
+  test('a diff git cannot produce refuses the receipt with EVIDENCE_IDENTITY_UNKNOWN and git\'s reason', () => {
+    const policy = loadPolicyFromHead(repo.work).policy;
+    repo.git('checkout', '-q', '-B', 'lost-blob', sha.t1!);
+    fs.writeFileSync(path.join(repo.work, 'lost.txt'), 'a blob this test deletes from the object store\n');
+    repo.git('add', '-A'); repo.git('commit', '-q', '-m', 'add a blob');
+    const head = repo.git('rev-parse', 'HEAD');
+    const blobId = repo.git('rev-parse', `${head}:lost.txt`);
+    const gitDir = repo.git('rev-parse', '--absolute-git-dir');
+    fs.rmSync(path.join(gitDir, 'objects', blobId.slice(0, 2), blobId.slice(2)));
+    const r = buildReceipt({ repoRoot: repo.work, gated: sha.t1!, current: head, policy, policyLabel: 'fixture' }) as { error?: string; code?: string };
+    expect(r.code).toBe('EVIDENCE_IDENTITY_UNKNOWN');
+    expect(r.error).toMatch(/^git diff [0-9a-f]{12} [0-9a-f]{12} failed \(.+\), so the changed files cannot be classified/);
+    repo.git('checkout', '-q', '-f', 'squash');
+  });
+
+  // #3512: a stamp path carrying a tentative `*_KEY_VERSION = '<next minor>'` (gstack's own convention since #3511) digests the
+  // same before and after the slot stamp moves it, so train-backstop finds the record that covers main; a base-version mention
+  // on a line the base already carried digests the same at the prefix (where it equals VERSION) and on the stamped main.
+  test('stampFreeTree collapses every stamp-form mention, not only the commit\'s version: a moved tentative key and a kept released one both digest equal', () => {
+    const git = gitIn(repo.work);
+    const policy = { ...loadPolicyFromHead(repo.work).policy, stamp_paths: ['docs/**/*.md', 'lib/policy.ts'], stamp_patterns: ["_KEY_VERSION = '{version}'"] };
+    const policyFile = (text: string) => { fs.mkdirSync(path.join(repo.work, 'lib'), { recursive: true }); fs.writeFileSync(path.join(repo.work, 'lib', 'policy.ts'), text); };
+    // The unstamped prefix: VERSION 1.2.3.0, a new key written as the tentative 1.3.0.0, a released key at 1.2.3.0 (the base's version).
+    repo.git('checkout', '-q', '-B', 'key-prefix', sha.main!);
+    policyFile("export const DOCS_KEY_VERSION = '1.3.0.0';\nexport const REVIEW_KEY_VERSION = '1.2.3.0';\nexport const OLD_KEY_VERSION = '1.2.2.0';\n");
+    repo.git('add', '-A'); repo.git('commit', '-q', '-m', 'prefix with a tentative key');
+    const prefix = repo.git('rev-parse', 'HEAD');
+    // Main after the slot stamp: VERSION 1.2.4.0, the tentative moved to the released version, the released key as written.
+    fs.writeFileSync(path.join(repo.work, 'VERSION'), '1.2.4.0\n');
+    policyFile("export const DOCS_KEY_VERSION = '1.2.4.0';\nexport const REVIEW_KEY_VERSION = '1.2.3.0';\nexport const OLD_KEY_VERSION = '1.2.2.0';\n");
+    repo.git('commit', '-qam', 'stamp 1.2.4.0');
+    const stamped = repo.git('rev-parse', 'HEAD');
+    expect(stampFreeTree(git, stamped, repo.work, policy)).toBe(stampFreeTree(git, prefix, repo.work, policy));
+    // A byte beyond a stamp-form mention still changes the digest.
+    policyFile("export const DOCS_KEY_VERSION = '1.2.4.0';\nexport const REVIEW_KEY_VERSION = '1.2.3.0';\nexport const OLD_KEY_VERSION = '1.2.2.0';\nexport const EXTRA = 1;\n");
+    repo.git('commit', '-qam', 'a code byte');
+    expect(stampFreeTree(git, repo.git('rev-parse', 'HEAD'), repo.work, policy)).not.toBe(stampFreeTree(git, prefix, repo.work, policy));
+    // The receipt agrees with the digest on the stamp, and refuses a released key moved by hand (older than the gated version;
+    // a mention equal to it is the base's own version, which the stamp_paths stage moves on a branch-added line).
+    const tree = (current: string) => (buildReceipt({ repoRoot: repo.work, gated: prefix, current, policy, policyLabel: 'fixture' }) as { tree: string; residual: string[] }).tree;
+    expect(tree(stamped)).toBe('same-modulo-stamps');
+    repo.git('checkout', '-q', '-B', 'hand-move', prefix);
+    fs.writeFileSync(path.join(repo.work, 'VERSION'), '1.2.4.0\n');
+    policyFile("export const DOCS_KEY_VERSION = '1.2.4.0';\nexport const REVIEW_KEY_VERSION = '1.2.3.0';\nexport const OLD_KEY_VERSION = '1.2.4.0';\n");
+    repo.git('commit', '-qam', 'stamp plus a released key moved by hand');
+    expect(tree(repo.git('rev-parse', 'HEAD'))).toBe('changed');
+    repo.git('checkout', '-q', 'squash');
+  });
+
   test('T1..Tk come from the train head by first parents; a head that is not a train is refused', () => {
     const git = gitIn(repo.work);
     const policy = loadPolicyFromHead(repo.work).policy;
@@ -271,11 +337,10 @@ describe('bisect: one executor per prefix, one trial per case', () => {
 });
 
 test('the free screening summary says first how to request the screen, then the selection and its estimated cost', () => {
-  const [j1] = Object.keys(LLM_JUDGE_TOUCHFILES) as [string];
-  const manifest = { version: 1, tier: 'gate', evalsAll: false, sliceCount: 1, profile: 'pr', selection: { e2e: [], judges: [j1] }, prCoverage: { mode: 'narrow' },
-    entries: [{ file: JUDGE_FILE, slice: 1, status: 'planned' }] } as unknown as PaidRunManifest;
+  const manifest = { version: 1, tier: 'gate', evalsAll: false, sliceCount: 1, profile: 'pr', selection: { e2e: ['hermetic-canary'], judges: [] }, prCoverage: { mode: 'narrow' },
+    entries: [{ file: 'test/skill-e2e-hermetic-canary.test.ts', slice: 1, status: 'planned' }] } as unknown as PaidRunManifest;
   const lines = screenSummary(manifest, '42');
   expect(lines[0]).toStartWith('To run the paid screen of this head: `gstack-ship-queue ready --pr 42 --screen`');
-  expect(lines[1]).toBe('- Screening selection: 0 case(s) + 1 judge(s), PR coverage mode `narrow`');
+  expect(lines[1]).toBe('- Screening selection: 1 case(s) + 0 judge(s), PR coverage mode `narrow`');
   expect(lines[2]).toMatch(new RegExp(`^- Estimated screen cost: ~\\$\\d+\\.\\d{2} .*\\$${FULL_GATE_USD} full gate.* No paid case ran on this push\\.$`));
 });

@@ -6,7 +6,7 @@
  * requires-remote. Every assertion holds on any host platform: each lane the
  * fixture selects is either named in `local` or asserted only by label.
  */
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterAll, afterEach, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -15,18 +15,20 @@ import { EXIT } from '../lib/headless-artifacts';
 import { loadConfigFromUser, validateConfig } from '../lib/pregate/config';
 import { buildContext, sha256, userConfigRejection } from '../lib/pregate/context';
 import { runPregate, verifyPregate } from '../lib/pregate/index';
-import { BASE_PREGATE, BIN, cleanup, commit, makeFixtureRepo, runBin, type FixtureRepo } from './helpers/pregate-fixture';
+import { BASE_PREGATE, BIN, cleanup, cloneFixture, commit, fixtureTemplate, makeFixtureRepo, runBin, type FixtureRepo } from './helpers/pregate-fixture';
 import { runScriptSync } from '../lib/script-invocation';
 
 const repos: FixtureRepo[] = [];
 afterEach(() => { while (repos.length) cleanup(repos.pop()!); });
+const noBasePolicy = fixtureTemplate({ pregate: null });
+afterAll(() => noBasePolicy.dispose());
 
 const SLUG = 'userpolicy';
 const LOCAL_ALL = ['free-tests.yml/unit', 'windows.yml/windows-shard'];
 
 /** A fixture whose base carries no `.gstack/pregate.json`, a feature commit touching lib/util.js, and the user-file path for its slug. */
 function setup(): { repo: FixtureRepo; userPolicy: string; run: (extra?: string[]) => ReturnType<typeof runBin> } {
-  const repo = makeFixtureRepo({ pregate: null });
+  const repo = cloneFixture(noBasePolicy);
   repos.push(repo);
   commit(repo, { 'lib/util.js': 'exports.add = (a, b) => b + a;\n' });
   const userPolicy = path.join(repo.home, 'projects', SLUG, 'pregate.json');
@@ -89,6 +91,23 @@ describe('loadConfigFromUser', () => {
   });
 });
 
+describe('fixture origin', () => {
+  // Value: protects=a push into the fixture's bare origin starts no detached auto-maintenance there, so copying the template never races
+  //   a repack (ENOENT lstat origin.git/objects/1d, Free Tests 41760556132); fails_when=the origin loses maintenance.auto=false;
+  //   why_new=local transport drops the runner's GIT_CONFIG_COUNT backstop, so only the origin's own config reaches receive-pack;
+  //   seam=none; no_claim=which maintenance task removed the object directory on the CI runner's git
+  test('a push into the origin starts no auto-maintenance even when the runner backstop is dropped', () => {
+    const { repo } = setup();
+    const trace = path.join(repo.root, 'trace2.txt');
+    const backstop = { GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'maintenance.auto', GIT_CONFIG_VALUE_0: 'false', GIT_CONFIG_KEY_1: 'gc.auto', GIT_CONFIG_VALUE_1: '0' };
+    const push = spawnSync('git', ['push', '-q', 'origin', 'HEAD:refs/heads/probe'], { cwd: repo.work, encoding: 'utf8', timeout: 30_000, env: { ...process.env, ...repo.env, ...backstop, GIT_TRACE2: trace } });
+    expect(push.status, push.stderr).toBe(0);
+    const events = fs.readFileSync(trace, 'utf8');
+    expect(events).toContain('receive-pack');
+    expect(events.split('\n').filter(l => l.includes('child_start') && l.includes('maintenance'))).toEqual([]);
+  });
+});
+
 describe('gstack-pregate with a user-owned policy', () => {
   // Value: protects=with no base copy the user file is the policy and its `local` lanes run here, while an unnamed platform lane stays
   //   requires-remote; fails_when=the user fallback or the `local` branch in selectLanes is dropped; why_new=both are new;
@@ -131,6 +150,19 @@ describe('gstack-pregate with a user-owned policy', () => {
     expect(lanes.fix).toContain(`under dependencies — or empty_lanes for other documentation — in ${userPolicy}`);
   }, 60_000);
 
+  // Value: protects=under a user-owned policy, a branch that adds its own .gstack/pregate.json is told the user file is the policy, by path;
+  //   fails_when=the own-policy line is limited to the base copy or hardcodes origin as the source; why_new=the own-policy line is new and its
+  //   test covers the base copy only; seam=none; no_claim=which route suits a user-policy repository
+  test('the own-policy no-lane fix names the user file as the policy source', () => {
+    const { repo, userPolicy, run } = setup();
+    writePolicy(userPolicy, { local: LOCAL_ALL });
+    commit(repo, { 'lib/orphan.js': 'exports.lonely = () => 2;\n', '.gstack/pregate.json': JSON.stringify({ runner: 'node --test {files}', dependencies: { 'lib/orphan.js': ['test/util.test.js'] } }) });
+    expect(run().status).not.toBe(EXIT.ok);
+    const lanes = JSON.parse(fs.readFileSync(path.join(repo.work, '.gstack/tmp/pregate.json'), 'utf8')).checks.find((c: { id: string }) => c.id === 'lanes');
+    expect(lanes.code).toBe('PREGATE_NO_LANE');
+    expect(lanes.fix).toStartWith(`this branch edits .gstack/pregate.json, but the policy comes from user ${userPolicy} so a branch cannot loosen its own gate`);
+  }, 60_000);
+
   // Value: protects=an invalid, sealed-bearing or unreadable user file refuses with PREGATE_CONFIG_INVALID naming the file, with a fix
   //   that points at the file rather than the base branch; fails_when=user-file errors run on defaults, or sealed/price_file are accepted
   //   and look active while nothing reads them; why_new=the user source is new; seam=none; no_claim=the sealed guard itself
@@ -144,12 +176,16 @@ describe('gstack-pregate with a user-owned policy', () => {
     expect(invalid.err).toContain(`fix: edit ${userPolicy} directly`);
     expect(invalid.err).not.toContain('.gstack/pregate.json has');
 
-    for (const [key, value] of [['sealed', { paths: ['evals/**'] }], ['price_file', 'evals/calls.json']] as const) {
+    const profile = { workflow: 'test.yml', events: ['push'], jobs: ['full-suite'], artifact: 'full-suite-tree' };
+    for (const [key, value] of [['sealed', { paths: ['evals/**'] }], ['price_file', 'evals/calls.json'], ['run_profiles', { test: profile }], ['remote_gate_runs', { profiles: ['test'], inventory: 'true' }]] as const) {
       writePolicy(userPolicy, { [key]: value });
       const r = run();
       expect(r.status).toBe(EXIT.refused);
       expect(r.err).toContain(`covers gstack-pregate run only; ${key}`);
     }
+    // An empty run_profiles is the documented default, not a policy, so it is accepted.
+    writePolicy(userPolicy, { run_profiles: {}, local: LOCAL_ALL });
+    expect(run().err).not.toContain('PREGATE_CONFIG_INVALID');
     // A null price_file is the documented default, not a policy, so it is accepted.
     writePolicy(userPolicy, { price_file: null, local: LOCAL_ALL });
     expect(run().err).not.toContain('PREGATE_CONFIG_INVALID');
@@ -161,16 +197,17 @@ describe('gstack-pregate with a user-owned policy', () => {
     expect(unreadable.err).toContain('cannot read the user-owned policy');
   }, 60_000);
 
-  // Value: protects=the user file is consulted only for --policy-from base with no base copy: head mode and a committed base copy never
-  //   read it; fails_when=either guard on the fallback is dropped and an unreviewed user file overrides reviewed policy; why_new=the
-  //   fallback is new; seam=none; no_claim=none beyond protects
-  test('--policy-from head and a base copy never read the user file', () => {
+  // Value: protects=the user file is consulted only with no base copy: a committed base copy never reads it, and under --policy-from head it
+  //   is the trusted policy the head file is compared with, so an invalid one refuses instead of vanishing (GST-419); fails_when=a base
+  //   copy is overridden by the user file, or head mode drops an unreadable user policy; why_new=the fallback is new, and head mode
+  //   now compares with it; seam=none; no_claim=none beyond protects
+  test('a base copy never reads the user file; under --policy-from head an invalid user file refuses', () => {
     const { repo, userPolicy, run } = setup();
     writePolicy(userPolicy, { local: ['not-a-lane'] });
 
     const head = run(['--policy-from', 'head']);
-    expect(head.err).not.toContain('PREGATE_CONFIG_INVALID');
-    expect(head.out).not.toContain('policy user');
+    expect(head.status).toBe(EXIT.refused);
+    expect(head.err).toContain('PREGATE_CONFIG_INVALID');
 
     commit(repo, { '.gstack/pregate.json': JSON.stringify(BASE_PREGATE) + '\n' });
     repo.git('push', '-q', 'origin', 'HEAD:main');

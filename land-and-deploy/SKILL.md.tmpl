@@ -7,6 +7,7 @@ description: |
   verifies production health via canary checks. Takes over after /ship
   creates the PR. Use when: "merge", "land", "deploy", "merge and verify",
   "land it", "ship it to production". (gstack)
+codex_default_prompt: "Use $gstack-land-and-deploy to merge this pull request once its checks pass, wait for CI and the deploy, and verify production health before calling it landed."
 allowed-tools:
   - Bash
   - Read
@@ -14,6 +15,7 @@ allowed-tools:
   - Glob
   - AskUserQuestion
 sensitive: true
+manual_only: true
 triggers:
   - merge and deploy
   - land the pr
@@ -21,12 +23,6 @@ triggers:
 ---
 
 {{PREAMBLE}}
-
-{{THIRD_PARTY_ACTIONS}}
-
-{{ASIDE_SETUP}}
-
-{{BROWSE_FALLBACK}}
 
 {{BASE_BRANCH_DETECT}}
 
@@ -177,15 +173,16 @@ readiness is not established.
 
 ## Step 3: Wait for CI (if pending)
 
-Poll in 4-minute rounds (300 s shell timeout), 15 minutes max; record the wait:
+One watcher call, never your own poll loop; a line per real event, else
+silence:
 
 ```bash
-~/.claude/skills/gstack/bin/gstack-ci-gate --repo "$REPO" --pr "$PR_NUMBER" --expect-head "$PR_HEAD" --wait 240
+~/.claude/skills/gstack/bin/gstack-pr-wait "$PR_NUMBER" --repo "$REPO" --until green
 ```
 
-Other verdicts follow Step 2. PENDING at 15 minutes: list the still-pending checks;
-ask A) wait 15 more minutes, B) exclude named `required=n` checks (Step 3.5
-approves each), or C) stop.
+Exit 0: green; rerun Step 2's gate (a moved head is a new push: restart at
+Step 1), then Step 3.4. Exit 1 (`PR_WAIT_BLOCKED`): **STOP**, show its lines;
+only a red `required=n` check can pass Step 3.5. Exit 2 (`PR_WAIT_REFUSED`): show it.
 
 ---
 
@@ -334,76 +331,7 @@ If browser access is unavailable, record SKIPPED with the reason for this target
 Staging choice A returns to its production route; C goes to Step 9 without claiming
 STAGING VERIFIED. Production goes to Step 9 with incomplete health evidence.
 
-Use the saved pre-merge scope and Step 5's precedence rule; URL/triggered-deploy paths
-still verify docs-only. Set `TARGET=production` unless entering from staging choice A/C.
-
-| Diff Scope | Canary Depth |
-|------------|-------------|
-| SCOPE_DOCS only | Smoke when Step 5 routes here; otherwise skipped there |
-| SCOPE_CONFIG only | Smoke: the Aside script below; `responseStatus` in `NAV=` must be 200 |
-| SCOPE_BACKEND only | Console errors + perf check |
-| SCOPE_FRONTEND (any) | Full: console + perf + screenshot |
-| Mixed scopes | Full canary |
-
-**Full canary sequence** — one `aside repl` script does the whole check (console hook first, then load, then evidence):
-
-```bash
-aside repl '
-const HOOK = `(() => { window.__gstackErrs = window.__gstackErrs || []; const oe = console.error; console.error = (...a) => { window.__gstackErrs.push(a.map(String).join(" ")); oe.apply(console, a); }; window.addEventListener("error", e => window.__gstackErrs.push("uncaught: " + e.message)); window.addEventListener("unhandledrejection", e => window.__gstackErrs.push("unhandledrejection: " + (e.reason && e.reason.message || e.reason))); })()`;
-const pg = await openTab("about:blank");
-await pg._sendToTarget("Page.addScriptToEvaluateOnNewDocument", { source: HOOK });
-await pg.goto("<url>");
-console.log("URL=" + pg.url());
-console.log("CONSOLE_ERRORS=" + JSON.stringify(await pg.evaluate(() => window.__gstackErrs)));
-console.log("NAV=" + await pg.evaluate(() => JSON.stringify(performance.getEntriesByType("navigation")[0])));
-console.log("TEXT_START"); console.log((await pg.evaluate(() => document.body.innerText)).slice(0, 20000)); console.log("TEXT_END");
-await pg.screenshot({ path: "post-deploy.jpg", type: "jpeg", quality: 60, fullPage: true });
-const a = await annotatedScreenshot(pg);
-await fs.writeFile(path.join(pwd, "post-deploy-annotated.png"), Buffer.from(a.base64Image, "base64"));
-console.log("ASIDE_DIR=" + pwd);
-await closeTab(pg);
-console.log("GSTACK_STEP_OK");
-'
-```
-
-Then copy the evidence out of the printed session directory:
-
-```bash
-mkdir -p .gstack/deploy-reports && cp "<ASIDE_DIR>/post-deploy.jpg" "<ASIDE_DIR>/post-deploy-annotated.png" .gstack/deploy-reports/
-```
-
-Read the output line by line:
-
-- `URL=` — the page loaded and stayed on the site (not a redirect to an error page). A line starting with `[error` or a missing `GSTACK_STEP_OK` means the load failed.
-- `CONSOLE_ERRORS=` — check for critical errors: entries containing `Error`, `Uncaught`, `Failed to load`, `TypeError`, `ReferenceError`. Ignore warnings.
-- `NAV=` — `responseStatus` is the HTTP status of the document (Chromium PerformanceNavigationTiming) — must be 200. `loadEventEnd` is the page load time. Check that it is under 10 seconds.
-- `TEXT_START` / `TEXT_END` — verify the page has real content (not blank, not a generic error page).
-- `post-deploy.jpg` and the annotated `post-deploy-annotated.png` are the evidence. Read the copied screenshot so the user sees it.
-
-**Health assessment:**
-- Page loads successfully with 200 status (`responseStatus` in `NAV=`) → PASS
-- No critical console errors → PASS
-- Page has real content (not blank or error screen) → PASS
-- Loads in under 10 seconds → PASS
-
-Assess only checks required by the selected depth; mark unperformed checks N/A.
-All required checks pass: record HEALTHY for this target. Staging returns through
-Step 5a's chosen A/C route; production goes to Step 9. Preserve deployment uncertainty.
-
-If any fail: show the evidence (screenshot path, console errors, perf numbers). Use AskUserQuestion:
-- **Re-ground:** "I found some issues on the live site after the deploy. Here's what I see: {specific issues}. This might be temporary (caches clearing, CDN propagating) or it might be a real problem."
-- **RECOMMENDATION:** Choose based on severity — B for critical (site down), A for minor (console errors).
-- A) Accept these observed issues for now — report DEGRADED, not healthy
-- B) That's broken — revert the merge and roll back to the previous version
-- C) Let me investigate more — open the site and look at logs before deciding
-
-**A:** Record DEGRADED and the user's acknowledgment, then Step 9 (do not silently
-continue from failed staging to production verification). **B:** Step 8, only with
-explicit rollback approval. **C:** Inspect the page/evidence and read-only logs;
-summarize findings, then ask for one recheck (repeat Step 7), rollback (Step 8), or
-finish DEGRADED (Step 9). These investigations never modify or redeploy code.
-When `ROLLBACK=true`, failures remain ROLLBACK PENDING; offer investigation or report,
-not another revert. Keep staging/production screenshots distinct when checking both.
+{{SECTION:canary}}
 
 ---
 
@@ -495,8 +423,8 @@ to check next. No deploy needed: merged, verification skipped for the stated rea
 Staging-only: production remains unverified, not necessarily undeployed. Rollback
 pending: identify who must resolve conflicts, merge the revert PR, or verify its deploy.
 REVERTED: cite rollback evidence; do not claim the original branch survived cleanup.
-Offer `/canary <url>` for extended monitoring, `/benchmark <url>` when performance
-matters, and `/document-release` when docs need updating.
+Offer `/canary <url>` for extended monitoring, `/benchmark <url>` for performance,
+and `/document-release` for docs.
 
 ---
 
@@ -512,8 +440,8 @@ Recheck read-only evidence; never redo a merge/deploy because a section was miss
 ## Important Rules
 
 - Never force-push, bypass CI, replay a confirmed merge, or hide missing evidence.
-- Auto-detect facts; ask when unknown or when an explicit approval gate applies.
-- Poll at each step's stated interval and deadline (4-minute CI rounds in Step 3; 30 seconds for merge readback and deploy status), with its progress messages.
+- Auto-detect facts; ask when unknown or an explicit approval gate applies.
+- Step 3 is one `gstack-pr-wait` call; elsewhere poll at the stated interval (30 s for merge readback and deploy) with progress lines.
 - After merge failures, offer approved rollback when appropriate; never revert a rollback automatically.
-- Verify once; `/canary` provides extended monitoring. Rechecks require the user's choice.
+- Verify once; `/canary` does extended monitoring; rechecks need the user's choice.
 - Use `--delete-branch`; reconcile failed cleanup non-destructively with confirmation.

@@ -7,15 +7,18 @@
  * and a scripted gh; no network, no API spend.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { bunIsolationArgs } from '../lib/bun-isolation';
 import { loadPolicyFromHead } from '../lib/ship-policy';
 import { NOTES_REF, persist, repoIdentity } from '../lib/ship-queue-train-record';
 import type { GhRunner } from '../scripts/recover-receipts';
 import { runBackstop } from '../scripts/train-backstop';
 import { gitIn, trainPrefixes, type TrainRecord } from '../scripts/train-gate';
 import { E2E_TOUCHFILES } from './helpers/touchfiles-data';
-import { BASE_POLICY, cleanup, makeFixtureRepo, type FixtureRepo } from './helpers/restamp-fixture';
+import { gitFixtureTemplate, rebindGitDir, type GitFixtureTemplate } from './helpers/git-fixture-template';
+import { BASE_POLICY, cleanup, fixtureRepoAt, seedFixtureRepo, type FixtureRepo } from './helpers/restamp-fixture';
 import { TRAIN_BLOCK, TRAIN_POLICY } from './helpers/ship-queue-train-fixture';
 
 const REPO = 'fixture/repo';
@@ -28,10 +31,23 @@ afterEach(() => { if (savedStateRoot === undefined) delete process.env.GSTACK_ST
 
 interface Fixture { repo: FixtureRepo; main0: string; prs: string[]; train: string[]; record: TrainRecord }
 
-/** Five PR branches from main and the train T1..T5 gstack-ship-queue would build from them (lib/ship-queue-train.ts buildChain). */
+/** Five PR branches from main and the train T1..T5 gstack-ship-queue would build from them, built once per policy and copied per test. */
+const templates = new Map<string, GitFixtureTemplate<Omit<Fixture, 'repo'>>>();
+afterAll(() => { for (const t of templates.values()) t.dispose(); });
 function trainFixture(policy: Record<string, unknown> = TRAIN_POLICY): Fixture {
-  const repo = makeFixtureRepo({ policy, prefix: 'train-backstop-fx-' });
+  const key = JSON.stringify(policy);
+  if (!templates.has(key)) templates.set(key, gitFixtureTemplate({ prefix: 'train-backstop-fx-', build: root => buildTrain(root, policy), rebind: (copy, tpl) => rebindGitDir(path.join(copy, 'work', '.git'), tpl, copy) }));
+  const { root, meta } = templates.get(key)!.copy();
+  const repo = fixtureRepoAt(root);
   repos.push(repo);
+  process.env.GSTACK_STATE_ROOT = path.join(repo.root, 'state');
+  return { repo, ...structuredClone(meta) };
+}
+
+/** lib/ship-queue-train.ts buildChain's T1..T5 over five PR branches from main. */
+function buildTrain(root: string, policy: Record<string, unknown>): Omit<Fixture, 'repo'> {
+  seedFixtureRepo(root, { policy });
+  const repo = fixtureRepoAt(root);
   process.env.GSTACK_STATE_ROOT = path.join(repo.root, 'state');
   const main0 = repo.git('rev-parse', 'HEAD');
   const prs = [1, 2, 3, 4, 5].map(i => {
@@ -54,7 +70,7 @@ function trainFixture(policy: Record<string, unknown> = TRAIN_POLICY): Fixture {
   const record: TrainRecord = { schema: 1, kind: 'train-gate', nonce: TRAIN_NONCE, head_sha: parent, tree: repo.git('rev-parse', `${parent}^{tree}`), verdict: 'GREEN',
     census: { complete: true, planned: { rule: 108, judge: 24 }, executed: { rule: 108, judge: 24 }, unbound: 0, partial_shards: 0, cancelled_shards: 0, killed_before_upload: 0 },
     panels: [], run: { id: 900, attempt: 1, url: 'https://example.invalid/runs/900' }, prefixes };
-  return { repo, main0, prs, train, record };
+  return { main0, prs, train, record };
 }
 
 /** The coordinator's squash merge of PR i onto main, stamped at merge (VERSION, package.json, the release output). */
@@ -122,6 +138,21 @@ describe('backstop: inert without a train block', () => {
     expect(out.lines[0]).toContain('declares no train block');
     expect(calls).toEqual([]);
   });
+
+  // evals-main-backstop.yml reads this step output and publishes the
+  // main-backstop check run the weekly release gates on (scripts/release-cut.ts).
+  test.skipIf(process.platform === 'win32')('the CLI appends action=<action> to --outputs and exits 0 when inert', () => {
+    const fx = trainFixture(BASE_POLICY);
+    const sha = squashMerge(fx.repo, 1);
+    const outputs = path.join(fx.repo.root, 'outputs.txt');
+    const summary = path.join(fx.repo.root, 'summary.md');
+    const r = spawnSync(process.execPath, [...bunIsolationArgs(), 'run', path.join(import.meta.dir, '..', 'scripts', 'train-backstop.ts'), 'run', '--repo', REPO, '--branch', 'main', '--sha', sha, '--summary', summary, '--outputs', outputs],
+      { cwd: fx.repo.work, encoding: 'utf8', timeout: 60_000, env: { ...process.env, GSTACK_STATE_ROOT: path.join(fx.repo.root, 'state') } });
+    expect(r.status, r.stdout + r.stderr).toBe(0);
+    expect(r.stdout).toContain('BACKSTOP: inert');
+    expect(fs.readFileSync(outputs, 'utf8')).toBe('action=inert\n');
+    expect(fs.readFileSync(summary, 'utf8')).toContain('- BACKSTOP: inert');
+  });
 });
 
 describe("backstop: a train's merges are covered by the train's own green record", () => {
@@ -134,6 +165,19 @@ describe("backstop: a train's merges are covered by the train's own green record
       expect(out.lines.at(-1)).toContain(`is T${i} of green train ${TRAIN_NONCE} (run 900`);
     }
     expect(dispatches()).toEqual([]);
+  });
+
+  test('while a freeze is active, a covering green-train record does not stand in for the gate (GST-1354)', () => {
+    const fx = trainFixture();
+    const { gh, dispatches } = fakeGh(fx, { gate: 'success' });
+    const main = squashMerge(fx.repo, 1);
+    const at = new Date().toISOString();
+    persist(fx.repo.work, [{ schema: 1, kind: 'freeze', repo_key: repoIdentity(fx.repo.work).key, train: 'backstop', merged: [], unmerged: [], main: { sha: fx.main0, tree: fx.repo.git('rev-parse', fx.main0 + '^{tree}') },
+      reason: 'backstop red', backstop: { nonce: 'gate.backstop-x', run: 1, state: 'completed/failure' }, repair: null, created_at: at, cleared_at: null, cleared_by: null, updated_at: at } as any]);
+    const out = backstop(fx, main, gh);
+    expect(out.action, out.lines.join('\n')).toBe('gated');
+    expect(out.lines).toContain('BACKSTOP: the queue is frozen, so only a gate on main can clear it; no green-train record stands in');
+    expect(dispatches()).toHaveLength(1);
   });
 
   test('a superseded push hands main to the newer push without a gh call', () => {
@@ -204,5 +248,52 @@ describe('backstop: debounce while a train merges', () => {
     expect(out.lines.some(line => line.includes('still merging after the settle window'))).toBe(true);
     expect(out.action).toBe('covered');
     expect(dispatches()).toEqual([]);
+  });
+});
+
+describe('backstop: a stamped train (changelog_fragments) covers only exact trees', () => {
+  test('main equal to S1 is covered as S1; the same tree with another VERSION is gated', () => {
+    const fx = trainFixture();
+    const { repo, main0, prs } = fx;
+    let parent = main0;
+    const stamped = prs.slice(0, 2).map((head, i) => {
+      repo.git('checkout', '-q', '-f', '--detach', parent);
+      repo.git('merge', '-q', '--no-ff', '--no-commit', head);
+      fs.writeFileSync(path.join(repo.work, 'VERSION'), `1.2.${4 + i}.0\n`);
+      repo.git('add', '-A');
+      parent = repo.git('commit-tree', repo.git('write-tree'), '-p', parent, '-p', head, '-m', `train S${i + 1}: merge #${101 + i} at ${head.slice(0, 12)} v1.2.${4 + i}.0`);
+      repo.git('merge', '--abort');
+      return parent;
+    });
+    repo.git('checkout', '-q', '-f', 'main');
+    const prefixes = trainPrefixes(gitIn(repo.work), parent, repo.work, loadPolicyFromHead(repo.work).policy);
+    if (!Array.isArray(prefixes)) throw new Error(prefixes.error);
+    expect(prefixes.map(p => [p.index, p.exact])).toEqual([[1, true], [2, true]]);
+    const record = { ...fx.record, head_sha: parent, tree: repo.git('rev-parse', `${parent}^{tree}`), prefixes };
+    const push = (tree: string) => {
+      const sha = repo.git('commit-tree', tree, '-p', repo.git('rev-parse', 'main'), '-m', 'squash');
+      repo.git('update-ref', 'refs/heads/main', sha);
+      repo.git('push', '-q', 'origin', 'main');
+      return sha;
+    };
+    const s1 = push(repo.git('rev-parse', `${stamped[0]}^{tree}`));
+    const covered = backstop({ ...fx, record }, s1, fakeGh({ ...fx, record }, { record }).gh);
+    expect(covered.action, covered.lines.join('\n')).toBe('covered');
+    expect(covered.lines.at(-1)).toContain(`is S1 of green train ${TRAIN_NONCE} (run 900, exact tree`);
+    repo.git('checkout', '-q', '-f', '--detach', stamped[0]!);
+    fs.writeFileSync(path.join(repo.work, 'VERSION'), '1.2.9.0\n');
+    repo.git('add', '-A');
+    const moduloStamps = push(repo.git('write-tree'));
+    repo.git('checkout', '-q', '-f', 'main');
+    const gated = backstop({ ...fx, record }, moduloStamps, fakeGh({ ...fx, record }, { record, gate: 'success' }).gh);
+    expect(gated.lines.join('\n')).toContain("no green-train record lists main's tree");
+    expect(gated.action).not.toBe('covered');
+  });
+
+  test('a chain that mixes stamped and plain prefixes is not a train head', () => {
+    const fx = trainFixture();
+    const { repo, train, prs } = fx;
+    const s = repo.git('commit-tree', repo.git('rev-parse', `${train[0]}^{tree}`), '-p', train[0]!, '-p', prs[1]!, '-m', `train S2: merge #102 at ${prs[1]!.slice(0, 12)} v1.2.5.0`);
+    expect(trainPrefixes(gitIn(repo.work), s, repo.work, loadPolicyFromHead(repo.work).policy)).toEqual({ error: `${train[0]!.slice(0, 12)} mixes stamped and plain prefixes` });
   });
 });

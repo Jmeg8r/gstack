@@ -16,23 +16,54 @@ import { resolveStateRoot } from './state-root';
 
 export const TRAIN_SCHEMA = 1;
 export const NOTES_REF = 'refs/notes/gstack-trains';
-const NOTES_REMOTE_REF = 'refs/notes/gstack-trains-origin';
+export const NOTES_REMOTE_REF = 'refs/notes/gstack-trains-origin';
 
 export type TrainState =
   | 'built' | 'pushed' | 'free-pending' | 'free-red' | 'free-green' | 'dispatch-unknown' | 'dispatch-absent' | 'gate-pending'
-  | 'green' | 'red' | 'incomplete' | 'attributed' | 'red-on-main' | 'unattributed' | 'merging' | 'merged' | 'superseded';
-/** States after which a train never dispatches again; prune deletes their branches. */
-export const TERMINAL_STATES: readonly TrainState[] = ['free-red', 'attributed', 'red-on-main', 'merged', 'superseded'];
+  | 'green' | 'red' | 'incomplete' | 'attributed' | 'red-on-main' | 'unattributed' | 'merging' | 'merged' | 'superseded' | 'stale';
+/** States after which a train never dispatches again; prune deletes their branches (`stale`: every PR merged or closed outside the train, `train prune --stale`). */
+export const TERMINAL_STATES: readonly TrainState[] = ['free-red', 'attributed', 'red-on-main', 'merged', 'superseded', 'stale'];
 
-export interface ScreenChoice { choice: 'screen' | 'no-screen'; policy: 'narrow' | 'broad' | null; nonce: string | null; run: number | null; merge_sha: string | null }
-export interface TrainSlot { pr: string; head: string; ready_at: string; screen: ScreenChoice }
+/** What the screen run itself said (lib/ship-queue-screen.ts), recorded when it was read; absent while the run is pending or unread. */
+export interface ScreenVerdictRecord { outcome: 'GREEN' | 'RED' | 'NOT_RUN' | 'INCOMPLETE'; run: number; red: string[]; flaky: string[]; detail: string; read_at: string }
+export interface ScreenChoice {
+  choice: 'screen' | 'no-screen'; policy: 'narrow' | 'broad' | null; nonce: string | null; run: number | null; merge_sha: string | null;
+  /** The scratch branch `ready --screen` pushed when GitHub's merge ref lagged the head (docs/ship-policy.md#run-a-merge-train). */
+  branch?: string;
+  verdict?: ScreenVerdictRecord;
+}
+/** A conditional READY (`ready --base-red --fixer <n>`): the receipt's base-red cases and the PR whose merge fixes them. */
+export interface BaseRedCondition { cases: string[]; fixer: string; base: string; expires_at: string }
+export interface TrainSlot {
+  pr: string; head: string; ready_at: string; screen: ScreenChoice;
+  /** Conditional slots ride only a generic train whose slot 1 is their fixer. */
+  base_red?: BaseRedCondition;
+  /** The fixer's READY (`ready --fixes-base-red`): the gate cases T0 may be red on, and only those. */
+  fixes_base_red?: string[];
+  /** The slot is a wave PR (lib/ship-queue-wave.ts) carrying these constituents at their pins. */
+  wave?: { nonce: string; constituents: string[] };
+}
+/** One prefix a generic train gates (lib/ship-queue-train-gate.ts), on its own train-prefix/<nonce>/t<i> (or s<i>) ref. */
+export interface GatedPrefix { index: number; ref: string; commit: string; tree: string; outcome: GateOutcome | null; red: string[]; detail: string | null }
+/** A generic train's verdict over its prefixes: slots 1..landable may land; culprit is the held slot's PR. */
+export interface GenericVerdict { kind: 'green' | 'attributed' | 'red-on-main' | 'unattributed' | 'incomplete'; landable: number; culprit: string | null; at: string }
+/** Written to the record and the notes before train land's first remote effect for a slot. */
+export interface LandingRecord { slot: number; mode: 'direct' | 'update'; method: 'squash' | 'merge' | 'rebase'; pin: string; update: string | null; base: string; expected_tree: string; at: string }
 export interface TrainPrefix { index: number; commit: string; tree: string; pr: string | null }
+/** A stamped prefix S_i (changelog_fragments trains, lib/ship-queue-train-stamp.ts): what slot i publishes, exactly. */
+export interface StampedPrefix { index: number; commit: string; tree: string; pr: string; version: string; date: string }
 export interface FreeRun { run: number | null; url: string | null; head_sha: string | null; conclusion: string | null; verdict: 'green' | 'red' | 'missing' | 'stale' | 'cancelled' | 'pending' }
 export interface TrainRecord {
   schema: 1; kind: 'train'; nonce: string; key: string; repo_key: string; repo: string; base: { ref: string; sha: string }; policy: string;
   slots: TrainSlot[]; held: string[]; prefixes: TrainPrefix[]; head: string; tree: string; branch: string;
   urgent: boolean; repair: boolean; explicit_order?: boolean; state: TrainState; free: FreeRun | null; attempts: string[];
   merged: Array<{ pr: string; sha: string; tree: string; at: string }>; superseded_by: string | null;
+  /** S_1..S_k when the base policy declares changelog_fragments; head and tree are then S_k's. Absent on plain trains. */
+  stamped?: StampedPrefix[];
+  /** Generic trains (a policy train block with gates): every prefix gated; absent on gstack-evals trains, which keep today's rules. */
+  gated?: GatedPrefix[];
+  verdict?: GenericVerdict;
+  landing?: Record<string, LandingRecord>;
   effects: Array<{ at: string; what: string }>; error: string | null; created_at: string; updated_at: string;
 }
 export type AttemptPurpose = 'gate' | 'rebuild' | 'infra-redispatch' | 'bisect';
@@ -47,6 +78,11 @@ export interface AttemptRecord {
   inputs: Record<string, string>; state: 'dispatching' | 'unknown' | 'absent' | 'dispatched' | 'completed'; run: { id: number; url: string } | null;
   outcome: GateOutcome | null; detail: string | null; red_cases: string[]; panels: CasePanel[]; infra_eligible: boolean;
   cost_usd: number | null; prefixes: number[]; created_at: string; updated_at: string;
+  /** Generic trains: the policy gate index, the run attempt read, both attempts' jobs, the rerun and its FLAKY cases, a reused T0 run. */
+  gate?: number; run_attempt?: number; rerun?: 'requested' | 'refused'; jobs?: Array<{ attempt: number; name: string; conclusion: string | null }>;
+  flaky?: string[]; reused?: string; tree?: string | null; spend_usd?: number;
+  /** A command gate's running process: reconcile marks the attempt absent only once this owner is gone. */
+  owner?: { pid: number; host: string };
 }
 export type PrefixResult = 'red' | 'green';
 export interface BisectRecord {
@@ -57,13 +93,46 @@ export interface BisectRecord {
 }
 export interface FreezeRecord {
   schema: 1; kind: 'freeze'; repo_key: string; train: string; merged: string[]; unmerged: Array<{ pr: string; head: string }>;
+  /** Slots GitHub could not answer for beside a merged one: neither merged nor unmerged (#3519); absent on records written before the field. */
+  unreadable?: Array<{ pr: string; head: string }>;
   main: { sha: string; tree: string }; reason: string; backstop: { nonce: string; run: number | null; state: string } | null;
   repair: { pr: string; head: string; train: string | null } | null; created_at: string; cleared_at: string | null; cleared_by: string | null; updated_at: string;
 }
+/** A constituent of a wave PR (lib/ship-queue-wave.ts): the PR, its pinned head and the wave-branch merge commit whose second parent is that head. */
+export interface WaveConstituent {
+  pr: string; head: string; merge_commit: string | null;
+  /** Files the integrator resolved by hand in this constituent's merge (wave build --continue); absent for a clean merge. */
+  resolved?: string[];
+}
+export type WaveState = 'conflict' | 'built' | 'pushed' | 'superseded' | 'released' | 'settled';
+export interface WaveRecord {
+  schema: 1; kind: 'wave'; nonce: string; repo_key: string; area: string; base: { ref: string; sha: string }; branch: string;
+  constituents: WaveConstituent[]; head: string | null; state: WaveState;
+  /** The merge the integrator resolves by hand: the constituent, its files, the worktree under the state root and the commit it merges onto. */
+  conflict: { pr: string; files: string[]; worktree: string; pred: string } | null;
+  superseded_by: string | null; settled: Array<{ pr: string; outcome: string; at: string }>;
+  effects: Array<{ at: string; what: string }>; created_at: string; updated_at: string;
+}
 export interface ReadyReceipt {
   schema: 1; kind: 'ready'; repo_key: string; pr: string; head: string; base_sha: string; ready_at: string; screen: ScreenChoice; updated_at: string;
+  base_red?: BaseRedCondition; fixes_base_red?: string[];
 }
-export type AnyRecord = TrainRecord | AttemptRecord | BisectRecord | FreezeRecord | ReadyReceipt;
+/** One release-gate bisect round (lib/release-gate.ts): the prefixes it dispatched on release-gate/<id> and what each case did there. */
+export interface ReleaseBisectRound { nonce: string; ref: string; run: { id: number; url: string } | null; prefixes: Array<{ sha: string; results: Record<string, PrefixResult> }> }
+/** A red release gate's bisect over the first-parent commits after the last green gate: first_bad once good and bad are adjacent. */
+export interface ReleaseBisect {
+  cases: string[]; good: string | null; bad: string; first_bad: string | null; spend_cap: number; spent_usd: number;
+  state: 'running' | 'found' | 'unknown' | 'capped'; detail: string; rounds: ReleaseBisectRound[];
+}
+/** The release gate's verdict on one commit of the gated branch (lib/release-gate.ts), the evidence scripts/release-cut.ts reads. */
+export interface ReleaseRecord {
+  schema: 1; kind: 'release'; repo_key: string; sha: string; tree: string; branch: string; stable: string | null; since: string | null;
+  nonce: string; attempts: number; run: { id: number; url: string } | null; verdict: 'PENDING' | 'GREEN' | 'RED' | 'INCOMPLETE';
+  red_cases: string[]; flaky: string[]; cost_usd: number | null; detail: string; bisect: ReleaseBisect | null; created_at: string; updated_at: string;
+}
+/** What `land --pin` merged (docs/ship-policy.md#land-direct): the pin, the base it landed on and the verified merge commit. */
+export interface LandNote { schema: 1; kind: 'land'; repo_key: string; pr: string; pin: string; base_sha: string; merge_sha: string; tree: string; landed_at: string; updated_at: string }
+export type AnyRecord = TrainRecord | AttemptRecord | BisectRecord | FreezeRecord | ReadyReceipt | WaveRecord | ReleaseRecord | LandNote;
 
 /** Clock seam for fill-time and record tests (`GSTACK_SHIP_QUEUE_NOW`, ISO-8601). */
 export function nowIso(): string {
@@ -86,6 +155,9 @@ const attemptPath = (nonce: string, id: string) => path.join(trainDir(nonce), 'a
 const bisectPath = (nonce: string) => path.join(trainDir(nonce), 'bisect.json');
 const freezePath = (repoKey: string) => path.join(queueRoot(), 'freeze', `${repoKey}.json`);
 export const readyPath = (repoKey: string, pr: string, head: string) => path.join(queueRoot(), 'ready', repoKey, `${pr}-${head}.json`);
+export const wavePath = (nonce: string) => path.join(queueRoot(), 'waves', `${nonce}.json`);
+export const releasePath = (repoKey: string, sha: string) => path.join(queueRoot(), 'release', repoKey, `${sha}.json`);
+export const landPath = (repoKey: string, pr: string, pin: string) => path.join(queueRoot(), 'landed', repoKey, `${pr}-${pin}.json`);
 
 /** Hosts that serve GitHub repositories at /<owner>/<repo> (git.capy.ai is Capy's GitHub proxy, set through url.insteadOf). */
 const GITHUB_HOSTS = ['github.com', 'www.github.com', 'ssh.github.com', 'git.capy.ai'];
@@ -132,6 +204,25 @@ const firstOf = <T>(k: RepoKeys, read: (key: string) => T | null): T | null => {
 export const loadFreeze = (repoKeys: RepoKeys) => firstOf(repoKeys, key => readJson<FreezeRecord>(freezePath(key), 'freeze'));
 export const loadReady = (repoKeys: RepoKeys, pr: string, head: string) => firstOf(repoKeys, key => readJson<ReadyReceipt>(readyPath(key, pr, head), 'ready'));
 export const activeFreeze = (repoKeys: RepoKeys): FreezeRecord | null => firstOf(repoKeys, key => { const f = readJson<FreezeRecord>(freezePath(key), 'freeze'); return f && !f.cleared_at ? f : null; });
+/**
+ * When a freeze-phase land lock's freeze is over, the cleared_at that proves it: the notes ref fetched, no freeze
+ * active, and the last freeze cleared at or after the lock was written. Absence of a record is never proof.
+ */
+export function freezeLockCleared(repoRoot: string, remote: string, repoKeys: RepoKeys, lock: { phase_at?: string; started_at: string }): string | null {
+  if (!rebuildFromNotes(repoRoot, remote).fetched || activeFreeze(repoKeys)) return null;
+  const last = loadFreeze(repoKeys);
+  return last?.cleared_at && Date.parse(last.cleared_at) >= Date.parse(lock.phase_at ?? lock.started_at) ? last.cleared_at : null;
+}
+
+export const loadWave = (nonce: string) => (/^[A-Za-z0-9._-]{1,128}$/.test(nonce) ? readJson<WaveRecord>(wavePath(nonce), 'wave') : null);
+/** Every wave of this repository, newest first. */
+export function listWaves(repoKeys: RepoKeys): WaveRecord[] {
+  const dir = path.join(queueRoot(), 'waves');
+  if (!fs.existsSync(dir)) return [];
+  const keys = keyList(repoKeys);
+  return fs.readdirSync(dir).filter(n => n.endsWith('.json')).map(n => loadWave(n.slice(0, -5))).filter((w): w is WaveRecord => !!w && keys.includes(w.repo_key))
+    .sort((a, b) => b.created_at.localeCompare(a.created_at) || b.nonce.localeCompare(a.nonce));
+}
 
 export function attemptsOf(train: TrainRecord): AttemptRecord[] {
   return train.attempts.map(id => loadAttempt(train.nonce, id)).filter((a): a is AttemptRecord => !!a);
@@ -151,14 +242,20 @@ export function recordPath(r: AnyRecord): string {
   if (r.kind === 'train-attempt') return attemptPath(r.train, r.id);
   if (r.kind === 'train-bisect') return bisectPath(r.train);
   if (r.kind === 'freeze') return freezePath(r.repo_key);
+  if (r.kind === 'wave') return wavePath(r.nonce);
+  if (r.kind === 'release') return releasePath(r.repo_key, r.sha);
+  if (r.kind === 'land') return landPath(r.repo_key, r.pr, r.pin);
   return readyPath(r.repo_key, r.pr, r.head);
 }
 
-function noteName(r: AnyRecord): string {
+export function noteName(r: AnyRecord): string {
   if (r.kind === 'train') return `gstack-trains:train:${r.nonce}`;
   if (r.kind === 'train-attempt') return `gstack-trains:attempt:${r.train}:${r.id}`;
   if (r.kind === 'train-bisect') return `gstack-trains:bisect:${r.train}`;
   if (r.kind === 'freeze') return `gstack-trains:freeze:${r.repo_key}`;
+  if (r.kind === 'wave') return `gstack-trains:wave:${r.nonce}`;
+  if (r.kind === 'release') return `gstack-trains:release:${r.repo_key}:${r.sha}`;
+  if (r.kind === 'land') return `gstack-trains:land:${r.repo_key}:${r.pr}:${r.pin}`;
   return `gstack-trains:ready:${r.repo_key}:${r.pr}:${r.head}`;
 }
 
@@ -222,19 +319,51 @@ function parseNote(text: string): AnyRecord | null {
     if (r.kind === 'train' && ids.test(r.nonce)) return r;
     if ((r.kind === 'train-attempt' && ids.test(r.train) && ids.test(r.id)) || (r.kind === 'train-bisect' && ids.test(r.train))) return r;
     if (r.kind === 'freeze' && ids.test(r.repo_key)) return r;
+    if (r.kind === 'wave' && ids.test(r.nonce) && ids.test(r.repo_key) && Array.isArray(r.constituents)) return r;
+    if (r.kind === 'release' && ids.test(r.repo_key) && /^[0-9a-f]{40,64}$/.test(r.sha)) return r;
+    if (r.kind === 'land' && ids.test(r.repo_key) && /^\d+$/.test(r.pr) && /^[0-9a-f]{40,64}$/.test(r.pin)) return r;
     if (r.kind === 'ready' && ids.test(r.repo_key) && /^\d+$/.test(r.pr) && /^[0-9a-f]{40,64}$/.test(r.head)) return r;
   } catch {}
   return null;
 }
 
+/**
+ * Remove records from the notes ref (`train forget`): each named note is
+ * removed locally, then the ref is pushed under an exact lease on the remote
+ * tip this call fetched, so a concurrent writer's push is never overwritten
+ * (a rejected lease returns `pushed: false` and nothing is deleted locally).
+ * Names are note names (noteName); a name with no note is reported missing.
+ */
+export function forgetNotes(repoRoot: string, names: string[], remote = 'origin'): { removed: string[]; missing: string[]; failed: string[]; pushed: boolean; lease: string | null; detail: string } {
+  const f = fetchNotes(repoRoot, remote);
+  if (!f.ok) return { removed: [], missing: [], failed: [], pushed: false, lease: null, detail: f.detail };
+  const lease = git(repoRoot, ['rev-parse', '--verify', '--quiet', NOTES_REMOTE_REF]).out || null;
+  const before = git(repoRoot, ['rev-parse', '--verify', '--quiet', NOTES_REF]).out || null;
+  const listed = git(repoRoot, ['notes', `--ref=${NOTES_REF}`, 'list']).out.split('\n').map(l => l.split(' ')[1]).filter(Boolean);
+  const removed: string[] = [];
+  const missing: string[] = [];
+  const failed: string[] = [];
+  const restore = () => { if (before) git(repoRoot, ['update-ref', NOTES_REF, before]); };
+  for (const name of names) {
+    const blob = git(repoRoot, ['hash-object', '--stdin'], undefined, name).out;
+    if (!listed.includes(blob)) { missing.push(name); continue; }
+    if (git(repoRoot, ['notes', `--ref=${NOTES_REF}`, 'remove', blob], notesEnv()).ok) removed.push(name); else failed.push(name);
+  }
+  if (failed.length) { restore(); return { removed: [], missing, failed, pushed: false, lease, detail: `git notes remove failed for ${failed.join(', ')}; the local notes ref was restored` }; }
+  if (!removed.length) return { removed, missing, failed, pushed: false, lease, detail: 'no note to remove' };
+  const p = git(repoRoot, ['push', '-q', lease ? `--force-with-lease=${NOTES_REF}:${lease}` : `--force-with-lease=${NOTES_REF}`, remote, `${NOTES_REF}:${NOTES_REF}`]);
+  if (!p.ok) restore();
+  return { removed, missing, failed, pushed: p.ok, lease, detail: p.ok ? `notes pushed to ${remote} ${NOTES_REF} (lease ${lease?.slice(0, 12) ?? 'new ref'})` : `git push ${NOTES_REF} rejected: ${p.err.replace(/\s+/g, ' ').trim().slice(0, 160)}; the local notes ref was restored` };
+}
+
 /** Rebuild local records from the notes ref: a note whose record is missing locally, or newer than the local copy, is written. */
-export function rebuildFromNotes(repoRoot: string, remote = 'origin'): { restored: number; read: number; detail: string } {
+export function rebuildFromNotes(repoRoot: string, remote = 'origin'): { restored: number; read: number; detail: string; fetched: boolean } {
   const f = fetchNotes(repoRoot, remote);
   const list = git(repoRoot, ['notes', `--ref=${NOTES_REF}`, 'list']);
-  if (!list.ok || !list.out.trim()) return { restored: 0, read: 0, detail: f.detail };
+  if (!list.ok || !list.out.trim()) return { restored: 0, read: 0, detail: f.detail, fetched: f.ok };
   const records = list.out.split('\n').map(l => l.split(' ')[0]!).filter(Boolean)
     .map(blob => parseNote(git(repoRoot, ['cat-file', 'blob', blob]).out)).filter((r): r is AnyRecord => !!r);
   const fresh = records.filter(newerOrMissing);
   for (const r of fresh) writeJsonAtomic(recordPath(r), r);
-  return { restored: fresh.length, read: records.length, detail: f.detail };
+  return { restored: fresh.length, read: records.length, detail: f.detail, fetched: f.ok };
 }

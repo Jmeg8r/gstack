@@ -29,13 +29,16 @@ Invoke them by name (e.g., `/office-hours`).
 |-------|-------------|
 | `/review` | Pre-landing PR review. Finds bugs that pass CI but break in prod; lists every gate edit for gate integrity. |
 | `/deslop-shared-libs` | Find worthwhile shared-code extractions in recent work. Recommendations only. |
+| `/write-skill` | Write or improve an agent skill without bloat: edit ladder, size per level (`gstack-skill-bill`), skill-to-bin drift check, full diets with a before/after test. |
 | `/test-audit` | Sweep existing tests for low-value, implementation-coupled or duplicate tests. Report-only unless you approve a batch. |
 | `/codex` | Second opinion via OpenAI Codex. Review, challenge, or consult modes. Available outside the Codex harness. |
 | `/claude-code` | Second opinion via Claude Code. Review, challenge, or consult modes. Available outside the Claude Code harness. |
 | `/investigate` | Systematic root-cause debugging. No fixes without investigation. |
+| `/verify` | Build-and-verify loop while you code: the repo's checks plus the tests pregate selects, fix, repeat, then hand off to `/ship`. Never green on an unmapped change. |
 | `/design-review` | Live-site visual audit + fix loop with atomic commits. |
 | `/design-shotgun` | Generate multiple AI design variants, comparison board, iterate. |
 | `/design-html` | Generate production-quality Pretext-native HTML/CSS. |
+| `/design-motion` | Turn an approved design into a showcase loop: MP4 for X, website GIF, 800×500 GIF, with seam, rest and overflow checks. |
 | `/devex-review` | Live developer experience audit (TTHW measured against the real flow). |
 | `/qa` | Test browser, API, CLI, job, worker and webhook behavior; reproduce bugs, fix them and re-verify. |
 | `/qa-only` | The same surface-aware QA, reporting findings and proposed tests without changing product code or tests. |
@@ -48,6 +51,7 @@ Invoke them by name (e.g., `/office-hours`).
 |-------|-------------|
 | `/ship` | Run tests, review, gate integrity, push, open PR. Workspace-aware version queue. |
 | `/land-and-deploy` | Merge the PR, wait for CI and deploy, verify production health. |
+| `/modernize` | Bring an aging PR onto its current base and decide MODERNIZE, REWORK or CLOSE, with `git range-diff` proof before a pinned-lease push. Never closes a PR itself. |
 | `/canary` | Post-deploy monitoring loop in your Aside browser (or gstack's own when Aside is absent). |
 | `/landing-report` | Read-only dashboard for the workspace-aware ship queue. |
 | `/document-release` | Audit relevant docs before final verification on every ship; also supports standalone documentation updates. |
@@ -64,8 +68,11 @@ Invoke them by name (e.g., `/office-hours`).
 | `/learn` | Manage what gstack learned across sessions. |
 | `/retro` | Weekly retro with per-person breakdowns and shipping streaks. |
 | `/health` | Code quality dashboard (type checker, linter, tests, dead code). |
+| `/captain` | Run a crew from one controller: READY contract, merge trains, digest, approvals shapes, daily flaky pass. Also `/crew`. Templates in `captain/templates/`, team guide in `docs/captain.md`. |
 | `/benchmark` | Performance regression detection (page load, Core Web Vitals). |
-| `/benchmark-models` | Cross-model benchmark for skills (Claude, GPT, Gemini side-by-side). |
+| `/ubicloud` | Run a heavy suite, build or eval on an ephemeral 16-vCPU Ubicloud VM: TTL-named VMs with a reaper, quota preflight, hang watchdog, one committed verify per repository. |
+| `/runaway-stopper` | Find runaway Capy threads and subagents (own tokens past 500M, active past 3 days, subagent past 100M, empty wakes, review rounds past 2), stop or rotate them at a clean point, and prevent the pattern. |
+| `/benchmark-models` | Cross-model benchmark for skills (Claude, GPT, Gemini, plus particle-1 and DeepSeek V4.1 Flash through OpenRouter, side-by-side). |
 | `/eval-plan` | Preregister a paid eval (bars, arms, decoys, stop rules), dry-run it for $0, pilot three priced items, then approve the spend. |
 | `/cso` | Supported security findings with explicit coverage. Static assessment remains available without catalog profiles. Contained runtime and scanner execution needs Docker and a matching qualified profile. The runtime catalog qualifies ten images: Node 24.4.0, Bun 1.3.10, Python 3.13.4 with uv 0.8.0, Rails on Ruby 3.4.4, and PostgreSQL 17.2, each for linux/amd64 and linux/arm64. The scanner catalog qualifies twelve: gitleaks, OSV-Scanner, Schemathesis, Semgrep, Trivy and zizmor on both platforms. Without Docker, or where no profile matches (native Windows Docker, for example), `/cso` runs static assessment only. Runtime-tested bundles authenticate separate external assertions. Project-test completion remains `self_reported` because target code controls the test process; `tested` is reserved for a future target-independent completion witness. |
 | `/setup-gbrain` | Set up gbrain for cross-machine session memory sync. |
@@ -152,6 +159,9 @@ When fixing failures or preparing `/ship`, follow this order:
    only when that prose is the contract. Do not lower thresholds, increase model
    budgets, skip cases, or rejudge a failure to manufacture a pass. A
    pre-registered fixed panel is not rejudging.
+   For any measured speedup, regression or eval delta, name the limiter that
+   moved and the run-to-run variation; a gap smaller than that variation is no
+   difference.
    For policy or validation repairs, exercise the actual registered callback with
    representative native input and assert that it uses the helper’s result.
    When renderer or parser failures recur at the same boundary, verify the
@@ -272,10 +282,15 @@ Agents poll `eval:bg:*` logs for the `### gstack-detach EXIT=<code> ###` sentine
 
 ## Platform support
 
+Support tiers (full: macOS, Linux; minimal: Windows, Gemini models) are in
+[docs/support-tiers.md](docs/support-tiers.md).
+
 - **macOS** + **Linux**: full test suite supported.
-- **Windows**: the curated Windows-safe subset runs in the `windows-free-tests`
-  CI workflow across six `windows-latest` jobs, packed by Windows-measured
-  durations. Setup script (`./setup`) requires Git Bash or
+- **Windows**: minimal support; [docs/support-tiers.md](docs/support-tiers.md)
+  says what is promised. Every PR must pass the `windows-smoke` check (`./setup`,
+  the core skills start, the fastest Windows-safe tests); the curated
+  Windows-safe subset runs nightly on main in `windows-free-tests` and never
+  blocks a PR. Setup script (`./setup`) requires Git Bash or
   MSYS today; native PowerShell support is a future expansion. The `bin/gstack-paths`
   helper resolves state roots through `CLAUDE_PLUGIN_DATA` / `GSTACK_HOME` so plugin
   installs work on every platform.
@@ -303,4 +318,4 @@ Agents poll `eval:bg:*` logs for the `### gstack-detach EXIT=<code> ###` sentine
 - Every Codex run's verdict goes through `lib/outside-review-result.ts`; its reason codes live in `lib/gate-outcomes.ts`, each with a `docs/troubleshooting.md` anchor.
 - `test/module-size-ratchet.test.ts` keeps refactored owner modules at or under 800 lines (150 per function) and residual files from growing.
 - The `claude` CLI binary resolves via `lib/claude-bin.ts` (re-exported from `browse/src/claude-bin.ts` for browse internals; `Bun.which()` + `GSTACK_CLAUDE_BIN` override). Set `GSTACK_CLAUDE_BIN=wsl` plus `GSTACK_CLAUDE_BIN_ARGS='["claude"]'` to run Claude through WSL on Windows.
-- Every Bun gstack starts ignores the working directory's `.env` files and `bunfig.toml`: bun shebangs are `#!/usr/bin/env -S bun --no-env-file --config=/dev/null`, shell and skill callers pass `bun --no-env-file --config=/dev/null`, TypeScript spawns use `bunIsolationArgs()` from `lib/bun-isolation.ts`, and `bun build --compile` adds `--no-compile-autoload-dotenv --no-compile-autoload-bunfig`. `test/bun-entry-isolation.test.ts` enforces all four.
+- Every Bun gstack starts ignores the working directory's `.env` files and `bunfig.toml`: bun shebangs are `#!/usr/bin/env -S bun --no-env-file --config=/dev/null`, skill prose passes `bun --no-env-file --config=/dev/null`, shipped shell files define `GSTACK_BUN_CONFIG` with the line in `test/bun-entry-isolation.test.ts` (`NUL` when `OSTYPE` is `msys` or `cygwin` and `cygpath` is on `PATH`, where native Bun cannot open `/dev/null`, #3415) and pass `bun --no-env-file --config="${GSTACK_BUN_CONFIG:-/dev/null}"`, TypeScript spawns use `bunIsolationArgs()` from `lib/bun-isolation.ts`, and `bun build --compile` adds `--no-compile-autoload-dotenv --no-compile-autoload-bunfig`. `test/bun-entry-isolation.test.ts` enforces all four.

@@ -23,9 +23,13 @@ import * as path from 'path';
 import type { Host, TemplateContext } from './resolvers/types';
 import { HOST_PATHS } from './resolvers/types';
 import { RESOLVERS } from './resolvers/index';
-import { rewriteCarvedSectionRefs, SKILL_BYTE_CEILING, usesLazySections } from './resolvers/sections';
+import { applySectionGuards, rewriteCarvedSectionRefs, SKILL_BYTE_CEILING, usesLazySections } from './resolvers/sections';
+import { ModuleError, excludedSkillDirs, selectModules } from './modules';
+import type { ModuleFilter } from './resolvers/types';
 import { insertRuntimePreludes } from './resolvers/runtime-root';
+import { generateSharedPreambleFile, hoistsPreamble, SHARED_PREAMBLE_FILE } from './resolvers/preamble-hoist';
 import { extractVoiceTriggers } from './resolvers/voice-triggers';
+import { frontmatterList, withTriggerLead } from '../lib/skill-triggers';
 import { ALL_HOST_NAMES, resolveHostArg, getHostConfig } from '../hosts/index';
 import type { HostConfig } from './host-config';
 
@@ -51,8 +55,12 @@ export interface GenerationOptions {
   catalogMode?: 'trim' | 'full';
   explainLevel?: 'default' | 'terse';
   respectDetection?: boolean;
+  /** A detection result the caller already read; wins over respectDetection so one read serves identity and render. */
+  gbrainDetected?: boolean;
   log?: (message: string) => void;
   planMode?: boolean;
+  /** Module loadout (scripts/modules.ts selectModules); null/undefined = `full`. */
+  modules?: ModuleFilter | null;
 }
 
 interface RenderOptions {
@@ -65,11 +73,12 @@ interface RenderOptions {
   explainLevel: 'default' | 'terse';
   gbrainDetected: boolean;
   planMode: boolean;
+  modules: ModuleFilter | null;
 }
 
 export interface GeneratedArtifact {
   relativePath: string;
-  kind: 'skill' | 'section' | 'metadata' | 'openclaw' | 'index' | 'digest' | 'doctor-components' | 'asset';
+  kind: 'skill' | 'section' | 'preamble' | 'metadata' | 'openclaw' | 'index' | 'digest' | 'doctor-components' | 'asset';
   host?: Host;
 }
 
@@ -87,7 +96,7 @@ export interface GenerationResult {
 }
 
 /** Canonical generation never reads local detection state unless opted in. */
-function loadGbrainOverride(respectDetection: boolean): boolean {
+export function loadGbrainOverride(respectDetection: boolean): boolean {
   if (!respectDetection) return false;
   const stateDir = resolveStateRoot();
   try {
@@ -143,6 +152,10 @@ function parseGenerationArgs(args: string[]): GenerationOptions {
   const disabledSkills = (disabledValue ?? '').split(/[\s,]+/).filter(Boolean);
   const badDisabled = disabledSkills.find(n => !/^\/?[a-z0-9-]+$/.test(n));
   if (badDisabled) throw new Error(`--disabled-skills takes skill names (got ${JSON.stringify(badDisabled)})`);
+  const modules = selectModules({ loadout: value('--loadout'), modules: value('--modules') });
+  if (modules && (outDir === undefined || path.resolve(outDir) === ROOT)) {
+    throw new ModuleError('MODULE_SPEC_INVALID', `--${value('--modules') === undefined ? 'loadout' : 'modules'} with exclusions needs an --out-dir outside the checkout root; the committed tree is always the full render`, 'bin/gstack-modules render --host <host> --modules <spec> --out-dir <dir>');
+  }
   const installRoot = value('--install-root');
   if (installRoot !== undefined && !INSTALL_ROOT_PATTERN.test(installRoot)) {
     throw new Error(`--install-root must be an absolute path of letters, digits and . _ - + @ / (got ${JSON.stringify(installRoot)})`);
@@ -158,7 +171,19 @@ function parseGenerationArgs(args: string[]): GenerationOptions {
       : outDir !== undefined ? path.resolve(outDir) : null,
     installRoot: installRoot ?? null,
     disabledSkills,
+    modules,
   };
+}
+
+/** A section file is left out when its skill or its manifest entry is excluded. */
+function excludesSection(filter: ModuleFilter | null, skillDir: string, tmpl: string): boolean {
+  if (!filter) return false;
+  if (filter.excluded.has(`skill:${skillDir}`)) return true;
+  const file = path.basename(tmpl).replace(/\.tmpl$/, '');
+  const manifest = path.join(ROOT, skillDir, 'sections', 'manifest.json');
+  if (!fs.existsSync(manifest)) return false;
+  const entry = (JSON.parse(fs.readFileSync(manifest, 'utf-8')).sections ?? []).find((s: { file: string }) => s.file === file);
+  return entry ? filter.excluded.has(`section:${skillDir}/${entry.id}`) : false;
 }
 
 /** Install roots are spliced into shell lines unquoted, so only plain absolute paths. */
@@ -432,11 +457,28 @@ function condenseOpenAIShortDescription(description: string): string {
   return `${safe}...`;
 }
 
-function generateOpenAIYaml(displayName: string, shortDescription: string): string {
+/**
+ * The sentence Codex's skill picker inserts when a user chooses the skill.
+ * A template sets it with a `codex_default_prompt:` frontmatter key (one line,
+ * optionally quoted; `$<display name>` is Codex's own skill reference). Without
+ * the key the prompt is the generic fallback, so every skill keeps a valid entry.
+ */
+export function extractCodexDefaultPrompt(tmplContent: string): string | undefined {
+  const fmEnd = tmplContent.startsWith('---\n') ? tmplContent.indexOf('\n---', 4) : -1;
+  if (fmEnd === -1) return undefined;
+  const match = tmplContent.slice(4, fmEnd).match(/^codex_default_prompt:[ \t]*(.+?)[ \t]*$/m);
+  if (!match) return undefined;
+  const raw = match[1];
+  const quoted = raw.match(/^"(.*)"$/) || raw.match(/^'(.*)'$/);
+  const value = quoted ? quoted[1] : raw;
+  return value.length > 0 ? value : undefined;
+}
+
+export function generateOpenAIYaml(displayName: string, shortDescription: string, defaultPrompt?: string): string {
   return `interface:
   display_name: ${JSON.stringify(displayName)}
   short_description: ${JSON.stringify(shortDescription)}
-  default_prompt: ${JSON.stringify(`Use ${displayName} for this task.`)}
+  default_prompt: ${JSON.stringify(defaultPrompt ?? `Use ${displayName} for this task.`)}
 policy:
   allow_implicit_invocation: true
 `;
@@ -444,13 +486,21 @@ policy:
 
 /**
  * Transform frontmatter for external hosts.
- * Claude: strips `sensitive:` field (only Factory uses it).
+ * Claude: strips template-only fields, adds disable-model-invocation to manual_only skills.
  * Codex: keeps name + description only, enforces 1024-char limit.
  * Factory: keeps name + description + user-invocable, conditionally adds disable-model-invocation.
  */
 function transformFrontmatter(content: string, host: Host): string {
   const hostConfig = getHostConfig(host);
   const fm = hostConfig.frontmatter;
+  const templateFrontmatter = content.startsWith('---\n') ? content.slice(4, content.indexOf('\n---', 4)) : '';
+  const escape = (s: unknown) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const conditionalLines = (fm.conditionalFields || [])
+    .filter(rule => Object.entries(rule.if).every(([k, v]) => new RegExp(`^${escape(k)}:[ \\t]*${escape(v)}[ \\t]*$`, 'm').test(templateFrontmatter)))
+    .flatMap(rule => Object.entries(rule.add))
+    .filter(([key]) => !new RegExp(`^${escape(key)}:`, 'm').test(templateFrontmatter))
+    .map(([key, value]) => `${key}: ${value}\n`)
+    .join('');
 
   if (fm.mode === 'denylist') {
     // Denylist mode: strip listed fields, keep everything else
@@ -461,7 +511,7 @@ function transformFrontmatter(content: string, host: Host): string {
         content = content.replace(new RegExp(`^${field}:\\s*.*\\n`, 'm'), '');
       }
     }
-    return content;
+    return conditionalLines ? content.replace('\n---\n', () => `\n${conditionalLines}---\n`) : content;
   }
 
   // Allowlist mode: reconstruct frontmatter with only allowed fields
@@ -471,7 +521,8 @@ function transformFrontmatter(content: string, host: Host): string {
   if (fmEnd === -1) return content;
   const frontmatter = content.slice(fmStart + 4, fmEnd);
   const body = content.slice(fmEnd + 4);
-  const { name, description } = extractNameAndDescription(content);
+  const { name, description: fullDescription } = extractNameAndDescription(content);
+  const description = fm.descriptionLead ? withTriggerLead(fullDescription, frontmatterList(content, 'triggers'), fm.descriptionLead) : fullDescription;
 
   // Description limit enforcement
   if (fm.descriptionLimit) {
@@ -503,19 +554,7 @@ function transformFrontmatter(content: string, host: Host): string {
     }
   }
 
-  // Add conditional fields
-  if (fm.conditionalFields) {
-    for (const rule of fm.conditionalFields) {
-      const match = Object.entries(rule.if).every(([k, v]) =>
-        new RegExp(`^${k}:\\s*${v}`, 'm').test(frontmatter)
-      );
-      if (match) {
-        for (const [key, value] of Object.entries(rule.add)) {
-          newFm += `${key}: ${value}\n`;
-        }
-      }
-    }
-  }
+  newFm += conditionalLines;
 
   // Preserve additional keepFields beyond name and description
   if (fm.keepFields) {
@@ -639,7 +678,7 @@ function resolvePlaceholders(
   // section generation so both paths get the same gbrain-aware behavior.
   const suppressed = effectiveSuppressedResolvers(hostConfig, options);
   const onePass = (input: string): string =>
-    input.replace(/\{\{(\w+(?::[^}]+)?)\}\}/g, (_match, fullKey) => {
+    applySectionGuards(input, ctx).replace(/\{\{(\w+(?::[^}]+)?)\}\}/g, (_match, fullKey) => {
       const parts = fullKey.split(':');
       const resolverName = parts[0];
       const args = parts.slice(1);
@@ -695,6 +734,7 @@ function buildContext(
   return {
     skillName, tmplPath, benefitsFrom, host, paths: HOST_PATHS[host],
     preambleTier, model: options.model ?? getHostConfig(host).defaultModel, interactive, explainLevel: options.explainLevel, installRoot: options.installRoot, planMode: options.planMode,
+    ...(options.modules ? { modules: options.modules } : {}),
   };
 }
 
@@ -748,16 +788,25 @@ function processExternalHost(
   // section cross-references get the same per-host treatment as SKILL.md).
   result = applyHostRewrites(result, hostConfig);
 
-  // Config-driven: generate metadata (e.g., openai.yaml for Codex)
+  // Config-driven: generate metadata (e.g., openai.yaml for Codex). The
+  // default_prompt comes from the template's codex_default_prompt: key when set.
   const metadata = hostConfig.generation.generateMetadata && !symlinkLoop ? {
     outputPath: path.join(outputDir, 'agents', 'openai.yaml'),
-    content: generateOpenAIYaml(name, condenseOpenAIShortDescription(extractedDescription)),
+    content: generateOpenAIYaml(name, condenseOpenAIShortDescription(extractedDescription), extractCodexDefaultPrompt(tmplContent)),
   } : undefined;
 
   return { content: result, outputPath, symlinkLoop, metadata };
 }
 
-function processTemplate(tmplPath: string, host: Host, options: RenderOptions): { outputPath: string; content: string; symlinkLoop?: boolean; metadata?: { outputPath: string; content: string } } {
+/** sections/preamble.md: the shared preamble with the same host rewrites as a section file. */
+function renderSharedPreamble(ctx: TemplateContext, hostConfig: HostConfig, options: RenderOptions): string {
+  let content = generateSharedPreambleFile(ctx);
+  content = ctx.host === 'claude' ? rewriteSectionBase(content, options.contentLinkRoot) : applyHostRewrites(content, hostConfig);
+  content = rewriteInstallRoot(insertRuntimePreludes(rewriteCarvedSectionRefs(content, ctx), ctx), hostConfig, options.installRoot);
+  return GENERATED_HEADER.replace('{{SOURCE}}', 'scripts/resolvers/preamble-hoist.ts') + content;
+}
+
+function processTemplate(tmplPath: string, host: Host, options: RenderOptions): { outputPath: string; content: string; symlinkLoop?: boolean; metadata?: { outputPath: string; content: string }; preamble?: { outputPath: string; content: string } } {
   // Normalize to LF at the entry point. Templates may have CRLF on disk when
   // checked out on Windows with core.autocrlf=true. Downstream regexes
   // (processVoiceTriggers, transformFrontmatter) hardcode \n, so without
@@ -800,7 +849,7 @@ function processTemplate(tmplPath: string, host: Host, options: RenderOptions): 
   // metadata gets the updated description with voice triggers included.
   const postProcessDescription = extractNameAndDescription(content).description;
 
-  // For Claude: strip sensitive: field (only Factory uses it)
+  // For Claude: strip template-only fields, add conditional fields
   // For external hosts: route output, transform frontmatter, rewrite paths
   let symlinkLoop = false;
   let metadata: { outputPath: string; content: string } | undefined;
@@ -815,7 +864,7 @@ function processTemplate(tmplPath: string, host: Host, options: RenderOptions): 
   }
 
   // Prepend generated header (after frontmatter)
-  const header = GENERATED_HEADER.replace('{{SOURCE}}', path.basename(tmplPath));
+  const header = GENERATED_HEADER.replace('{{SOURCE}}', path.basename(tmplPath)) + (options.modules ? `<!-- loadout: ${options.modules.name} -->\n` : '');
   const fmEnd = content.indexOf('---', content.indexOf('---') + 3);
   if (fmEnd !== -1) {
     const insertAt = content.indexOf('\n', fmEnd) + 1;
@@ -832,10 +881,13 @@ function processTemplate(tmplPath: string, host: Host, options: RenderOptions): 
 
   // --out-dir: repoint section-base paths to the out-dir (no-op otherwise).
   if (host === 'claude') content = rewriteSectionBase(content, options.contentLinkRoot);
-  if (skillDir === '' || skillDir === '.') content = omitDisabledSkills(content, options.disabledSkills);
+  if (skillDir === '' || skillDir === '.') content = omitDisabledSkills(content, [...options.disabledSkills, ...excludedSkillDirs(options.modules)]);
   content = rewriteInstallRoot(insertRuntimePreludes(rewriteCarvedSectionRefs(content, ctx), ctx), currentHostConfig, options.installRoot);
 
-  return { outputPath, content, symlinkLoop, metadata };
+  const preamble = hoistsPreamble(ctx) && tmplContent.includes('{{PREAMBLE}}') && !effectiveSuppressedResolvers(currentHostConfig, options).has('PREAMBLE')
+    ? { outputPath: path.join(path.dirname(outputPath), 'sections', SHARED_PREAMBLE_FILE), content: renderSharedPreamble(ctx, currentHostConfig, options) }
+    : undefined;
+  return { outputPath, content, symlinkLoop, metadata, preamble };
 }
 
 /** autoplan/DRIVER.md (field wave item 13): one host-neutral render of autoplan/DRIVER.md.tmpl through the same resolvers. */
@@ -845,6 +897,15 @@ export function renderAutoplanDriver(options: RenderOptions): string {
   const tmpl = fs.readFileSync(tmplPath, 'utf-8');
   const ctx = buildContext(tmpl, tmplPath, 'claude', options, 'autoplan');
   return GENERATED_HEADER.replace('{{SOURCE}}', `${AUTOPLAN_DRIVER_RELPATH}.tmpl`) + resolvePlaceholders(tmpl, ctx, getHostConfig('claude'), `${AUTOPLAN_DRIVER_RELPATH}.tmpl`, options);
+}
+
+/** ship/DRIVER.md (GSTA-167 PR 5): the compact /ship entry for a parent agent, rendered the same way. */
+export const SHIP_DRIVER_RELPATH = 'ship/DRIVER.md';
+export function renderShipDriver(options: RenderOptions): string {
+  const tmplPath = path.join(ROOT, `${SHIP_DRIVER_RELPATH}.tmpl`);
+  const tmpl = fs.readFileSync(tmplPath, 'utf-8');
+  const ctx = buildContext(tmpl, tmplPath, 'claude', options, 'ship');
+  return GENERATED_HEADER.replace('{{SOURCE}}', `${SHIP_DRIVER_RELPATH}.tmpl`) + resolvePlaceholders(tmpl, ctx, getHostConfig('claude'), `${SHIP_DRIVER_RELPATH}.tmpl`, options);
 }
 
 /**
@@ -926,8 +987,9 @@ export async function runGeneration(settings: GenerationOptions = {}): Promise<G
     model: settings.model ?? null,
     catalogMode: settings.catalogMode ?? 'trim',
     explainLevel: settings.explainLevel ?? 'default',
-    gbrainDetected: loadGbrainOverride(settings.respectDetection ?? false),
+    gbrainDetected: settings.gbrainDetected ?? loadGbrainOverride(settings.respectDetection ?? false),
     planMode: settings.planMode ?? true,
+    modules: settings.modules ?? null,
   };
   const hosts = settings.host === 'all' ? ALL_HOST_NAMES as Host[] : [settings.host ?? 'claude'];
   const log = settings.log ?? (() => {});
@@ -993,6 +1055,7 @@ export async function runGeneration(settings: GenerationOptions = {}): Promise<G
       for (const template of templates) {
         const skillDir = path.dirname(template.tmpl);
         if (!includesSkill(hostConfig, skillDir)) continue;
+        if (options.modules?.excluded.has(`skill:${skillDir === '.' ? 'gstack' : skillDir}`)) continue;
         const result = processTemplate(path.join(ROOT, template.tmpl), host, options);
         const relativePath = rel(result.outputPath);
         if (host !== 'claude') renderedNames.add(path.basename(path.dirname(result.outputPath)));
@@ -1003,6 +1066,7 @@ export async function runGeneration(settings: GenerationOptions = {}): Promise<G
         }
         emit(result.outputPath, result.content, 'skill', host);
         if (result.metadata) emit(result.metadata.outputPath, result.metadata.content, 'metadata', host);
+        if (result.preamble) emit(result.preamble.outputPath, result.preamble.content, 'preamble', host);
         if (skillDir === 'qa') {
           const report = fs.readFileSync(path.join(ROOT, 'qa', 'templates', 'functional-report-template.md'), 'utf-8');
           emit(path.join(path.dirname(result.outputPath), 'templates', 'functional-report-template.md'),
@@ -1019,6 +1083,7 @@ export async function runGeneration(settings: GenerationOptions = {}): Promise<G
 
       for (const section of sections) {
         if (!includesSkill(hostConfig, section.skillDir) || !usesLazySections(host, section.skillDir)) continue;
+        if (excludesSection(options.modules, section.skillDir, section.tmpl)) continue;
         const result = processSectionTemplate(path.join(ROOT, section.tmpl), section.skillDir, host, options);
         emit(result.outputPath, result.content, 'section', host);
         tokenBudget.push({ skill: rel(result.outputPath), lines: result.content.split('\n').length, tokens: Math.round(result.content.length / 4) });
@@ -1033,6 +1098,9 @@ export async function runGeneration(settings: GenerationOptions = {}): Promise<G
       }
       if (host === 'claude' && includesSkill(hostConfig, 'autoplan') && templates.some(t => t.tmpl === 'autoplan/SKILL.md.tmpl')) {
         emit(path.join(options.outputRoot, AUTOPLAN_DRIVER_RELPATH), renderAutoplanDriver(options), 'asset', host);
+      }
+      if (host === 'claude' && includesSkill(hostConfig, 'ship') && templates.some(t => t.tmpl === 'ship/SKILL.md.tmpl')) {
+        emit(path.join(options.outputRoot, SHIP_DRIVER_RELPATH), renderShipDriver(options), 'asset', host);
       }
 
       if (host === 'openclaw') {
@@ -1095,7 +1163,7 @@ export async function runGeneration(settings: GenerationOptions = {}): Promise<G
   // Shared artifacts are awaited in both modes. A failure must reach the CLI
   // exit code, never disappear in a fire-and-forget auxiliary writer.
   try {
-    const index = await generateLlmsTxt();
+    const index = await generateLlmsTxt({ excludedSkills: excludedSkillDirs(options.modules) });
     emit(path.join(options.outputRoot, 'gstack', 'llms.txt'), index.content, 'index');
     for (const warning of index.warnings) diagnostics.push({ kind: 'warning', message: `[gen-llms-txt] ${warning}` });
   } catch (error) {
@@ -1140,6 +1208,10 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
     }
     return result.exitCode;
   } catch (error) {
+    if (error instanceof ModuleError) {
+      console.error(`${error.code}: ${error.message}`);
+      return 2;
+    }
     console.error(`ERROR: ${(error as Error).message}`);
     return 1;
   }

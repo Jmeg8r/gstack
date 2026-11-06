@@ -18,6 +18,7 @@
 import { afterEach, beforeAll } from 'bun:test';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { CAPY_LAUNCH_MARKERS } from './scripts/lib/shard-engine';
 
 // State-root hermeticity (docs/state-root.md). Tests isolate state with
 // GSTACK_HOME, but GSTACK_STATE_ROOT and GSTACK_STATE_DIR outrank or join it
@@ -32,6 +33,20 @@ for (const name of ['GSTACK_STATE_ROOT', 'GSTACK_STATE_DIR']) {
   if (process.env[name] === undefined) continue;
   delete process.env[name];
   process.stderr.write(`test-setup: stripped inherited ${name}; tests isolate state via GSTACK_HOME\n`);
+}
+// The Capy installer's launch markers (GSTA-99, GSTA-104): a focused `bun test`
+// run from a shell that sourced the launch file would hand every product child
+// an unattended Capy session it never set up. The shard engine strips the same
+// list for the lanes; this reaches direct runs too.
+for (const name of CAPY_LAUNCH_MARKERS) delete process.env[name];
+// The variables gbrain reads to pick a brain (#3466). Tests spawn bins with
+// { ...process.env, HOME: <tmp> }; with no gbrain config under the temp HOME,
+// buildGbrainEnv passes an exported URL through and a real gbrain on PATH
+// writes test pages and sources into the developer's live brain.
+for (const name of ['GBRAIN_DATABASE_URL', 'GBRAIN_DIRECT_DATABASE_URL', 'DATABASE_URL', 'GBRAIN_HOME']) {
+  if (process.env[name] === undefined) continue;
+  delete process.env[name];
+  process.stderr.write(`test-setup: stripped inherited ${name}; tests must not reach a live gbrain\n`);
 }
 process.env.GSTACK_TEST_LEGACY_ROOT = path.join(os.tmpdir(), `gstack-test-legacy-root-${process.pid}-${Date.now()}-unused`);
 // Workflow leases (bin/gstack-lease) default to the installation's git dir;

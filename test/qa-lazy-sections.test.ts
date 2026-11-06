@@ -161,8 +161,8 @@ describe('QA-only cross-host lazy rendering', () => {
         expect(fs.readFileSync(path.join(rendered, dir, 'SKILL.md'), 'utf8')).not.toContain(body.split('\n').slice(2).join('\n').trim());
       }
       const outside = generated.artifacts.filter(artifact => artifact.host === host.name && artifact.kind === 'section'
-        && !/^(?:qa|qa-only|ship|plan-ceo-review|office-hours)\//.test(artifact.relativePath)
-        && !/\/gstack-(?:qa(?:-only)?|ship|plan-ceo-review|office-hours)\//.test(artifact.relativePath));
+        && !/^(?:qa|qa-only|ship|plan-ceo-review|office-hours|design-review)\//.test(artifact.relativePath)
+        && !/\/gstack-(?:qa(?:-only)?|ship|plan-ceo-review|office-hours|design-review)\//.test(artifact.relativePath));
       expect(outside.length > 0).toBe(host.name === 'claude');
       // C4: ship is carved on every host; external pointers are relative to the installed skill.
       const ctx = context(host.name, 'ship');
@@ -570,7 +570,8 @@ describe('installed QA pointers', () => {
               'set -e', `IS_WINDOWS=${copy ? 1 : 0}`, `SKILL_PREFIX=${prefix}`, 'QUIET=1',
               '_FOREIGN_SKIPPED_ENTRIES=()', '_BACKED_UP_SKILL_MDS=()', '_SKILL_BACKUP_ROOT="$HOME/backups"',
               'GSTACK_USER_RENDER_DIR="$HOME/absent-render"',
-              'GSTACK_STATE_ROOT="$HOME/.gstack"', '_SKILL_COPIES_FILE="$GSTACK_STATE_ROOT/skill-copies.tsv"', helpers,
+              'GSTACK_STATE_ROOT="$HOME/.gstack"', '_SKILL_COPIES_FILE="$GSTACK_STATE_ROOT/skill-copies.tsv"',
+              `. "${path.join(ROOT, 'bin/gstack-skill-name.sh')}"`, helpers,
               'log() { :; }', '_browser_hint() { :; }', 'bun_cmd() { :; }', install,
             ].join('\n');
             const runInstall = () => runBashScript(script, {

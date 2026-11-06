@@ -1,6 +1,6 @@
 {
   "name": "gstack",
-  "version": "1.91.226",
+  "version": "1.96.0",
   "description": "Garry's Stack — Claude Code skills + fast headless browser. One repo, one install, entire AI engineering workflow.",
   "license": "MIT",
   "type": "module",
@@ -63,12 +63,13 @@
     "slop": "npx slop-scan scan . 2>/dev/null || echo 'slop-scan not available (install with: npm i -g slop-scan)'",
     "slop:diff": "bun run scripts/slop-diff.ts",
     "test:quick": "bun run scripts/test-free-shards.ts --quick",
-    "test:pr": "EVALS_JOBS=${EVALS_JOBS:-2} bun run scripts/test-paid-shards.ts --tier gate --profile pr",
+    "test:pr": "EVALS_JOBS=${EVALS_JOBS:-2} EVALS_SCREEN_POLICY=${EVALS_SCREEN_POLICY:-narrow} bun run scripts/test-paid-shards.ts --tier gate --profile pr",
     "test:release": "EVALS_ALL=1 EVALS_FRESH=1 EVALS_CACHE_PURPOSE=release bun run scripts/test-paid-shards.ts --tier gate --profile full && EVALS_ALL=1 EVALS_FRESH=1 EVALS_CACHE_PURPOSE=release bun run scripts/test-paid-shards.ts --tier periodic --profile full",
     "eval:bg:pr": "bun run scripts/eval-bg.ts pr",
     "eval:bg:release": "bun run scripts/eval-bg.ts release"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.78.0",
     "@huggingface/transformers": "^4.3.1",
     "@ngrok/ngrok": "^1.7.0",
     "cross-spawn": "^7.0.6",
@@ -76,9 +77,11 @@
     "html-to-docx": "1.8.0",
     "html-to-vdom": "0.7.0",
     "marked": "^18.1.1",
-    "playwright": "^1.62.1",
+    "playwright": "^1.64.1",
     "sharp": "^0.35.4",
-    "socks": "^2.8.10"
+    "socks": "^2.8.10",
+    "xterm": "^5.3.0",
+    "xterm-addon-fit": "^0.8.0"
   },
   "engines": {
     "bun": ">=1.4.2"
@@ -95,24 +98,23 @@
   ],
   "devDependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.2.141",
-    "@anthropic-ai/sdk": "^0.78.0",
     "@types/bun": "1.4.3",
     "prettier": "3.9.10",
-    "typescript": "7.0.2",
-    "xterm": "^5.3.0",
-    "xterm-addon-fit": "^0.8.0"
+    "typescript": "7.0.2"
   },
   "overrides": {
-    "@modelcontextprotocol/sdk": "1.31.0",
+    "@hono/node-server": "2.1.6",
+    "@modelcontextprotocol/sdk": "1.32.0",
     "adm-zip": "^0.6.1",
-    "fast-uri": "3.1.8",
+    "fast-uri": "3.1.9",
     "hono": "4.13.13",
     "image-size": "2.0.4",
-    "ip-address": "10.7.3",
+    "ip-address": "10.7.4",
     "proxy-addr": "2.0.8",
+    "qs": "6.16.2",
     "sharp": "0.35.5"
   },
   "patchedDependencies": {
-    "playwright-core@1.62.1": "patches/playwright-core@1.62.1.patch"
+    "playwright-core@1.64.1": "patches/playwright-core@1.64.1.patch"
   }
 }

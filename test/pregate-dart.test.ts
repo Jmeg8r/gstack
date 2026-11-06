@@ -533,8 +533,9 @@ describe('gstack-pregate on a Dart repo with a committed policy', () => {
     for (const tool of ['fvm', 'dart', 'flutter']) fs.rmSync(path.join(bin, tool));
     const missing = run(repo, env);
     expect(missing.status).not.toBe(EXIT.ok);
-    expect(missing.out).toMatch(/^tests {6}lanes {5}incomplete .*not on PATH: dart/m);
-    expect(missing.out).toContain('fix: install dart (or fvm, which this repo pins) and rerun');
+    expect(missing.out).toMatch(/^tests {6}lanes {5}incomplete .*not on PATH: dart.*\(PREGATE_ENVIRONMENT\)/m);
+    expect(missing.out).toContain('fix: install dart (or fvm, which this repo pins) on this machine and rerun, or run the lane remotely; the diff is not at fault');
+    expect(missing.out).toContain('environment: missing-binary — not on PATH: dart');
   }, 30_000);
 
   // Value: protects=without an fvm pin the missing-SDK fix names only the SDK, never fvm; fails_when=fvmPinnedFor always reports a pin
@@ -546,14 +547,15 @@ describe('gstack-pregate on a Dart repo with a committed policy', () => {
     commit(repo, { 'packages/core/lib/core.dart': 'int one() => 2;\n' });
     const r = run(repo, { PATH: bin });
     expect(r.status).not.toBe(EXIT.ok);
-    expect(r.out).toMatch(/^tests {6}lanes {5}incomplete .*not on PATH: dart/m);
-    expect(r.out).toContain('fix: install dart and rerun');
+    expect(r.out).toMatch(/^tests {6}lanes {5}incomplete .*not on PATH: dart.*\(PREGATE_ENVIRONMENT\)/m);
+    expect(r.out).toContain('fix: install dart on this machine and rerun, or run the lane remotely; the diff is not at fault');
     expect(r.out).not.toContain('(or fvm');
   }, 30_000);
 
   // Value: protects=a touched device test (integration_test/) is never run locally, fails with a fix naming .gstack/pregate.json and the
-  //   `[]` remedy, and that documented declaration clears it; fails_when=the docs' remedy stops working or the fix loses the device hint;
-  //   why_new=device tests were only checked at isTestFile; seam=none; no_claim=CI running the device test
+  //   `[]` remedy, and that documented declaration clears it once it is on the base (a branch-only [] under --policy-from head is refused,
+  //   GST-419); fails_when=the docs' remedy stops working, the fix loses the device hint, or a head [] runs; why_new=device tests were only
+  //   checked at isTestFile; seam=none; no_claim=CI running the device test
   test('a touched integration test (root or nested package) has no local lane until declared []', () => {
     const repo = dartRepo();
     commit(repo, { 'integration_test/app_test.dart': "import 'package:integration_test/integration_test.dart';\nvoid main() {}\n" });
@@ -569,7 +571,14 @@ describe('gstack-pregate on a Dart repo with a committed policy', () => {
     expect(stuck.out).toContain('FAIL lanes — packages/core/integration_test/core_it_test.dart has no test lane');
     expect(stuck.out).toContain('in .gstack/pregate.json; pregate does not run device tests, so declare "**/integration_test/**": []');
     commit(repo, { '.gstack/pregate.json': JSON.stringify({ ...DART_PREGATE, dependencies: { ...DART_PREGATE.dependencies, '**/integration_test/**': [] } }) + '\n' });
-    const declared = run(repo, env, ['--policy-from', 'head']);
+    const headOnly = run(repo, env, ['--policy-from', 'head']);
+    expect(headOnly.status).toBe(EXIT.refused);
+    expect(headOnly.err).toContain('a [] declaration must land on main first');
+    expect(headOnly.err).toContain('(PREGATE_HEAD_POLICY_LOOSENS');
+    repo.git('push', '-q', 'origin', 'HEAD:main');
+    repo.git('fetch', '-q', 'origin');
+    commit(repo, { 'integration_test/app_test.dart': "import 'package:integration_test/integration_test.dart';\nvoid main() {  }\n", 'packages/core/integration_test/core_it_test.dart': "void main() { }\n" });
+    const declared = run(repo, env);
     expect(declared.status).toBe(EXIT.ok);
     expect(declared.out).not.toContain('has no test lane');
     expect(declared.out).toContain('nothing touched selects a test');
@@ -612,7 +621,8 @@ describe('gstack-pregate on a Dart repo with a committed policy', () => {
     const r = run(repo, env);
     expect(r.status).not.toBe(EXIT.ok);
     expect(r.out).toMatch(/^tests {6}lanes {5}incomplete .*2 tests ran in 2 file\(s\), exit 0; no test runner detected for 1 of 3 selected file\(s\): packages\/ui\/test\/ui_test\.dart; not on PATH: flutter/m);
-    expect(r.out).toContain('fix: install flutter and rerun');
+    expect(r.out).toContain('fix: install flutter on this machine and rerun, or run the lane remotely; the diff is not at fault');
+    expect(r.out).toContain('(PREGATE_ENVIRONMENT)');
     expect(fs.readFileSync(/log: (\S+)/.exec(r.out)![1]!, 'utf8')).toContain('ran in core: test/core_test.dart');
   }, 30_000);
 

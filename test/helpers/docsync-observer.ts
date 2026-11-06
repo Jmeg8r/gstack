@@ -5,14 +5,33 @@ import { observeQAWrites, type QAWriteObservation } from './qa-functional-observ
 import { nativeCalls } from './qa-checkpoint-evidence';
 import type { SkillTestResult } from './session-runner';
 import { DOC_PATH, type DocsScenario, type fixtureDocs } from './docsync-fixture';
-import { docsNativeInterface } from './docsync-interface';
+import { docsNativeInterface, DOCS_AUDIT_RECORD, DOCS_AUDIT_RECORD_PATHS, DOCS_AUDIT_RESET, DOCS_TMP_EXCLUDE, docsCapsCommand } from './docsync-interface';
 import { sliceBetween } from './skill-fixture';
 import { readOnlyCommandAllowed } from './read-only-commands';
 
 export { docsNativeInterface };
 
 export async function observeDocsWrites(fixture: ReturnType<typeof fixtureDocs>) {
-  return observeQAWrites(fixture.repo, { atomicTargets: [DOC_PATH] });
+  return observeQAWrites(fixture.repo, { atomicTargets: [DOC_PATH, DOCS_AUDIT_RECORD] });
+}
+
+/** Temp files the Write/Edit tool renamed onto the receipt record (`<record>.tmp.<pid>.<12 hex>`): created, written and closed
+ *  under the record's directory, then moved onto the record by a cookie-paired MOVED_FROM/MOVED_TO, and not left behind. */
+function docsRecordSources(observation: QAWriteObservation): Set<string> {
+  const sources = new Set<string>();
+  const events = observation.events;
+  for (const [index, event] of events.entries()) {
+    if (event.path !== DOCS_AUDIT_RECORD || event.mask !== 0x80 || !Number.isInteger(event.cookie) || event.cookie <= 0) continue;
+    const pair = events.flatMap((candidate, at) => candidate.cookie === event.cookie ? [at] : []);
+    if (pair.length !== 2 || pair[1] !== index) continue;
+    const source = events[pair[0]];
+    if (source.mask !== 0x40 || !source.path.startsWith(DOCS_AUDIT_RECORD + '.tmp.') || !/^\.tmp\.[1-9]\d*\.[0-9a-f]{12}$/.test(source.path.slice(DOCS_AUDIT_RECORD.length))
+      || Object.hasOwn(observation.before, source.path) || Object.hasOwn(observation.after, source.path) || observation.changed.includes(source.path)) continue;
+    const lifecycle = events.filter(candidate => candidate.path === source.path);
+    if (lifecycle.at(-1) !== source || lifecycle.some(candidate => candidate !== source && (candidate.cookie !== 0 || ![0x100, 0x2, 0x4, 0x8].includes(candidate.mask)))) continue;
+    sources.add(source.path);
+  }
+  return sources;
 }
 
 type DocsWriteContext = {
@@ -136,8 +155,9 @@ export function docsWriteFailures(observation: QAWriteObservation, allowed: stri
   const failures = [...observation.failures];
   if (!observation.complete) failures.push('incomplete docs write observation');
   const atomicSources = docsAtomicSources(observation, allowed, context);
+  const recordSources = docsRecordSources(observation);
   for (const file of new Set([...observation.events.map(e => e.path), ...observation.changed])) {
-    if (file !== '.qa-state/.observer-check' && !allowed.includes(file) && !atomicSources.has(file))
+    if (file !== '.qa-state/.observer-check' && !allowed.includes(file) && !DOCS_AUDIT_RECORD_PATHS.includes(file) && !atomicSources.has(file) && !recordSources.has(file))
       failures.push(`forbidden docs write: ${file}${atomicSources.deniedAt && path.dirname(file) === path.dirname(DOC_PATH) ? ` (atomic replacement unproven at ${atomicSources.deniedAt})` : ''}`);
     if (allowed.includes(file) && observation.before[file] && observation.after[file] &&
         observation.before[file].split(':')[0] !== observation.after[file].split(':')[0]) failures.push(`document mode changed: ${file}`);
@@ -202,6 +222,7 @@ Keep artifacts concise: update the invocation record in place with ids, counts, 
 const DOCS_READ_COMMANDS = ['pwd', 'ls', 'cat', 'sha256sum', 'stat'];
 const DOCS_GIT_READS = ['status', 'diff', 'show', 'log', 'ls-files', 'ls-tree', 'check-ignore', 'rev-parse', 'merge-base', 'hash-object'];
 const DOCS_DESCRIBE_FLAGS = /^(?:--tags|--always|--exact-match|--abbrev=\d+)$/;
+const DOCS_BRANCH_LIST_FLAGS = /^(?:-[arlv]+|--(?:all|remotes|list|verbose|show-current|no-color|no-abbrev))$/;
 const DOCS_SAFE_GIT_CONFIG = /^(?:core\.pager=cat|core\.quotepath=(?:true|false|on|off)|color\.[a-z.]+=(?:true|false|never|always|auto))$/i;
 
 /**
@@ -230,10 +251,17 @@ function unwrapHarmlessRead(text: string, fixture: ReturnType<typeof fixtureDocs
 export function docsCommandAllowed(command: string, fixture: ReturnType<typeof fixtureDocs>, scripts: string[] = []): boolean {
   const text = command.trim();
   if (docsPreambleCommands(fixture).some(block => block.trim() === text)) return true;
+  // The section prints the cap gate with the ~/.claude/skills/gstack prefix; in the fixture HOME is fixture.home, so that form names the same installed binary.
+  if (text === DOCS_TMP_EXCLUDE || text === DOCS_AUDIT_RESET || text === docsCapsCommand(fixture.skills.split(path.sep).join('/')) ||
+    (text === docsCapsCommand('~/.claude/skills/gstack') && fixture.skills === path.join(fixture.home, '.claude/skills/gstack'))) return true;
   if (readOnlyCommandAllowed(text, docsReadOnlyScope(fixture)) || docsComposedReadAllowed(text, fixture)) return true;
   const insert = /^cat (['"]?)([^\s'"]+)\1 >> (['"]?)([^\s'"]+)\3$/.exec(text);
   if (insert) return [insert[2], insert[4]].every(file => path.isAbsolute(file) && /\.md$/i.test(file) &&
     !/[\x00-\x1f\x7f;&|<>`$\\()*?\[\]{}~#]/.test(file) && docsPrivateArtifact(file, fixture, scripts));
+  // The interface lets a private artifact live "in a new directory you create there" (under the home), and snapshot --out
+  // does not create its parent (gate 41817566885: the parent ran `mkdir -p <home>/ship2` before its snapshot).
+  const directory = /^mkdir (?:-p )?(['"]?)([^\s'"]+)\1$/.exec(text);
+  if (directory) return docsPrivateDirectory(directory[2]!, fixture);
   // Harmless wrappers are accepted on read-only commands only; lifecycle and
   // script calls must stay literal so their failures are not suppressed.
   const unwrapped = unwrapHarmlessRead(text, fixture);
@@ -298,9 +326,15 @@ function docsUnrollLoops(text: string): string | null {
 
 /**
  * A read-only line the shared grammar cannot see whole: loops are checked as
- * their unrolled passes, and each declared Git read joined to grammar reads
- * (never after a cd, never fed by a pipe) is checked literally and then stands
- * in the line as a neutral read for the grammar.
+ * their unrolled passes, and each declared Git read or installed candidate
+ * --help joined to grammar reads (never after a cd, never fed by a pipe) is
+ * checked literally and then stands in the line as a neutral read for the grammar.
+ * The candidate's --help prints its usage and returns before it touches Git or a
+ * file (bin/gstack-docs-candidate main), so joining it reads nothing more (gates
+ * 40600731931 and 40627127462, screen 40558235014: the parent ended a line of reads with it).
+ * A declared read command given --help prints its own usage instead of reading, and its
+ * operands stay checked as reads (screens 40822033640 and 40815828320, gate 40809051510:
+ * the parent joined `cat <candidate> --help 2>&1 | head -N`, which printed cat's usage).
  */
 function docsComposedReadAllowed(text: string, fixture: ReturnType<typeof fixtureDocs>): boolean {
   const line = docsUnrollLoops(text);
@@ -308,13 +342,17 @@ function docsComposedReadAllowed(text: string, fixture: ReturnType<typeof fixtur
   if (line !== text && readOnlyCommandAllowed(line, docsReadOnlyScope(fixture))) return true;
   const segments = docsTopLevelSegments(line);
   if (!segments) return false;
+  const candidate = path.join(fixture.skills, 'bin/gstack-docs-candidate').split(path.sep).join('/');
   const commands = segments.map(segment => line.slice(segment.start, segment.end).trim());
-  const git = commands.flatMap((command, index) => /^git(?:\s|$)/.test(command) ? [index] : []);
-  if (!git.length || commands.some(command => /^cd(?:\s|$)/.test(command))) return false;
+  const readHelp = (command: string) => DOCS_READ_COMMANDS.includes(command.split(/\s+/)[0]!) && /\s--help(?:\s|$)/.test(command);
+  const declared = commands.flatMap((command, index) => /^git(?:\s|$)/.test(command) || command.startsWith(`${candidate} `) || readHelp(command) ? [index] : []);
+  if (!declared.length || commands.some(command => /^cd(?:\s|$)/.test(command))) return false;
   let neutral = line;
-  for (const index of git.reverse()) {
+  for (const index of declared.reverse()) {
     const read = unwrapHarmlessRead(commands[index]!, fixture);
-    if (segments[index - 1]?.op === '|' || read === null || !/^git\s/.test(read) || !literalDocsCommandAllowed(read, fixture, [])) return false;
+    const help = read !== null && /^(?:(?:snapshot|compare) )?--help$/.test(read.slice(candidate.length + 1));
+    if (segments[index - 1]?.op === '|' || read === null || !(/^git\s/.test(read) || (read.startsWith(`${candidate} `) && help) || readHelp(read))
+      || !literalDocsCommandAllowed(read, fixture, [])) return false;
     neutral = `${neutral.slice(0, segments[index]!.start)} pwd ${neutral.slice(segments[index]!.end)}`;
   }
   return readOnlyCommandAllowed(neutral, docsReadOnlyScope(fixture));
@@ -357,7 +395,12 @@ function literalDocsCommandAllowed(text: string, fixture: ReturnType<typeof fixt
   if (commandName === 'git') {
     if (rest.some(arg => /^(?:--output|--ext-diff|--textconv|-w)(?:=|$)/.test(arg))) return false;
     if (rest[0] === 'hash-object' && rest.some(arg => /^-[^-]*w/.test(arg))) return false;
-    if (rest[0] === 'branch') return rest.length === 2 && rest[1] === '--show-current';
+    // A branch listing reads refs (gates 40458489644 and 40477638211: the parent oriented with `git branch -a`);
+    // an operand or any other option creates, moves, deletes or retargets a branch.
+    if (rest[0] === 'branch') return rest.slice(1).every(arg => DOCS_BRANCH_LIST_FLAGS.test(arg));
+    // A tag listing reads refs the same way (gate 40643690306: the parent ended a line of reads with `git tag`);
+    // an operand or any other option creates, deletes, signs or verifies a tag.
+    if (rest[0] === 'tag') return rest.slice(1).every(arg => arg === '-l' || arg === '--list');
     if (rest[0] === 'describe') {
       const operands = rest.slice(1).filter(arg => !DOCS_DESCRIBE_FLAGS.test(arg));
       return operands.length <= 1 && operands.every(arg => !arg.startsWith('-'));
@@ -422,12 +465,28 @@ function docsPrivateArtifact(file: string, fixture: ReturnType<typeof fixtureDoc
     path.basename(file) !== 'actor-state.json' && path.basename(actual) !== 'actor-state.json';
 }
 
-/** A candidate call at a wrong binary path that does not exist exited 127 before anything ran; it is ignored only when the same command at the declared path follows and runs. */
-function candidateNotFound(calls: SkillTestResult['toolCalls'], index: number, fixture: ReturnType<typeof fixtureDocs>, scripts: string[]): boolean {
+/** True when `dir` is one new directory directly under the fixture home, clear of the repository and every protected root. */
+function docsPrivateDirectory(dir: string, fixture: ReturnType<typeof fixtureDocs>): boolean {
+  if (!path.isAbsolute(dir) || path.normalize(dir) !== dir || path.dirname(dir) !== fixture.home ||
+      /[\x00-\x1f\x7f;&|<>`$\\()*?\[\]{}~#]/.test(dir)) return false;
+  const roots = [fixture.repo, fixture.skills, fixture.env.CLAUDE_CONFIG_DIR, fixture.env.GSTACK_HOME, path.join(fixture.home, 'remote.git')];
+  return actualWritePath(dir) === path.join(fs.realpathSync(fixture.home), path.basename(dir)) &&
+    !roots.some(root => within(dir, root) || within(root, dir));
+}
+
+/**
+ * A call to one of Step 14.5's own helpers (the docs candidate or the cap gate; never a lifecycle helper) at a wrong
+ * binary path that does not exist exited 127 before anything ran; it is ignored only when the same command at the
+ * declared path runs: after the slip for snapshot, compare and the cap gate, whose result the workflow needs, and
+ * anywhere in the transcript for --help, which reads nothing the agent still has to recover (gate 40323989742: the
+ * parent read the usage at the declared path, mistyped the path on a second --help, then went on; screen 40749421675:
+ * the parent typed the cap gate at the shard root, then ran it at the declared path).
+ */
+function helperNotFound(calls: SkillTestResult['toolCalls'], index: number, fixture: ReturnType<typeof fixtureDocs>, scripts: string[]): boolean {
   const command = String(calls[index].input?.command ?? '').trim();
   const binary = command.split(' ')[0]!;
-  const candidate = path.join(fixture.skills, 'bin/gstack-docs-candidate').split(path.sep).join('/');
-  if (!/^\/[\w.\/-]+\/gstack-docs-candidate$/.test(binary) || binary === candidate) return false;
+  const declared = path.join(fixture.skills, 'bin', path.basename(binary)).split(path.sep).join('/');
+  if (!/^\/[\w.\/-]+\/gstack-(?:docs-candidate|ship-receipt)$/.test(binary) || binary === declared) return false;
   if (calls[index].output.trimEnd() !== `Exit code 127\n(eval):1: no such file or directory: ${binary}`) return false;
   try {
     fs.lstatSync(binary);
@@ -435,8 +494,9 @@ function candidateNotFound(calls: SkillTestResult['toolCalls'], index: number, f
   } catch (error) {
     if (!['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) return false;
   }
-  const retry = candidate + command.slice(binary.length);
-  return docsCommandAllowed(retry, fixture, scripts) && calls.slice(index + 1).some(call =>
+  const retry = declared + command.slice(binary.length);
+  const candidates = retry === `${declared} --help` ? calls.filter((_, position) => position !== index) : calls.slice(index + 1);
+  return docsCommandAllowed(retry, fixture, scripts) && candidates.some(call =>
     call.tool === 'Bash' && String(call.input?.command ?? '').trim() === retry && !call.output.startsWith('Exit code'));
 }
 
@@ -446,13 +506,15 @@ export function docsToolFailures(result: SkillTestResult, fixture: ReturnType<ty
   const authoredDoc = path.join(repo, DOC_PATH);
   for (const [index, call] of result.toolCalls.entries()) {
     if (call.tool === 'Bash' && !docsCommandAllowed(String(call.input?.command ?? ''), fixture, scripts) &&
-      !candidateNotFound(result.toolCalls, index, fixture, scripts)) failures.push('command outside declared docs observation interface');
+      !helperNotFound(result.toolCalls, index, fixture, scripts)) failures.push('command outside declared docs observation interface');
     if (['Write', 'Edit'].includes(call.tool)) {
       const file = path.resolve(fixture.repo, call.input?.file_path ?? '');
       const actual = actualWritePath(file);
       const productWrite = within(file, fixture.repo) || (actual !== null && within(actual, repo));
-      if (readOnly && productWrite) failures.push('read-only docs write attempt');
-      const allowedDoc = file === path.join(fixture.repo, DOC_PATH) && actual === authoredDoc;
+      // Step 14.5's receipt record is housekeeping every scenario may write, a read-only audit included; the document stays read-only.
+      const recordWrite = file === path.join(fixture.repo, DOCS_AUDIT_RECORD) && actual === path.join(repo, DOCS_AUDIT_RECORD);
+      if (readOnly && productWrite && !recordWrite) failures.push('read-only docs write attempt');
+      const allowedDoc = (file === path.join(fixture.repo, DOC_PATH) && actual === authoredDoc) || recordWrite;
       if (productWrite && !allowedDoc) {
         failures.push('non-document product write attempt');
       }
@@ -477,11 +539,18 @@ export function docsCompletedRead(result: SkillTestResult, file: string, fixture
     const expanded = docsUnrollLoops(command);
     const grammar = !literal && expanded !== null && !/(?:^|[;&|]\s*)cd\s/.test(command)
       && (readOnlyCommandAllowed(command, docsReadOnlyScope(fixture)) || docsComposedReadAllowed(command, fixture));
-    const catArgs = !literal && !grammar ? [] : (expanded ?? command).split(/\s*(?:;|&&|\|\|)\s*/).filter(part => /^cat\s/.test(part) && !part.includes('|'))
-      .flatMap(part => part.match(/'[^']*'|"[^"]*"|[^\s'"]+/g)?.slice(1).map(arg => /^['"]/.test(arg) ? arg.slice(1, -1) : arg) ?? []);
+    const parts = !literal && !grammar ? [] : (expanded ?? command).split(/\s*(?:;|&&|\|\|)\s*/);
+    const operands = (part: string) => part.match(/'[^']*'|"[^"]*"|[^\s'"]+/g)?.slice(1).map(arg => /^['"]/.test(arg) ? arg.slice(1, -1) : arg) ?? [];
+    const catArgs = parts.filter(part => /^cat\s/.test(part) && !part.includes('|')).flatMap(operands);
     const cat = call.tool === 'Bash' && catArgs.some(arg => resolve(arg) === target);
     if ((read || cat) && !/^(?:<tool_use_error>|Error(?: reading file|:)|Exit code [1-9]\d*\b)/i.test(call.output.trimStart()) &&
         call.output.replace(/^\s*\d+(?:→|\t)/gm, '').includes(source)) return true;
+    // A line's exit status is its last command's: when the line's first command cats the file unpiped and the output
+    // opens with its full bytes, a later command's failure does not undo that read (screen 40828580338: zsh read the
+    // separator `echo ======` as an = command lookup and abandoned the rest of the line after phase.md printed in full).
+    const status = /^Exit code [1-9]\d*\n/.exec(call.output.trimStart());
+    const lead = cat && /^cat\s/.test(parts[0]!) && !parts[0]!.includes('|') ? operands(parts[0]!).find(arg => !arg.startsWith('-')) : undefined;
+    if (status && lead !== undefined && resolve(lead) === target && call.output.trimStart().slice(status[0].length).startsWith(source)) return true;
   }
   return false;
 }

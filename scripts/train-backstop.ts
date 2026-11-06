@@ -22,7 +22,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { loadPolicyFromHead, type TrainPolicy } from '../lib/ship-policy';
-import { NOTES_REF, fetchNotes, nowIso, persist, repoIdentity, type FreezeRecord } from '../lib/ship-queue-train-record';
+import { NOTES_REF, NOTES_REMOTE_REF, fetchNotes, nowIso, persist, repoIdentity, type FreezeRecord } from '../lib/ship-queue-train-record';
 import { E2E_TOUCHFILES, LLM_JUDGE_TOUCHFILES } from '../test/helpers/touchfiles-data';
 import { DISPATCH_INPUTS, makeNonce, nonceScope } from './eval-bg';
 import { ghFailureReason, runGh, type GhRunner } from './recover-receipts';
@@ -36,6 +36,8 @@ export interface BackstopOptions {
   repo: string; branch: string; sha: string; repoRoot: string;
   gh?: GhRunner; git?: Git; now?: () => number; sleep?: (ms: number) => void;
   settleMs?: number; pollMs?: number; gateDeadlineMs?: number; random?: string;
+  /** This workflow run's id (GITHUB_RUN_ID), named in the rerun command a standing freeze prints. */
+  runId?: string;
 }
 interface Run { id: number; status: string; conclusion: string | null; head_sha: string; display_title?: string; html_url?: string }
 
@@ -53,8 +55,11 @@ function noteRecords<T extends { kind: string; repo_key?: string }>(git: Git, ki
   });
 }
 
-/** The newest green-train record whose prefix trees include this digest, with its run; null when none. */
-export function coveringRecord(gh: GhRunner, repo: string, train: TrainPolicy, digest: string, lines: string[]): { run: Run; record: TrainRecord; index: number } | null {
+/**
+ * The newest green-train record with a prefix covering main, with its run; null when none. A plain prefix T_i
+ * covers main's tree modulo stamps (its digest); a stamped prefix S_i covers only main's exact tree.
+ */
+export function coveringRecord(gh: GhRunner, repo: string, train: TrainPolicy, main: { digest: string | null; tree: string }, lines: string[]): { run: Run; record: TrainRecord; index: number; exact: boolean } | null {
   const runs = json<{ workflow_runs?: Run[] }>(gh(['api', '-X', 'GET', `repos/${repo}/actions/workflows/${train.gate_workflow}/runs`, '-f', 'event=workflow_dispatch', '-f', 'status=success', '-f', 'per_page=50'], GH_MS));
   if (!runs) { lines.push('cannot list the train gate runs; the backstop gates main'); return null; }
   const trains = (runs.workflow_runs ?? []).map(run => ({ run, nonce: /\[eval-bg ([A-Za-z0-9._-]+)\]/.exec(run.display_title ?? '')?.[1] ?? '' }))
@@ -69,7 +74,7 @@ export function coveringRecord(gh: GhRunner, repo: string, train: TrainPolicy, d
       try { record = file ? JSON.parse(fs.readFileSync(path.join(dir, file), 'utf8')) as TrainRecord : null; } catch { record = null; }
       if (!record || record.kind !== 'train-gate' || record.verdict !== 'GREEN' || record.census?.complete !== true || record.nonce !== nonce
         || record.head_sha !== run.head_sha || !Array.isArray(record.prefixes)) continue;
-      const hit = record.prefixes.find(p => p.stamp_free_tree === digest);
+      const hit = record.prefixes.find(p => p.exact ? p.tree === main.tree : main.digest !== null && p.stamp_free_tree === main.digest);
       if (!hit) continue;
       const checks = json<{ check_runs?: Array<{ name?: string; conclusion?: string | null }> }>(
         gh(['api', `repos/${repo}/commits/${run.head_sha}/check-runs?check_name=${encodeURIComponent(train.full_gate_check)}`], GH_MS));
@@ -77,7 +82,7 @@ export function coveringRecord(gh: GhRunner, repo: string, train: TrainPolicy, d
         lines.push(`train ${nonce} (run ${run.id}) lists this tree but its ${train.full_gate_check} check run is not a success`);
         continue;
       }
-      return { run, record, index: hit.index };
+      return { run, record, index: hit.index, exact: !!hit.exact };
     }
     return null;
   } finally {
@@ -150,9 +155,12 @@ export function runBackstop(o: BackstopOptions): { action: BackstopAction; lines
   }
   const digest = stampFreeTree(git, o.sha, o.repoRoot, loaded.policy);
   if (typeof digest !== 'string') { lines.push(`BACKSTOP: no tree modulo stamps (${digest.error}); gating main`); }
-  const covered = typeof digest === 'string' ? coveringRecord(gh, o.repo, train, digest, lines) : null;
+  const tree = git(['rev-parse', `${o.sha}^{tree}`]).out;
+  const frozen = noteRecords<FreezeRecord>(git, 'freeze', repoKey).some(f => !f.cleared_at);
+  if (frozen) lines.push('BACKSTOP: the queue is frozen, so only a gate on main can clear it; no green-train record stands in');
+  const covered = frozen ? null : coveringRecord(gh, o.repo, train, { digest: typeof digest === 'string' ? digest : null, tree }, lines);
   if (covered) {
-    lines.push(`BACKSTOP: covered: main ${o.sha.slice(0, 12)} is T${covered.index} of green train ${covered.record.nonce} (run ${covered.run.id}, tree modulo stamps ${String(digest).slice(0, 12)}); no gate`);
+    lines.push(`BACKSTOP: covered: main ${o.sha.slice(0, 12)} is ${covered.exact ? `S${covered.index}` : `T${covered.index}`} of green train ${covered.record.nonce} (run ${covered.run.id}, ${covered.exact ? `exact tree ${tree.slice(0, 12)}` : `tree modulo stamps ${String(digest).slice(0, 12)}`}); no gate`);
     return done('covered');
   }
   const owned = noteRecords<FreezeRecord>(git, 'freeze', repoKey).find(f => !f.cleared_at && f.main.sha === o.sha && f.backstop);
@@ -163,17 +171,90 @@ export function runBackstop(o: BackstopOptions): { action: BackstopAction; lines
   lines.push(`BACKSTOP: no green-train record lists main's tree modulo stamps${typeof digest === 'string' ? ` ${digest.slice(0, 12)}` : ''}; gating main`);
   const nonce = makeNonce('gate', o.sha, o.sha, o.random ?? randomBytes(3).toString('hex'), { purpose: 'backstop' });
   const run = gateMain({ repo: o.repo, branch: o.branch, sha: o.sha, gh, train, now, sleep, pollMs, deadline: now() + (o.gateDeadlineMs ?? 270 * 60_000), nonce }, lines);
-  if (run?.status === 'completed' && run.conclusion === 'success') { lines.push(`BACKSTOP: gated: run ${run.id} is green on main ${o.sha.slice(0, 12)}`); return done('gated'); }
+  if (run?.status === 'completed' && run.conclusion === 'success') { lines.push(`BACKSTOP: gated: run ${run.id} is green on main ${o.sha.slice(0, 12)}`); return clearOnGreen(o, { git, repoKey, run }, lines); }
   return freeze(o, { gh, git, repoKey, nonce, run }, lines);
 }
 
-/** Write the freeze record (local state, then refs/notes/gstack-trains) unless a freeze is already active. */
+/** Main does not move while frozen, so rerunning this backstop run gates the same commit again (the workflow has no other trigger than a push). */
+const rerunCommand = (o: BackstopOptions) => `gh run rerun ${o.runId ?? '<this backstop run>'} -R ${o.repo}`;
+
+/** The land note of a merge: direct freeze's admitted repair (gstack-ship-queue land --pin --repair), when main contains its merge. */
+function repairIn(o: BackstopOptions, git: Git, repoKey: string, f: FreezeRecord): { merge_sha: string } | string {
+  const r = f.repair;
+  if (!r) return 'no repair was admitted (gstack-ship-queue land --pr <repair-pr> --pin <sha> --repair)';
+  if (r.train) return `repair train ${r.train} holds it, and that train's verify clears it`;
+  const landed = noteRecords<{ kind: string; repo_key: string; pr: string; pin: string; merge_sha: string }>(git, 'land', repoKey).find(l => l.pr === r.pr && l.pin === r.head);
+  if (!landed || !SHA.test(landed.merge_sha ?? '')) return `repair #${r.pr} has no land note at ${r.head.slice(0, 12)}, so land never verified its merge`;
+  if (!git(['merge-base', '--is-ancestor', landed.merge_sha, o.sha]).ok) return `main ${o.sha.slice(0, 12)} does not contain repair #${r.pr}'s merge ${landed.merge_sha.slice(0, 12)}`;
+  return landed;
+}
+
+/** One compare-and-swap rewrite of the active freeze: none active, `change` declined (null), pushed, or failed. */
+type Rewrite = { state: 'none' } | { state: 'unchanged' | 'pushed'; record: FreezeRecord } | { state: 'failed'; detail: string };
+
+/**
+ * Rewrite the active freeze on origin with a compare-and-swap: start from origin's notes (unpushed local notes are
+ * dropped), apply `change`, and push without merging. A rejected push starts over from origin's new notes, so a repair
+ * that `land --pin --repair` recorded meanwhile is never overwritten by this run's stale copy.
+ */
+function rewriteFreeze(git: Git, repoRoot: string, repoKey: string, change: (f: FreezeRecord) => FreezeRecord | null): Rewrite {
+  for (let i = 0; i < 3; i++) {
+    const f = git(['fetch', '--no-tags', '-q', 'origin', `+${NOTES_REF}:${NOTES_REMOTE_REF}`]);
+    if (!f.ok) return /couldn't find remote ref|no such ref/i.test(f.out) ? { state: 'none' } : { state: 'failed', detail: `git fetch ${NOTES_REF} failed: ${f.out.slice(0, 160)}` };
+    if (!git(['update-ref', NOTES_REF, NOTES_REMOTE_REF]).ok) return { state: 'failed', detail: `cannot reset ${NOTES_REF} to origin's notes` };
+    const active = noteRecords<FreezeRecord>(git, 'freeze', repoKey).find(r => !r.cleared_at);
+    if (!active) return { state: 'none' };
+    const next = change(structuredClone(active));
+    if (!next) return { state: 'unchanged', record: active };
+    const written = persist(repoRoot, [next], { push: false });
+    if (written.detail !== 'notes written locally (not pushed)') return { state: 'failed', detail: written.detail };
+    if (git(['push', '-q', 'origin', `${NOTES_REF}:${NOTES_REF}`]).ok) return { state: 'pushed', record: next };
+  }
+  return { state: 'failed', detail: `origin's ${NOTES_REF} moved under three pushes` };
+}
+
+/**
+ * A green gate clears the active backstop freeze only on evidence: main is still this commit, at or after the freeze's
+ * main, and contains the merge of the repair the freeze admitted (docs/ship-policy.md#direct-freeze).
+ */
+function clearOnGreen(o: BackstopOptions, c: { git: Git; repoKey: string; run: Run }, lines: string[]): { action: BackstopAction; lines: string[] } {
+  const tip = c.git(['ls-remote', 'origin', `refs/heads/${o.branch}`]).out.split(/\s/)[0] ?? '';
+  let why = '';
+  const out = rewriteFreeze(c.git, o.repoRoot, c.repoKey, f => {
+    const repair = f.train !== 'backstop' ? `train ${f.train} froze the queue, and its repair train's verify clears it`
+      : tip !== o.sha ? `${o.branch} moved to ${tip.slice(0, 12) || 'an unreadable tip'}; that push's backstop judges it`
+      : !c.git(['merge-base', '--is-ancestor', f.main.sha, o.sha]).ok ? `main ${o.sha.slice(0, 12)} is not at or after the freeze main ${f.main.sha.slice(0, 12)}`
+      : repairIn(o, c.git, c.repoKey, f);
+    if (typeof repair === 'string') { why = repair; return null; }
+    const at = nowIso();
+    return { ...f, cleared_at: at, cleared_by: `repair #${f.repair!.pr}; backstop ${c.run.id} green on ${o.sha}`, updated_at: at };
+  });
+  if (out.state === 'none') return { action: 'gated', lines };
+  if (out.state === 'failed') { lines.push(`BACKSTOP: green, but the freeze stands: ${out.detail}; gate this main again with ${rerunCommand(o)} (docs/troubleshooting.md#backstop-freeze-stands)`); return { action: 'failed', lines }; }
+  if (out.state === 'unchanged') { lines.push(`BACKSTOP: green, but the freeze stands: ${why}; once that is fixed, gate this main again with ${rerunCommand(o)} (docs/troubleshooting.md#backstop-freeze-stands)`); return { action: 'gated', lines }; }
+  lines.push(`BACKSTOP: freeze cleared (${out.record.cleared_by})`);
+  return { action: 'gated', lines };
+}
+
+/** Write the freeze record (local state, then refs/notes/gstack-trains); an active backstop freeze is rewritten, never replaced. */
 function freeze(o: BackstopOptions, c: { gh: GhRunner; git: Git; repoKey: string; nonce: string; run: Run | null }, lines: string[]): { action: BackstopAction; lines: string[] } {
-  const active = noteRecords<FreezeRecord>(c.git, 'freeze', c.repoKey).find(f => !f.cleared_at);
-  if (active) { lines.push(`BACKSTOP: red, and the queue is already frozen (${active.reason}); the existing freeze stands`); return { action: 'frozen', lines }; }
   const red = c.run?.status === 'completed' ? redCases(c.gh, o.repo, c.run) : [];
   const runText = c.run ? `run ${c.run.id} (${c.run.status}/${c.run.conclusion ?? '-'})` : 'no run';
   const cases = red.length ? red.map(r => `${r.id} (inputs ${r.inputs.slice(0, 4).join(', ') || 'none declared'})`).join('; ') : 'no red case recorded';
+  const judged = c.run?.status === 'completed' && c.run.conclusion === 'failure';
+  const out = rewriteFreeze(c.git, o.repoRoot, c.repoKey, f => {
+    if (f.train !== 'backstop') return null;
+    const repair = repairIn(o, c.git, c.repoKey, f);
+    const verdict = typeof repair === 'string' ? '' : judged
+      ? `; repair #${f.repair!.pr} did not turn main green, so its admission is spent: land the next repair with land --pin --repair`
+      : `; repair #${f.repair!.pr} was not judged (${runText}), so its admission stands: gate this main again with ${rerunCommand(o)}`;
+    const issue = (f as { issue?: string | null }).issue;
+    return { ...f, reason: `backstop red on main ${o.sha.slice(0, 12)}: ${cases}; ${runText}${verdict}; frozen since main ${f.main.sha.slice(0, 12)}; fix: land the revert or fix-forward${issue ? ` (${issue})` : ''}`,
+      repair: verdict && judged ? null : f.repair, updated_at: nowIso() };
+  });
+  if (out.state === 'failed') { lines.push(`BACKSTOP: red, and the freeze record could not be read or written (${out.detail}); nothing written`); return { action: 'failed', lines }; }
+  if (out.state === 'unchanged') { lines.push(`BACKSTOP: red, and the queue is already frozen (${out.record.reason}); the existing freeze stands`); return { action: 'frozen', lines }; }
+  if (out.state === 'pushed') { lines.push(`BACKSTOP: red, and the queue is already frozen; the freeze stands with its reason updated: ${out.record.reason}`); return { action: 'frozen', lines }; }
   const body = [`The main backstop gate is not green on ${o.sha}: ${runText}.`, '', `Red cases: ${cases}.`, '', 'gstack-ship-queue refuses ordinary trains until a repair train merges (docs/ship-policy.md#run-a-merge-train). Land the revert or fix-forward.'].join('\n');
   const issue = c.gh(['issue', 'create', '-R', o.repo, '--title', `Main backstop red on ${o.sha.slice(0, 12)}`, '--body', body], GH_MS);
   const issueUrl = issue.status === 0 ? issue.stdout.trim().split('\n').at(-1) ?? null : null;
@@ -192,8 +273,9 @@ function freeze(o: BackstopOptions, c: { gh: GhRunner; git: Git; repoKey: string
 }
 
 const USAGE = `usage: bun run scripts/train-backstop.ts run --repo <owner/name> --branch <main> --sha <sha>
-    [--settle-minutes 60] [--poll-seconds 60] [--gate-deadline-minutes 270] [--summary <file>]
-Exit 0 when inert, superseded, covered, deferred to a freeze's own backstop, or gated green; 1 when it froze the queue or could not finish.`;
+    [--settle-minutes 60] [--poll-seconds 60] [--gate-deadline-minutes 270] [--summary <file>] [--outputs <file>]
+Exit 0 when inert, superseded, covered, deferred to a freeze's own backstop, or gated green; 1 when it froze the queue or could not finish.
+--outputs appends action=<action> (the workflow reads it as a step output and publishes the main-backstop check run from it).`;
 
 if (import.meta.main) {
   const [command, ...rest] = process.argv.slice(2);
@@ -201,12 +283,14 @@ if (import.meta.main) {
   const minutes = (name: string, fallback: number) => Number(flag(name) ?? fallback) * 60_000;
   const [repo, branch, sha] = [flag('repo'), flag('branch'), flag('sha')];
   if (command !== 'run' || !repo || !branch || !sha) { console.error(USAGE); process.exit(2); }
-  const { action, lines } = runBackstop({ repo: repo!, branch: branch!, sha: sha!, repoRoot: process.cwd(), settleMs: minutes('settle-minutes', 60),
+  const { action, lines } = runBackstop({ repo: repo!, branch: branch!, sha: sha!, repoRoot: process.cwd(), runId: process.env.GITHUB_RUN_ID, settleMs: minutes('settle-minutes', 60),
     pollMs: Number(flag('poll-seconds') ?? 60) * 1000, gateDeadlineMs: minutes('gate-deadline-minutes', 270) });
   const summary = flag('summary');
   for (const line of lines) {
     console.log(line);
     if (summary) fs.appendFileSync(summary, `- ${line}\n`);
   }
+  const outputs = flag('outputs');
+  if (outputs) fs.appendFileSync(outputs, `action=${action}\n`);
   process.exit(action === 'frozen' || action === 'failed' ? 1 : 0);
 }
