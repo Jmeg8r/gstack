@@ -8,7 +8,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { classifyOutsideReview, validateOutsideReview, type OutsideGate } from '../lib/outside-review-result';
+import { classifyOutsideReview, usageFromEvents, validateOutsideReview, type OutsideGate } from '../lib/outside-review-result';
 import { gateOutcomeLine, type GateReason } from '../lib/gate-outcomes';
 
 const ROOT = path.resolve(import.meta.dir, '..');
@@ -30,6 +30,67 @@ function cli(args: string[]) {
 // A clean review states that it found nothing; an untagged finding is unverified (DX-11).
 const RECOMMEND = 'No issues found in changed.ts.\nRecommendation: approve because changed.ts keeps its data.';
 const UNTAGGED = 'Recommendation: fix the guard because changed.ts loses data.';
+
+// A model may write the completion recommendation as a Markdown section instead of an inline line (#3980).
+describe('a ## Recommendation heading carries the completion recommendation (#3980)', () => {
+  const review = (tail: string, head = 'Severity: Low. A future caller may need a guard.') =>
+    classifyOutsideReview({ text: `${head}\n\n${tail}`, gate: 'review' });
+
+  test('an advisory review with a heading is clean and keeps its severity', () => {
+    const result = review('## Recommendation\n\nShip as-is because current callers already enforce the invariant.');
+    expect(result.verdict).toBe('clean');
+    expect(result.findings.highest).toBe('P3');
+    expect(review('## Recommendation\n\n**Ship as-is** because current callers already enforce the invariant.').verdict).toBe('clean');
+  });
+
+  test('a blocker under the heading still blocks', () => {
+    const result = review('## Recommendation\n\nFix the write because it loses data.', 'Severity: High. The write drops rows.');
+    expect(result.verdict).toBe('findings');
+    expect(result.findings.highest).toBe('P1');
+  });
+
+  test('a label or verdict on the line under the heading still blocks, with or without an inline line', () => {
+    for (const [under, highest] of [['P1: Fix the race because it loses data.', 'P1'], ['Critical: the migration drops rows because it skips the copy.', 'P0'],
+      ['Verdict: not ready', 'P2']] as const) {
+      for (const inline of ['', '\n\nRecommendation: fix it because it loses data.']) {
+        const result = classifyOutsideReview({ text: `[P2] nit\n\n## Recommendation\n\n${under}${inline}`, gate: 'review' });
+        expect(result.findings.highest).toBe(highest);
+        expect(result.verdict).toBe(inline || highest !== 'P2' ? 'findings' : 'unavailable');
+      }
+    }
+  });
+
+  test('a no-findings rationale under the heading concludes the review', () => {
+    const result = classifyOutsideReview({ text: '### Recommendation:\nApprove because no issues were found.', gate: 'proposal' });
+    expect(result.verdict).toBe('clean');
+    expect(classifyOutsideReview({ text: '## Recommendation\n\nApprove because I found no issues.', gate: 'review' }).verdict).toBe('clean');
+  });
+
+  test('a heading over a no-findings line with no because-clause reads as it did before the heading fold', () => {
+    for (const text of ['## Recommendation\n\nNo issues found.', 'Reviewed the diff.\n\n## Recommendation\n\nNo issues found in the change.']) {
+      // Fork rule: the structured gate concludes no findings only on an exact NO_FINDINGS line.
+      expect(classifyOutsideReview({ text, gate: 'structured' }).reason).toBe('untagged_review');
+      expect(classifyOutsideReview({ text: `${text}\nNO_FINDINGS`, gate: 'structured' }).verdict).toBe('clean');
+      expect(classifyOutsideReview({ text, gate: 'review' }).reason).toBe('missing_markers');
+    }
+  });
+
+  test('the inline form still works', () => {
+    const result = review('Recommendation: Ship as-is because current callers already enforce the invariant.');
+    expect(result.verdict).toBe('clean');
+    expect(result.findings.highest).toBe('P3');
+  });
+
+  test('a reply with no recommendation, an empty section, no rationale or a fenced example is still missing', () => {
+    for (const tail of ['No recommendation here.', '## Recommendation', '## Recommendation\n\nShip as-is.',
+      '## Recommendation\n\n- Ship as-is because callers enforce it.',
+      '```text\n## Recommendation\n\nShip as-is because this is an example.\n```']) {
+      const result = review(tail);
+      expect(result.verdict).toBe('unavailable');
+      expect(result.reason).toBe('missing_markers');
+    }
+  });
+});
 
 describe('classifyOutsideReview: separate execution, findings and verdict', () => {
   const cases: Array<[string, { text: string; gate: OutsideGate; stderr?: string; exit?: number }, string, string | null, string | undefined]> = [
@@ -275,6 +336,36 @@ describe('B1: a review whose sandbox could not start is unavailable, not clean',
     expect(r.status).toBe(1);
     expect(r.stdout).toContain('REASON: sandbox_unavailable');
     expect(r.stderr).toStartWith(`Codex outside review unavailable: Codex's sandbox could not start here (${BWRAP}`);
+  });
+});
+
+describe('Codex token usage from --json events (#2948)', () => {
+  const turn = (usage: Record<string, number>) => JSON.stringify({ type: 'turn.completed', usage });
+
+  test('one turn: every counter the event carries, nothing invented', () => {
+    expect(usageFromEvents(turn({ input_tokens: 12016, cached_input_tokens: 0, cache_write_input_tokens: 12013, output_tokens: 5, reasoning_output_tokens: 0 })))
+      .toEqual({ input_tokens: 12016, cached_input_tokens: 0, cache_write_input_tokens: 12013, output_tokens: 5, reasoning_output_tokens: 0, usd: 'unknown' });
+  });
+
+  test('the latest turn wins (codex reports the running session total); malformed and unrelated lines are skipped', () => {
+    const events = [turn({ input_tokens: 100, output_tokens: 10 }), 'not json', '{"type":"item.completed","item":{"type":"agent_message"}}', turn({ input_tokens: 150, output_tokens: 15, reasoning_output_tokens: 2 })].join('\n');
+    expect(usageFromEvents(events)).toEqual({ input_tokens: 150, output_tokens: 15, reasoning_output_tokens: 2, usd: 'unknown' });
+  });
+
+  test('a cumulative total_token_usage snapshot wins over per-turn usage, latest first', () => {
+    const snap = (n: number) => JSON.stringify({ msg: { type: 'token_count', info: { total_token_usage: { input_tokens: n, output_tokens: n / 10, total_tokens: n * 1.1 } } } });
+    expect(usageFromEvents([turn({ input_tokens: 7 }), snap(100), snap(300)].join('\n'))).toEqual({ input_tokens: 300, output_tokens: 30, total_tokens: 330, usd: 'unknown' });
+  });
+
+  test('the CLI prints OUTSIDE_USAGE only when given --events, on every verdict', () => {
+    const events = path.join(TMP, 'usage-events.jsonl');
+    fs.writeFileSync(events, turn({ input_tokens: 1200, cached_input_tokens: 200, output_tokens: 340 }) + '\n');
+    const withEvents = cli(['--events', events, 'review', file('No issues found.')]);
+    expect(withEvents.stdout).toContain('OUTSIDE_USAGE: input=1200 cached_input=200 output=340\n');
+    const empty = path.join(TMP, 'no-usage.jsonl');
+    fs.writeFileSync(empty, '{"type":"thread.started"}\n');
+    expect(cli(['--events', empty, 'review', file('')]).stdout).toContain('OUTSIDE_USAGE: unknown\n');
+    expect(cli(['--verdict', 'review', file('No issues found.')]).stdout).not.toContain('OUTSIDE_USAGE');
   });
 });
 
