@@ -80,10 +80,12 @@ to suit the tool.
 - Live: `gstack-cso start --diff --base origin/main` on the ClaudeClaw ASTGL-74 worktree
   creates a run, and `inspect` shows `AGENTS.md` recorded as an alias of `CLAUDE.md`.
 
+## Decisions (James, 2026-11-08)
+- **An in-repo alias leaves coverage complete.** Its target is audited under its own path.
+  Only escaping, absolute, dangling, directory or chained symlinks make coverage partial.
+- **No raw link text in the manifest.** An entry records only its classification (alias of
+  the target's snapshot path handle, or unaudited with a reason). The link text is read with
+  `readlink` to classify, then discarded, so it never bypasses the redacting reader.
+
 ## Open questions
-- Does an in-repo alias leave coverage **complete**, as proposed, or should every symlink
-  make coverage partial? (Proposed: complete, because the target is audited.)
-- Should the manifest record the link text? It aids review, but it is repository content
-  that bypasses the redacting reader. (Proposed: record only the classification and the
-  target's snapshot path handle, not raw link text.)
 - Linear: which project tracks gstack fork work, if any?
