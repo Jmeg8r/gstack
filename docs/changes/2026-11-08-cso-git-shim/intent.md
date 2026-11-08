@@ -1,11 +1,11 @@
 ---
 change: 2026-11-08-cso-git-shim
-status: draft
+status: accepted
 track: T3
 risk: high
 risk_reason: the CSO helper's executable resolution decides which binary runs against an audited repository and whether Git hardening applies; a wrong answer runs the wrong tool or unhardened Git
 author: claude
-accepted_by: pending
+accepted_by: james
 linear: pending
 source: side session from the jfcadm/gstack PR 25 VERIFY (2026-11-08)
 ---
