@@ -1,10 +1,11 @@
 ---
 change: 2026-11-08-cso-git-fail-closed
-status: draft
+status: accepted
 track: T3
 risk: high
 risk_reason: hardenGit decides whether Git runs against an audited repository with fsmonitor, hooks and config includes disabled; a silent fallback runs Git, or a lookalike, without those protections
 author: claude
+accepted_by: james
 linear: pending
 source: concern C1 in docs/changes/2026-11-08-cso-git-shim/spec.md (jfcadm/gstack PR 26)
 ---
