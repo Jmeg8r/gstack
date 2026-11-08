@@ -1,6 +1,6 @@
 ---
 change: 2026-11-08-cso-git-shim
-status: draft
+status: accepted
 track: T3
 intent: ./intent.md
 spec: ./spec.md
