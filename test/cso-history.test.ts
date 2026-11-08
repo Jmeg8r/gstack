@@ -57,6 +57,57 @@ diff --git "a/foo b/foo
     expect(kept).toContain('Subject: rename');
   });
 
+  test('withholds every symlink diff section, whose body is link text, whatever the path',()=>{
+    const raw=`commit ${'e'.repeat(40)}
+Subject: add links
+diff --git a/AGENTS.md b/AGENTS.md
+new file mode 120000
+index 0000000..1111111
+--- /dev/null
++++ b/AGENTS.md
+@@ -0,0 +1 @@
++NEW-LINK-TEXT
+\\ No newline at end of file
+diff --git a/app.ts b/app.ts
+index 2222222..3333333 100644
+--- a/app.ts
++++ b/app.ts
+@@ -1 +1 @@
++kept-line
+commit ${'f'.repeat(40)}
+Subject: retarget, typechange and removal
+diff --git a/docs/guide.md b/docs/guide.md
+index 4444444..5555555 120000
+--- a/docs/guide.md
++++ b/docs/guide.md
+@@ -1 +1 @@
+-OLD-LINK-TEXT
++RETARGETED-LINK-TEXT
+diff --git a/tool.md b/tool.md
+old mode 100644
+new mode 120000
+--- a/tool.md
++++ b/tool.md
+@@ -1 +1 @@
++TYPECHANGE-LINK-TEXT
+diff --git a/gone.md b/gone.md
+deleted file mode 120000
+index 6666666..0000000
+--- a/gone.md
++++ /dev/null
+@@ -1 +0,0 @@
+-DELETED-LINK-TEXT
+`;
+    const kept=withholdHistory(raw,()=>undefined);
+    for(const text of ['NEW-LINK-TEXT','OLD-LINK-TEXT','RETARGETED-LINK-TEXT','TYPECHANGE-LINK-TEXT','DELETED-LINK-TEXT'])
+      expect(kept).not.toContain(text);
+    for(const path of ['AGENTS.md','docs/guide.md','tool.md','gone.md'])
+      expect(kept).toContain(`diff withheld: ${path} (symlink)`);
+    expect(kept).toContain('+kept-line');
+    expect(kept).toContain('Subject: add links');
+    expect(kept).toContain('Subject: retarget, typechange and removal');
+  });
+
   test('rejects malformed quoted headers instead of broadening the match',()=>{
     expect(gitDiffHeaderPaths('diff --git "a/foo b/foo')).toBeUndefined();
     expect(historyForPath('diff --git "a/foo b/foo\n+secret\n','foo')).toBeUndefined();

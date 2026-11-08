@@ -57,16 +57,31 @@ export function gitDiffHeaderPaths(line: string): [string, string] | undefined {
   }
 }
 
+/** An extended header line saying either side of the section is a symlink (Git mode 120000). */
+const SYMLINK_HEADER = /^(?:(?:old|new|deleted file|new file) mode 120000|index [0-9a-f]+\.\.[0-9a-f]+ 120000)$/;
+/** The first line after a section's extended header. */
+const HEADER_END = /^(?:--- |@@ |Binary files |GIT binary patch)/;
+
 /**
  * Replace every diff section touching a path `withheld` names with one marker line, so a file the snapshot keeps
- * out of the readable tree cannot come back through retained history. An unparseable diff header is withheld too.
+ * out of the readable tree cannot come back through retained history. An unparseable diff header is withheld too,
+ * and so is any symlink section, whatever its path: its body is link text, which the snapshot never records.
  */
 export function withholdHistory(raw: string, withheld: (path: string) => string | undefined): string {
   const output: string[] = [];
-  let skipping = false;
+  let skipping = false,
+    // A section's extended header is held back until it shows whether the section is a symlink.
+    header: { lines: string[]; path: string } | undefined;
+  const release = () => {
+    if (header) output.push(...header.lines);
+    header = undefined;
+  };
   for (const line of raw.split('\n')) {
-    if (line.startsWith('commit ')) skipping = false;
-    else if (line.startsWith('diff --git ')) {
+    if (line.startsWith('commit ')) {
+      release();
+      skipping = false;
+    } else if (line.startsWith('diff --git ')) {
+      release();
       const paths = gitDiffHeaderPaths(line)?.map((value) => value.replace(/^[ab]\//, '')),
         reason = paths ? paths.map(withheld).find(Boolean) : 'unparseable diff header';
       skipping = Boolean(reason);
@@ -74,9 +89,26 @@ export function withholdHistory(raw: string, withheld: (path: string) => string 
         output.push(`diff withheld: ${paths?.[1] ?? 'unknown path'} (${reason})`);
         continue;
       }
+      header = { lines: [line], path: paths?.[1] ?? 'unknown path' };
+      continue;
     }
-    if (!skipping) output.push(line);
+    if (skipping) continue;
+    if (header) {
+      if (SYMLINK_HEADER.test(line)) {
+        output.push(`diff withheld: ${header.path} (symlink)`);
+        header = undefined;
+        skipping = true;
+        continue;
+      }
+      if (!HEADER_END.test(line)) {
+        header.lines.push(line);
+        continue;
+      }
+      release();
+    }
+    output.push(line);
   }
+  release();
   return output.join('\n');
 }
 

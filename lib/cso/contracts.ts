@@ -156,6 +156,8 @@ export interface SnapshotEntry {
   bytes: number;
   mode: number;
   transformation?: string;
+  /** Symlink entries only: a digest of the link text (never the text), bound into the original identity. */
+  linkHash?: string;
 }
 export interface SnapshotPathIdentity {
   path: string;
@@ -441,10 +443,16 @@ export function snapshotReference(value: unknown): string {
   return snapshotPathHandleId(reference) ? reference : relativePath(reference);
 }
 export function snapshotOriginalIdentity(
-  entries: Array<Pick<SnapshotEntry, 'path' | 'originalHash' | 'mode'>>,
+  entries: Array<Pick<SnapshotEntry, 'path' | 'originalHash' | 'mode' | 'linkHash'>>,
   deletedPaths: Array<Pick<SnapshotPathIdentity, 'path'>> = [],
 ): string {
-  const present = entries.map((entry) => [entry.path, entry.originalHash, entry.mode]);
+  // A symlink's link hash joins its tuple; entries without one keep the
+  // three-field form, so identities of artifacts without symlinks are unchanged.
+  const present = entries.map((entry) =>
+    entry.linkHash === undefined
+      ? [entry.path, entry.originalHash, entry.mode]
+      : [entry.path, entry.originalHash, entry.mode, entry.linkHash],
+  );
   // Preserve the original no-deletion identity for v3 artifacts already
   // retained by pre-release builds. Any deletion changes the identity and is
   // therefore impossible to strip from a manifest without detection.

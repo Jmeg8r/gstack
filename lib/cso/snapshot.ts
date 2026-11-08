@@ -1,6 +1,6 @@
 import * as fs from 'node:fs';
 import { createHash } from 'node:crypto';
-import { dirname, isAbsolute, join, resolve, relative, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, posix, resolve, relative, sep } from 'node:path';
 import {
   CsoError,
   SnapshotManifest,
@@ -77,6 +77,14 @@ export function historyMarker(note: string): string {
 /** Transformation recorded for a repository boundary Git listed as one entry: an untracked nested repository or a registered submodule gitlink. */
 export const NESTED_REPOSITORY =
   'excluded: nested Git repository; Git listed it as a single boundary entry and never descends into it, so its own source and history are not audited with this repository';
+/** Transformation for a symlink naming a regular source file in the inventory; the target is audited under its own path. */
+export function symlinkAlias(handle: string): string {
+  return `excluded: symlink alias of ${handle}`;
+}
+/** Transformation for any other symlink. Its reason is a fixed phrase; the link text itself is never recorded. */
+export function symlinkWithheld(reason: string): string {
+  return `withheld: symlink not followed (${reason})`;
+}
 export function inAuditPaths(path: string, prefixes: readonly string[]): boolean {
   return prefixes.some((prefix) => path === prefix || path.startsWith(`${prefix}/`));
 }
@@ -538,6 +546,91 @@ async function paths(
   admission.time();
   return result;
 }
+/**
+ * The symlink's own pathname. Every ancestor is checked with containedFile;
+ * the final component is the link itself and is never followed.
+ */
+function symlinkPath(repo: string, path: string): string {
+  const parent = dirname(relativePath(path));
+  return join(parent === '.' ? repo : containedFile(repo, parent), basename(path));
+}
+/**
+ * The persisted, domain-separated digest of a symlink's text. It binds the
+ * link's target into the original source identity, so a retargeted link is a
+ * different source; like Git's own blob hash, it carries no link text.
+ */
+function symlinkIdentity(text: Buffer): string {
+  return createHash('sha256').update('cso-symlink-v1\0').update(text).digest('hex');
+}
+/** Reads link text as bytes, only to classify and to hash it the way Git stores a symlink (mode 120000). */
+function readSymlink(full: string, objectFormat: string): { text: Buffer; linkHash: string } {
+  const text = fs.readlinkSync(full, { encoding: 'buffer' });
+  return { text, linkHash: createHash(objectFormat).update(`blob ${text.length}\0`).update(text).digest('hex') };
+}
+/**
+ * Never-following classification. An alias names a relative, in-repo regular
+ * file that is itself in the capture inventory and reached through no symlink;
+ * containedFile rejects a symlink anywhere on that path, including the target
+ * itself. Anything else is withheld with one fixed reason.
+ */
+function classifySymlink(
+  repo: string,
+  path: string,
+  text: Buffer,
+  inventory: ReadonlySet<string>,
+): { target: string } | { reason: string } {
+  let link: string;
+  try {
+    // ignoreBOM keeps a leading U+FEFF: to the filesystem it is part of the name.
+    link = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(text);
+  } catch {
+    return { reason: 'link text is not UTF-8' };
+  }
+  if (posix.isAbsolute(link) || isAbsolute(link)) return { reason: 'absolute' };
+  // Walk the link one component at a time, as the kernel would, without
+  // following anything: a component the link descends into must already be a
+  // real directory, so a later `..` cannot erase a missing directory, a file or
+  // a symlink that the kernel would have had to traverse. The link's own
+  // parent directories were checked by symlinkPath.
+  const parent = posix.dirname(path),
+    parts = parent === '.' ? [] : parent.split('/'),
+    components = link.split('/');
+  for (const [index, part] of components.entries()) {
+    if (part === '' || part === '.') continue;
+    if (part === '..') {
+      if (!parts.length) return { reason: 'escapes the repository' };
+      parts.pop();
+      continue;
+    }
+    parts.push(part);
+    if (index === components.length - 1) continue;
+    let step: fs.Stats;
+    try {
+      step = fs.lstatSync(join(repo, ...parts));
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') return { reason: 'missing target' };
+      throw error;
+    }
+    if (step.isSymbolicLink()) return { reason: 'target is a symlink or crosses one' };
+    if (!step.isDirectory()) return { reason: 'missing target' };
+  }
+  if (!parts.length) return { reason: 'escapes the repository' };
+  const target = parts.join('/');
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(containedFile(repo, target));
+  } catch (error) {
+    if (error instanceof CsoError) return { reason: 'target is a symlink or crosses one' };
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return { reason: 'missing target' };
+    throw error;
+  }
+  if (stat.isDirectory()) return { reason: 'target is a directory' };
+  if (!stat.isFile()) return { reason: 'target is not a regular file' };
+  if (noReadPath(target) || !inventory.has(target)) return { reason: 'target not in the source inventory' };
+  return { target };
+}
 async function rejectSpecialFiles(
   repo: string,
   home: string,
@@ -587,7 +680,9 @@ async function rejectSpecialFiles(
           walk(full, path);
           continue;
         }
-        if (!stat.isFile()) special.push(path);
+        // Symlinks are recorded, never followed, by capture(); only FIFOs,
+        // sockets and devices stay refused here.
+        if (!stat.isFile() && !stat.isSymbolicLink()) special.push(path);
       }
     } finally {
       directory.closeSync();
@@ -658,6 +753,7 @@ export async function capture(
       gitModes = new Map<string, string>(),
       sensitiveEvidence: any[] = [],
       boundaries = new Map<string, fs.Stats>(),
+      symlinks = new Map<string, { dev: number; ino: number; linkHash: string }>(),
       absentPaths = new Set<string>();
     let total = 0;
     guard();
@@ -673,6 +769,7 @@ export async function capture(
     if (unmatched !== undefined)
       throw new CsoError('INVALID_ARGUMENT', `--paths entry matches no source file: ${unmatched}`);
     const outsideAudit = (path: string) => auditPaths !== undefined && !inAuditPaths(path, auditPaths);
+    const inventory: ReadonlySet<string> = new Set(list);
     await rejectSpecialFiles(repo, home, admission);
     guard();
     const manifest: SnapshotManifest = {
@@ -716,6 +813,38 @@ export async function capture(
         throw error;
       }
       const size = source.size;
+      // A symlink is recorded by identity and link text, never followed: an
+      // alias of an inventoried regular file is excluded (its target is
+      // audited under its own path); any other symlink is withheld. Git's mode
+      // and link-text blob hash keep diff mode exact for unchanged links.
+      if (source.isSymbolicLink()) {
+        const full = symlinkPath(repo, path),
+          { text, linkHash } = readSymlink(full, objectFormat);
+        let transformation: string;
+        if (noReadPath(path)) transformation = `excluded: ${exclusion(path) ?? 'host dependency input'}`;
+        else if (outsideAudit(path)) transformation = OUTSIDE_AUDIT_PATHS;
+        else {
+          const kind = classifySymlink(repo, path, text, inventory);
+          transformation =
+            'target' in kind
+              ? symlinkAlias(snapshotPathHandle(snapshotPathId(repo, kind.target)))
+              : symlinkWithheld(kind.reason);
+        }
+        symlinks.set(path, { dev: source.dev, ino: source.ino, linkHash });
+        gitModes.set(path, '120000');
+        gitHashes.set(path, linkHash);
+        entries.push({
+          path,
+          pathId: snapshotPathId(repo, path),
+          originalHash: 'not-read',
+          bytes: size,
+          mode: source.mode & 0o777,
+          transformation,
+          linkHash: symlinkIdentity(text),
+        });
+        guard();
+        continue;
+      }
       // A directory in Git's inventory is a repository boundary, not source:
       // an untracked nested repository (listed with a trailing slash) or a
       // registered submodule's gitlink. Git reports it as one entry and never
@@ -855,6 +984,26 @@ export async function capture(
               current.mode !== boundary.mode
             )
               throw new CsoError('SNAPSHOT_RACE', `${message}: ${e.path}`);
+            guard();
+            continue;
+          }
+          const link = symlinks.get(e.path);
+          if (link) {
+            // Same symlink, same link text, or the capture is void. Any error
+            // here (gone, swapped for a file, ancestor replaced) is that race.
+            let stable = false;
+            try {
+              const full = symlinkPath(repo, e.path),
+                current = fs.lstatSync(full);
+              stable =
+                current.isSymbolicLink() &&
+                current.dev === link.dev &&
+                current.ino === link.ino &&
+                readSymlink(full, objectFormat).linkHash === link.linkHash;
+            } catch {
+              stable = false;
+            }
+            if (!stable) throw new CsoError('SNAPSHOT_RACE', `${message}: ${e.path}`);
             guard();
             continue;
           }
@@ -1132,6 +1281,8 @@ export function assertSnapshot(runDir: string, manifest: SnapshotManifest): void
       throw new CsoError('INCOMPATIBLE_INPUT', 'Snapshot manifest contains an invalid execution entry');
     if (e.originalHash === 'not-read' && (e.executionHash !== undefined || !e.transformation))
       throw new CsoError('INCOMPATIBLE_INPUT', 'Unread source cannot be represented as an execution input');
+    if (e.linkHash !== undefined && (e.originalHash !== 'not-read' || !/^[a-f0-9]{64}$/.test(e.linkHash)))
+      throw new CsoError('INCOMPATIBLE_INPUT', 'Snapshot manifest contains an invalid symlink entry');
     return { ...e, path };
   });
   const deleted = (manifest.deletedPaths ?? []).map((item) => {

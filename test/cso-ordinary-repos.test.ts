@@ -97,18 +97,31 @@ describe('CSO start on a repository with an untracked nested repository (#3255 b
     expect(fs.existsSync(path.join(dir, 'readable', 'inner'))).toBe(false);
   });
 
-  test('negative control: an untracked symlink to a directory is still refused, not treated as a boundary', () => {
+  // Since change cso-symlink-alias (2026-11-08) a symlink no longer stops the run. The
+  // control still holds: it is a withheld gap, never a boundary exclusion, never followed.
+  test('negative control: an untracked symlink to a directory is a withheld gap, not treated as a boundary', () => {
     const root = tmp(),
       repo = init(path.join(root, 'repo')),
-      outside = path.join(root, 'outside');
+      outside = path.join(root, 'outside'),
+      hostCanary = `HOST-CANARY-${process.pid}`;
     commit(repo, { 'README.md': 'outer\n' }, 'outer');
     nestedRepository(repo, 'inner', { 'f.txt': 'x\n' });
     fs.mkdirSync(outside);
-    fs.writeFileSync(path.join(outside, 'host.txt'), 'host\n');
+    fs.writeFileSync(path.join(outside, 'host.txt'), `${hostCanary}\n`);
     fs.symlinkSync(outside, path.join(repo, 'escape'));
     const started = cso(repo, ['start', '--repo', repo, '--scope', 'auth', '--offline']);
-    expect(started.status).not.toBe(0);
-    expect(JSON.parse(started.stderr).error).toMatchObject({ code: 'UNSAFE_PATH', message: expect.stringContaining('escape') });
+    expect(started.stderr).toBe('');
+    expect(started.status).toBe(0);
+    const run = JSON.parse(started.stdout),
+      dir = path.join(state, 'security', 'cso', run.repoId, run.runId),
+      report = readJson(path.join(dir, 'report.json')),
+      snapshot = report.coverage.find((item: any) => item.domain === 'snapshot-inputs');
+    expect(snapshot.exclusions).toEqual([`inner: ${NESTED_REPOSITORY}`]);
+    expect(snapshot.status).toBe('partial');
+    expect(snapshot.gaps).toHaveLength(1);
+    for (const file of runFiles(dir)) expect(fs.readFileSync(file, 'utf8')).not.toContain(hostCanary);
+    expect(fs.existsSync(path.join(dir, 'snapshot', 'escape'))).toBe(false);
+    expect(fs.existsSync(path.join(dir, 'readable', 'escape'))).toBe(false);
   });
 
   test('negative control: a nested repository swapped for another directory during capture fails as a snapshot race', async () => {
