@@ -20,6 +20,7 @@ off `origin/main` `f0a566a26`. The installed `~/.claude/skills/gstack` is not to
 |---|---|
 | `test/cso-executable-hardlink.test.ts` (new) | R1–R3 cases; committed first and failing |
 | `lib/cso/process.ts` | `canonicalExecutable`; used in `executable()` and `hardenGit()` |
+| `.github/workflows/free-tests.yml` | add the new test to `macos-named-regressions`, the only CI job where the darwin stress case runs (Linux realpath keeps the opened name, so the other cases pass there even on the old code) |
 | `docs/changes/2026-11-08-cso-git-shim/*` | these artifacts |
 
 ## Order of work
