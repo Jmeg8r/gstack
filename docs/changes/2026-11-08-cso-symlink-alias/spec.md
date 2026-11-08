@@ -18,28 +18,28 @@ claude_config_sha: 6ab4082
 change inside `lib/cso/snapshot.ts`, one new test file and the doc section; keep the FIFO
 error text byte-identical; do not touch `cli.ts` or `contracts.ts` (coverage already works
 from the transformation prefix, see Design). Offering it upstream stays James's later call.
-*James:* pending.
+*James:* accepted (2026-11-08): `snapshot.ts`, one test file and the doc section only; FIFO text byte-identical.
 
 **F2. Policy skills.** Source: /spec step 2. `security-review` and `gstack-cso` review a
 diff; no code exists yet. `gstack-cso` is also the thing being changed, and the fork itself
 cannot be audited today (it tracks the `connect-chrome` symlink). Recommended: run
 `security-review` at VERIFY, and run the *fixed* `gstack-cso` from this branch on its own
 diff as a live check. That run is only possible because of this change.
-*James:* pending.
+*James:* accepted (2026-11-08): `security-review` at VERIFY plus the branch's fixed `gstack-cso` on this fork's diff.
 
 **F3. Aliases into withheld files.** Source: `SECRET_FILE` (`snapshot.ts:54`) already
 excludes `AGENTS.md` and `CLAUDE.md`. ClaudeClaw's `AGENTS.md` is therefore an alias of an
 excluded file. Recommended: an alias is classified by target *type and location* only. What
 happens to the target's own payload (audited, excluded or withheld) is reported on the
 target's entry, unchanged. The alias adds no second copy and claims nothing about the target.
-*James:* pending.
+*James:* accepted (2026-11-08).
 
 **F4. Comprehensive mode cannot rebuild a symlink.** Source: the execution copy never
 contains symlinks (`assertSnapshot`), and `verification.ts:1887-1906` refuses any input with
 a transformation. An application that needs a symlink at runtime will report that input as
 withheld, not silently run without it. Recommended: accept, and document it in the doc
 section. Rebuilding symlinks in the execution copy is a separate change.
-*James:* pending.
+*James:* accepted (2026-11-08); documented in the doc section.
 
 ## Requirements
 
@@ -142,6 +142,9 @@ section. Rebuilding symlinks in the execution copy is a separate change.
 | live | fixed launcher from this branch: `gstack-cso start --diff --base origin/main` on the ClaudeClaw ASTGL-74 worktree, and on this fork | run created; `inspect` shows `AGENTS.md` (or `connect-chrome`) classified, coverage as R5 predicts |
 
 ## Open questions
-- How the live check runs the *branch* launcher, not the installed one. To be settled in
-  the plan after reading `bin/gstack-cso-launcher`'s build (it is a compiled Mach-O binary).
-- F1–F4: resolutions pending (above).
+- None blocking. The live check builds the branch binaries with `bun run build:cso`
+  (`scripts/build-cso.sh`) inside this worktree and runs the worktree's
+  `bin/gstack-cso-launcher`; the installed copy is not touched. If the launcher refuses to
+  run outside the installed distribution, the plan records that, and the live check moves
+  to after deployment.
+- F1–F4 resolved (above).
