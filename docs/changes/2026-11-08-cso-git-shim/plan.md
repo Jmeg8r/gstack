@@ -65,3 +65,33 @@ off `origin/main` `f0a566a26`. The installed `~/.claude/skills/gstack` is not to
 - **Pass `DEVELOPER_DIR`/`TMPDIR` to the child.** Disproved: environment has no effect.
 - **Skip canonicalization.** `cso-docker-argv0` depends on resolving OrbStack's
   `docker -> docker-tools` symlink, and the hardening check compares canonical paths.
+
+## VERIFY results (2026-11-08, rebased onto `c87512939`)
+- `test/cso-executable-hardlink.test.ts`: with `canonicalExecutable` temporarily set to
+  the old `realpathSync`, 3 of 4 fail (the stress case returned `/usr/bin/python3`; 47 of
+  2,000 helper `git()` calls failed with `unsupported invocation`). With the fix: 4 of 4
+  pass, and 15 of 15 together with `cso-git-hardening`.
+- Stress, 5,000 helper `git()` calls at 300-way concurrency under `childEnvironment`:
+  **340 failures on `f0a566a26`, 0 on the fix** (before and after the rebase).
+- All CSO suites with a real-path `TMPDIR`, rebuilt binary: 848 pass, 35 skip, 3 fail,
+  **0 `unsupported invocation`**. None of the three is caused by this change:
+  - `cso-cache` 'recovers dead immutable leases': known, out of scope.
+  - `cso-file-ceiling` `afterAll` hook timeout (the rm of the 5,000-file fixture runs past
+    5 s): it also fails with the old `process.ts` swapped back in.
+  - `cso-requalification` 'the committed catalog is not older than its trigger inputs'
+    (`preparationSha256`): it already fails on `main` at `c87512939`, because PR 25 edited
+    `process.ts`, which is in the image helpers' import closure. This change moves that
+    hash again. Requalifying the runtimes is a separate promotion run, not done here.
+- `bun run typecheck` is clean. `typecheck:test`: "819 known diagnostics, none new".
+  `snyk test`: 140 dependencies, 0 issues.
+- Adversarial review (fresh-context correctness panel): no correctness bug that the
+  current callers can reach. The two low-severity test findings (no CI job ran the darwin
+  case; a tight default timeout) are fixed by the `free-tests.yml` row and explicit test
+  timeouts.
+
+## Deviations
+- The branch was cut from `f0a566a26` and rebased onto `c87512939` (PR 25) before the
+  push. The only overlap was PR 25's one-line `HASH_KEYS` addition in `process.ts`, which
+  rebased without conflict.
+- `.github/workflows/free-tests.yml` joined the change after the adversarial review
+  (recorded in Files that change).
