@@ -101,3 +101,19 @@ Each step → verify, then commit (conventional, `-F` message file, `git branch 
   `cso-eval`, `cso-git-hardening` and `cso-lease-identity` fail 33 tests identically on
   untouched `origin/main` and on this branch (they need built binaries); no difference in
   the failing set. They are rerun after `build:cso` at VERIFY.
+- **Race tests moved below the repository root after the first mutation pass** (commit
+  `6cded4521`). With the symlink stability check disabled, both race tests still passed:
+  their link was in the root, and `guard()`'s repository-root identity check (the root
+  directory and its Git marker, by mtime/ctime) caught the unlink first. The raced link is
+  now `docs/guide.md`, and the assertion requires the `SNAPSHOT_RACE` message to name it.
+
+## Mutation check (step 3)
+Each mutant applied to the committed `snapshot.ts`, `test/cso-snapshot-symlink.test.ts` run,
+then restored with `git restore`:
+
+| Mutant | Result |
+|---|---|
+| skip `containedFile` on the alias target | 2 fail (chained symlink, crossing a symlinked directory) |
+| record `100644` instead of `120000` | 1 fail (diff mode) |
+| stability check never throws | 2 fail (retarget, swap), after the race tests moved below the root |
+| accept absolute targets | 1 fail (absolute target) |
