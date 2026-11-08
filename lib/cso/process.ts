@@ -9,6 +9,7 @@ import {
   type Stats,
   openSync,
   readSync,
+  readlinkSync,
   realpathSync,
   statSync,
 } from 'node:fs';
@@ -29,6 +30,31 @@ export const TRUSTED_DIRECTORIES =
     ? [...new Set([WINDOWS_GIT ? dirname(WINDOWS_GIT) : '', WINDOWS_SYSTEM].filter(Boolean))]
     : ['/usr/local/bin', '/usr/bin', '/bin', '/opt/homebrew/bin', '/usr/local/sbin', '/usr/sbin', '/sbin'];
 export const TRUSTED_PATH = TRUSTED_DIRECTORIES.join(delimiter);
+const MAX_SYMLINK_HOPS = 40;
+/**
+ * Resolve every symlink in an executable path without asking the kernel for the
+ * file's name. macOS ships /usr/bin/git as one of many hard links to the
+ * xcode-select shim, which picks its tool from its own path; a kernel lookup
+ * (Bun's realpathSync) may name any sibling link, such as /usr/bin/python3.
+ */
+export function canonicalExecutable(path: string): string {
+  if (process.platform === 'win32') return realpathSync(path);
+  const pending = resolve(path).split('/').filter(Boolean);
+  let resolved = '/',
+    hops = 0;
+  while (pending.length) {
+    const next = join(resolved, pending.shift()!);
+    if (!lstatSync(next).isSymbolicLink()) {
+      resolved = next;
+      continue;
+    }
+    if (++hops > MAX_SYMLINK_HOPS) throw new CsoError('UNSAFE_PATH', 'Executable symlink chain is too long');
+    const target = readlinkSync(next);
+    pending.unshift(...target.split('/').filter(Boolean));
+    if (isAbsolute(target)) resolved = '/';
+  }
+  return resolved;
+}
 export function executable(name: string): string {
   // Never consult the audited repository's PATH or executable overrides.
   if (!/^[a-zA-Z0-9._-]+$/.test(name)) throw new CsoError('INVALID_ARGUMENT', 'Invalid executable name');
@@ -56,7 +82,7 @@ export function executable(name: string): string {
       try {
         const stat = statSync(p);
         accessSync(p, constants.X_OK);
-        if (stat.isFile() && (process.platform === 'win32' || stat.mode & 0o111)) return realpathSync(p);
+        if (stat.isFile() && (process.platform === 'win32' || stat.mode & 0o111)) return canonicalExecutable(p);
       } catch {}
     }
   }
@@ -477,13 +503,11 @@ function assertGitConfigIdentities(expected: GitConfigIdentity[]): void {
 }
 function hardenGit(file: string, args: string[]): { args: string[]; configs?: GitConfigIdentity[] } {
   if (!/^(?:git|git\.exe)$/i.test(basename(file))) return { args };
-  let trusted: string;
-  try {
-    trusted = executable('git');
-  } catch {
-    return { args };
-  }
-  if (realpathSync(file) !== trusted) return { args };
+  // A Git-named child that cannot be hardened is refused, never run as-is: an
+  // unresolvable trusted Git propagates its error, and a lookalike is unsafe.
+  const trusted = executable('git');
+  if (canonicalExecutable(file) !== trusted)
+    throw new CsoError('UNSAFE_PATH', 'Refusing a Git executable that is not the trusted Git');
   const positions = args.flatMap((value, index) => (value === '-C' ? [index] : []));
   if (positions.length !== 1 || positions[0] + 1 >= args.length)
     throw new CsoError(
