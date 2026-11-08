@@ -168,6 +168,7 @@ const HASH_KEYS = new Set([
   'planSha256',
   'planHash',
   'originalHash',
+  'linkHash',
   'executionHash',
   'snapshotHash',
   'sourceHash',

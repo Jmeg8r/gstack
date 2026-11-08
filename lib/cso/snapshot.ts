@@ -554,16 +554,24 @@ function symlinkPath(repo: string, path: string): string {
   const parent = dirname(relativePath(path));
   return join(parent === '.' ? repo : containedFile(repo, parent), basename(path));
 }
+/**
+ * The persisted, domain-separated digest of a symlink's text. It binds the
+ * link's target into the original source identity, so a retargeted link is a
+ * different source; like Git's own blob hash, it carries no link text.
+ */
+function symlinkIdentity(text: Buffer): string {
+  return createHash('sha256').update('cso-symlink-v1\0').update(text).digest('hex');
+}
 /** Reads link text as bytes, only to classify and to hash it the way Git stores a symlink (mode 120000). */
 function readSymlink(full: string, objectFormat: string): { text: Buffer; linkHash: string } {
   const text = fs.readlinkSync(full, { encoding: 'buffer' });
   return { text, linkHash: createHash(objectFormat).update(`blob ${text.length}\0`).update(text).digest('hex') };
 }
 /**
- * Lexical, never-following classification. An alias names a relative, in-repo
- * regular file that is itself in the capture inventory and reached through no
- * symlink; containedFile rejects a symlink anywhere on that path, including
- * the target itself. Anything else is withheld with one fixed reason.
+ * Never-following classification. An alias names a relative, in-repo regular
+ * file that is itself in the capture inventory and reached through no symlink;
+ * containedFile rejects a symlink anywhere on that path, including the target
+ * itself. Anything else is withheld with one fixed reason.
  */
 function classifySymlink(
   repo: string,
@@ -578,8 +586,36 @@ function classifySymlink(
     return { reason: 'link text is not UTF-8' };
   }
   if (posix.isAbsolute(link) || isAbsolute(link)) return { reason: 'absolute' };
-  const target = posix.normalize(posix.join(posix.dirname(path), link));
-  if (target === '.' || target === '..' || target.startsWith('../')) return { reason: 'escapes the repository' };
+  // Walk the link one component at a time, as the kernel would, without
+  // following anything: a component the link descends into must already be a
+  // real directory, so a later `..` cannot erase a missing directory, a file or
+  // a symlink that the kernel would have had to traverse. The link's own
+  // parent directories were checked by symlinkPath.
+  const parent = posix.dirname(path),
+    parts = parent === '.' ? [] : parent.split('/'),
+    components = link.split('/');
+  for (const [index, part] of components.entries()) {
+    if (part === '' || part === '.') continue;
+    if (part === '..') {
+      if (!parts.length) return { reason: 'escapes the repository' };
+      parts.pop();
+      continue;
+    }
+    parts.push(part);
+    if (index === components.length - 1) continue;
+    let step: fs.Stats;
+    try {
+      step = fs.lstatSync(join(repo, ...parts));
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') return { reason: 'missing target' };
+      throw error;
+    }
+    if (step.isSymbolicLink()) return { reason: 'target is a symlink or crosses one' };
+    if (!step.isDirectory()) return { reason: 'missing target' };
+  }
+  if (!parts.length) return { reason: 'escapes the repository' };
+  const target = parts.join('/');
   let stat: fs.Stats;
   try {
     stat = fs.lstatSync(containedFile(repo, target));
@@ -803,6 +839,7 @@ export async function capture(
           bytes: size,
           mode: source.mode & 0o777,
           transformation,
+          linkHash: symlinkIdentity(text),
         });
         guard();
         continue;
@@ -1243,6 +1280,8 @@ export function assertSnapshot(runDir: string, manifest: SnapshotManifest): void
       throw new CsoError('INCOMPATIBLE_INPUT', 'Snapshot manifest contains an invalid execution entry');
     if (e.originalHash === 'not-read' && (e.executionHash !== undefined || !e.transformation))
       throw new CsoError('INCOMPATIBLE_INPUT', 'Unread source cannot be represented as an execution input');
+    if (e.linkHash !== undefined && (e.originalHash !== 'not-read' || !/^[a-f0-9]{64}$/.test(e.linkHash)))
+      throw new CsoError('INCOMPATIBLE_INPUT', 'Snapshot manifest contains an invalid symlink entry');
     return { ...e, path };
   });
   const deleted = (manifest.deletedPaths ?? []).map((item) => {
