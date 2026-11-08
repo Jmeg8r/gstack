@@ -1,11 +1,11 @@
 ---
 change: 2026-11-08-cso-symlink-alias
-status: draft
+status: accepted
 track: T3
 risk: high
 risk_reason: /cso is a security audit; a defect could let a symlink hide audited code, read a file outside the repository, or report coverage it did not have
 author: james
-accepted_by:
+accepted_by: james
 linear: pending
 source: conversation (ClaudeClaw ASTGL-74 VERIFY, 2026-11-08)
 ---
