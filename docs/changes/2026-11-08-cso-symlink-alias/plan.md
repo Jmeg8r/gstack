@@ -80,3 +80,24 @@ Each step → verify, then commit (conventional, `-F` message file, `git branch 
   (`/var/folders/...`, under the `/var -> /private/var` symlink) 85 of 100 fail with
   `Private state has a symlink or non-directory ancestor`: the private-state guard
   refusing a symlinked ancestor, as designed. Every test run in this change uses the real path.
+
+## Deviations
+- **Three existing tests encoded the removed rule and were rewritten, not left unchanged**
+  (intent success signal "existing suites pass unchanged"). Each now asserts its stated
+  purpose under the new behaviour:
+  - `test/cso-snapshot-state.test.ts` "rejects symlinks and hard links as execution inputs"
+    → "never follows a symlink into an execution input, and rejects hard links": the
+    `/etc/passwd` link is `withheld (absolute)`, absent from both copies; the hard link is
+    still refused. The original `expect(...).rejects` calls were not awaited, so the
+    hard-link half never actually ran; both are awaited now.
+  - same file, "rejects broken untracked symlinks instead of silently omitting them" →
+    "records a broken untracked symlink explicitly…": `withheld (missing target)`.
+  - `test/cso-ordinary-repos.test.ts` negative control: a symlink to an outside directory
+    is a withheld gap (coverage partial), never the nested-repository boundary exclusion,
+    and the outside content reaches no run file. CLI-level; runs only with built binaries.
+- **One extra unaudited reason**, `target is not a regular file` (an ignored FIFO, socket
+  or device as the target), not in the spec's list.
+- **Pre-existing CLI-suite failures.** `cso-cli`, `cso-ordinary-repos`, `cso-cache`,
+  `cso-eval`, `cso-git-hardening` and `cso-lease-identity` fail 33 tests identically on
+  untouched `origin/main` and on this branch (they need built binaries); no difference in
+  the failing set. They are rerun after `build:cso` at VERIFY.
