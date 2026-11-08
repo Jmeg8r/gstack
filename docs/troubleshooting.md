@@ -1324,13 +1324,18 @@ link itself, to classify it, and records it in the snapshot manifest.
 - A relative symlink to a regular source file inside the repository (for
   example `AGENTS.md -> CLAUDE.md`) is an **alias**: `excluded: symlink alias
   of <handle>`. The target is audited under its own path, so coverage is
-  unchanged.
+  unchanged. Every directory the link passes through must exist and be a real
+  directory: `missing/../CLAUDE.md` is withheld as a missing target, not an
+  alias.
 - Any other symlink is **withheld**: `withheld: symlink not followed
   (<reason>)`, where the reason is absolute, escapes the repository, missing
   target, target is a directory, target is a symlink or crosses one, target is
   not a regular file, target not in the source inventory, or link text is not
   UTF-8. Snapshot coverage then reads **partial** and the report lists it.
-- The link text itself is never written to the manifest or a report.
+- The link text itself is never written to the manifest or a report. Retained
+  history replaces every symlink diff with `diff withheld: <path> (symlink)`.
+  The manifest keeps only a digest of the link text, so a retargeted symlink
+  changes the source identity that `replay --source` checks.
 - `--comprehensive` does not recreate symlinks in the execution copy. An
   application that needs one at runtime reports that input as withheld.
 

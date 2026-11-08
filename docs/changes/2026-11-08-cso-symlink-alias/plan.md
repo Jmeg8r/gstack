@@ -106,6 +106,64 @@ Each step → verify, then commit (conventional, `-F` message file, `git branch 
   their link was in the root, and `guard()`'s repository-root identity check (the root
   directory and its Git marker, by mtime/ctime) caught the unlink first. The raced link is
   now `docs/guide.md`, and the assertion requires the `SNAPSHOT_RACE` message to name it.
+- **Codex review of PR 25 found three P2 gaps; all fixed on this branch** (tests
+  `2da512cf2`, fix `2e6547ff3`). Each was confirmed against the code before fixing:
+  - *Link text in retained history.* History filtering was path-based only, so a
+    committed symlink's `120000` patch body (its link text) reached `history.txt`
+    and the `history` command. `withholdHistory` now withholds any section whose
+    extended header shows mode `120000`, whatever the path. The original disclosure
+    test missed this because its symlinks were never committed.
+  - *`..` collapsed before validation.* `posix.normalize` ran before any check, so
+    `missing/../README.md` was an alias. The classifier now walks the link one
+    component at a time from its parent: every component it descends into must be
+    a real directory (lstat, never followed) before a later `..` may leave it.
+  - *Link target not in the source identity.* Symlink entries persisted only
+    `originalHash: 'not-read'`, so `replay --source` accepted a retargeted link.
+    Entries now persist `linkHash` (sha256 of `cso-symlink-v1\0` + link text),
+    bound into `snapshotOriginalIdentity` only when present, so identities of
+    artifacts without symlinks are unchanged. No link text is stored: like Git's
+    blob hash, the digest reveals the text only to someone who can guess it.
+  - **Scope departs from F1** ("nothing in `cli.ts`, `contracts.ts`,
+    `verification.ts`"): `lib/cso/history.ts` (section withholding),
+    `lib/cso/contracts.ts` (`SnapshotEntry.linkHash`, identity tuple) and
+    `lib/cso/process.ts` (`linkHash` joins the redaction hash allowlist, so a
+    manifest printed through redaction keeps it). Each is the narrowest place
+    the fix can live.
+- **Live runs 1 and 2 predate these fixes.** Their `AGENTS.md -> CLAUDE.md`
+  classification is unaffected (no intermediate component, no `..`); history
+  output and the source identity would differ. Not re-run.
+
+## Mutation check (Codex fixes)
+Same method, against `2e6547ff3`:
+
+| Mutant | Result |
+|---|---|
+| skip the intermediate component checks | 3 fail (missing directory, regular file, symlinked directory then `..`) |
+| never withhold symlink history sections | 2 fail (history unit test, committed link text) |
+| leave `linkHash` out of the identity | 1 fail (source identity) |
+| do not persist `linkHash` | 1 fail (source identity) |
+
+Every kill was an assertion failure; no run hit the Git shim misfire below.
+
+## VERIFY results (Codex fixes, 2026-11-08, at `2e6547ff3`)
+- `bun run typecheck`: clean. `bun run typecheck:test`: "819 known diagnostics, none new".
+- `test/cso-snapshot-symlink.test.ts` + `test/cso-history.test.ts`: **27 pass, 0 fail**
+  on a clean run (22 symlink tests, up from 16).
+- **Environment flake, not this change:** about 2% of the helper's Git calls run
+  Xcode's `python3` instead (`unknown option --no-optional-locks`, exit 2, reported
+  as `MISSING_INPUT … unsupported invocation`). Reproduced outside the tests by
+  calling the helper's `runProcess` with its sanitized environment (6 of 300). The
+  helper resolves `/usr/bin/git` (the xcode-select shim) before Homebrew's Git.
+  Under that flake, runs fail a different random set of tests each time.
+- Wide run with rebuilt binaries (the ten files above plus `cso-history`): 271 pass,
+  3 skip, 11 fail. One is the pre-existing `cso-cache` lease failure; nine are the
+  shim misfire (error text names it); two had no visible error and were rerun
+  individually. On rerun `cso-git-hardening` 11/11 and `cso-snapshot-symlink` 22/22;
+  `cso-snapshot-state` 87/1 (the 1 is the shim misfire); `cso-cli` failed 3 and then 4
+  *different* tests in successive runs, each a compiled `start` or `submit` that
+  exited 1 with empty output. No `cso-cli` test failed twice. Consistent with the
+  shim misfire inside the compiled binary, whose stderr the tests do not show;
+  **not independently proven**.
 
 ## Mutation check (step 3)
 Each mutant applied to the committed `snapshot.ts`, `test/cso-snapshot-symlink.test.ts` run,
