@@ -100,6 +100,10 @@ describe('CSO snapshot tracked symlinks', () => {
     ['target crossing a symlinked directory', 'cross.md', ({ repo, link }) => { fs.mkdirSync(path.join(repo, 'real')); fs.writeFileSync(path.join(repo, 'real/f.md'), 'f\n'); link('via', 'real'); link('cross.md', 'via/f.md'); }, 'target is a symlink or crosses one'],
     ['target outside the source inventory', 'hidden.md', ({ repo, link }) => { fs.writeFileSync(path.join(repo, '.gitignore'), 'ignored.md\n'); fs.writeFileSync(path.join(repo, 'ignored.md'), 'ignored\n'); link('hidden.md', 'ignored.md'); }, 'target not in the source inventory'],
     ['non-UTF-8 link text', 'binary.md', ({ link }) => link('binary.md', Buffer.from([0xff, 0xfe, 0x61])), 'link text is not UTF-8'],
+    // `..` must not erase a component the kernel would have to traverse first.
+    ['target through a missing directory', 'dotdot.md', ({ link }) => link('dotdot.md', 'missing/../README.md'), 'missing target'],
+    ['target through a regular file', 'viafile.md', ({ link }) => link('viafile.md', 'README.md/../CLAUDE.md'), 'missing target'],
+    ['target through a symlinked directory and back up', 'back.md', ({ repo, link }) => { fs.mkdirSync(path.join(repo, 'real/sub'), { recursive: true }); link('via', 'real/sub'); link('back.md', 'via/../CLAUDE.md'); }, 'target is a symlink or crosses one'],
   ];
   for (const [name, linkName, arrange, reason] of cases)
     posixOnly(`records a ${name} as an unaudited symlink`, async () => {
@@ -123,6 +127,53 @@ describe('CSO snapshot tracked symlinks', () => {
     // Positive control: the same scan finds the marker when it is present.
     fs.writeFileSync(path.join(runDir, 'control.txt'), marker);
     expect(containsMarker(runDir, marker)).toEqual(['control.txt']);
+  });
+
+  posixOnly('still records an alias whose path climbs back through a real directory', async () => {
+    const { repo, runDir, link } = fixture();
+    link('docs/up.md', '../docs/../README.md');
+    const manifest = await capture(repo, runDir);
+    expect(entry(manifest, 'docs/up.md')).toMatchObject({ originalHash: 'not-read', transformation: alias(repo, 'README.md') });
+  });
+
+  posixOnly('keeps committed link text out of retained history', async () => {
+    const { root, repo, runDir, git, link } = fixture(),
+      marker = `HISTORY-MARKER-${process.pid}-${Date.now()}`;
+    fs.writeFileSync(path.join(root, `${marker}.txt`), `${marker} outside payload\n`);
+    link('leak.md', `../${marker}.txt`);
+    link('AGENTS.md', 'CLAUDE.md');
+    git('add', '.');
+    git('commit', '-qm', 'links');
+    await capture(repo, runDir);
+    const history = fs.readFileSync(path.join(runDir, 'history.txt'), 'utf8');
+    expect(history).toContain('diff withheld: leak.md (symlink)');
+    // AGENTS.md is already withheld by its path (agent configuration); either reason keeps the text out.
+    expect(history).toContain('diff withheld: AGENTS.md (');
+    expect(containsMarker(runDir, marker)).toEqual([]);
+  });
+
+  posixOnly('binds each symlink target into the original source identity', async () => {
+    const { root, repo, runDir, link } = fixture(),
+      second = path.join(root, 'run-2'),
+      third = path.join(root, 'run-3');
+    fs.mkdirSync(second, { mode: 0o700 });
+    fs.mkdirSync(third, { mode: 0o700 });
+    link('docs/guide.md', '../CLAUDE.md');
+    const first = await capture(repo, runDir),
+      again = await capture(repo, second);
+    expect(again.originalHash).toBe(first.originalHash);
+    // Retarget the alias out of the repository: same path, same mode, different topology.
+    fs.unlinkSync(path.join(repo, 'docs/guide.md'));
+    link('docs/guide.md', '../../outside.md');
+    const retargeted = await capture(repo, third);
+    expect(retargeted.originalHash).not.toBe(first.originalHash);
+    expect(() => assertSnapshot(third, retargeted)).not.toThrow();
+    // The bound value is checked, not just carried: altering it breaks the identity.
+    const tampered = structuredClone(first),
+      bound = tampered.entries.find((item) => item.path === 'docs/guide.md') as { linkHash?: string };
+    expect(bound.linkHash).toMatch(/^[a-f0-9]{64}$/);
+    bound.linkHash = '0'.repeat(64);
+    expect(() => assertSnapshot(runDir, tampered)).toThrow('Snapshot original identity is inconsistent');
   });
 
   posixOnly('gives coverage what it keys on: excluded for an alias, withheld for anything else', async () => {
