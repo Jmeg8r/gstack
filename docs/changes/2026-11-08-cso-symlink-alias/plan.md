@@ -117,3 +117,31 @@ then restored with `git restore`:
 | record `100644` instead of `120000` | 1 fail (diff mode) |
 | stability check never throws | 2 fail (retarget, swap), after the race tests moved below the root |
 | accept absolute targets | 1 fail (absolute target) |
+
+## VERIFY results (2026-11-08, at `9bdf35e76`)
+- `bun run build:cso` in the worktree: launcher 3.0.0 / ABI 3; build outputs are ignored,
+  worktree clean afterwards.
+- With the built binaries and a real `TMPDIR`: the four snapshot suites plus `cso-cli`,
+  `cso-ordinary-repos`, `cso-git-hardening`, `cso-cache`, `cso-lease-identity` and
+  `cso-eval` → 270 pass, 3 skip, 1 fail across 10 files. The one failure,
+  `cso-cache` "recovers dead immutable leases…", fails identically on untouched
+  `origin/main` built the same way (15 pass, 1 fail there); unrelated to this change.
+  The rewritten `cso-ordinary-repos` negative control passes.
+- `bun run typecheck`: clean. `bun run typecheck:test`: "819 known diagnostics, none new".
+- **Live run 1, this fork** (`1794152678187-5232fa9650d23930`, `--diff --base origin/main`,
+  `--paths` = the changed files, because the fork's 69.1 MiB of source exceeds the 64 MiB
+  cap): run created where it was refused before; `connect-chrome` recorded
+  `withheld: outside the --paths audit scope`, not read, and **absent from `changedPaths`**
+  (Git-identical `120000` hashing; a wrong hash would have made diff mode refuse the run).
+  Self-audit submitted (application-model and attack-surface, sequential challenge) and
+  finished: partial, 0 findings.
+- **Live run 2, ClaudeClaw ASTGL-74 worktree** (`1794152816617-233c2eb118275ecb`): `AGENTS.md`
+  recorded `excluded: symlink alias of @cso-path//…`, not read, not a changed path;
+  `CLAUDE.md` still excluded on its own entry (F3); no link text in the manifest; changed
+  paths are exactly ASTGL-74's 9 files. Secrets, attack-surface and ci-cd submitted;
+  finished: partial, 0 findings.
+- `security-review` (F2): done as the sequential review recorded in the two submissions
+  above; no findings.
+- Noted, not changed: tracked files under dependency-excluded directories (here
+  `.gstack/*.json`) always appear in `changedPaths` because they get no Git hash. That
+  predates this change.
