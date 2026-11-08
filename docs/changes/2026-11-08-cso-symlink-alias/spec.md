@@ -1,9 +1,9 @@
 ---
 change: 2026-11-08-cso-symlink-alias
-status: draft
+status: accepted
 track: T3
 intent: ./intent.md
-accepted_by:
+accepted_by: james
 linear: pending
 skills_in_force: []
 claude_config_sha: 6ab4082
