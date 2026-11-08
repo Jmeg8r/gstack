@@ -1315,7 +1315,24 @@ or too large. Each message names the cap that applied:
 - **64 MiB source cap.** The full size of every such file outside dependency
   and VCS directories counts, including files over 1 MiB whose contents are
   withheld from the audit.
-- **Symlinks.** A tracked symlink anywhere in the repository stops the run.
+- **Special files.** A nonignored FIFO, socket or device anywhere in the
+  repository stops the run (`Symlink or special source file: <path>`).
+
+Symlinks do **not** stop the run. /cso never follows one: it reads only the
+link itself, to classify it, and records it in the snapshot manifest.
+
+- A relative symlink to a regular source file inside the repository (for
+  example `AGENTS.md -> CLAUDE.md`) is an **alias**: `excluded: symlink alias
+  of <handle>`. The target is audited under its own path, so coverage is
+  unchanged.
+- Any other symlink is **withheld**: `withheld: symlink not followed
+  (<reason>)`, where the reason is absolute, escapes the repository, missing
+  target, target is a directory, target is a symlink or crosses one, target is
+  not a regular file, target not in the source inventory, or link text is not
+  UTF-8. Snapshot coverage then reads **partial** and the report lists it.
+- The link text itself is never written to the manifest or a report.
+- `--comprehensive` does not recreate symlinks in the execution copy. An
+  application that needs one at runtime reports that input as withheld.
 
 **Fix.** No setting raises these caps. For the 64 MiB source cap, rerun with
 `--paths` set to the comma-separated repo-relative directories you want audited
@@ -1327,8 +1344,8 @@ With `--diff`, every changed path outside dependency directories must be inside
 `--paths`, or the run is refused. Do not audit a hand-trimmed copy: /cso would treat it as the whole
 repository and report nothing as skipped. `--paths` does not lower the
 manifest cap or the 100,000-entry limit, because every skipped path still has a
-manifest entry (about 50,000 files fit). Symlinks must be removed. Add your
-file count or size to
+manifest entry (about 50,000 files fit). For a special file, remove it or
+add it to `.gitignore`. Add your file count or size to
 [#2993](https://github.com/garrytan/gstack/issues/2993).
 
 <a id="cso-scanner-invalid-output"></a>
