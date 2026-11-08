@@ -100,6 +100,8 @@ describe('CSO snapshot tracked symlinks', () => {
     ['target crossing a symlinked directory', 'cross.md', ({ repo, link }) => { fs.mkdirSync(path.join(repo, 'real')); fs.writeFileSync(path.join(repo, 'real/f.md'), 'f\n'); link('via', 'real'); link('cross.md', 'via/f.md'); }, 'target is a symlink or crosses one'],
     ['target outside the source inventory', 'hidden.md', ({ repo, link }) => { fs.writeFileSync(path.join(repo, '.gitignore'), 'ignored.md\n'); fs.writeFileSync(path.join(repo, 'ignored.md'), 'ignored\n'); link('hidden.md', 'ignored.md'); }, 'target not in the source inventory'],
     ['non-UTF-8 link text', 'binary.md', ({ link }) => link('binary.md', Buffer.from([0xff, 0xfe, 0x61])), 'link text is not UTF-8'],
+    // A leading UTF-8 BOM is part of the filename, not an encoding mark: ﻿README.md does not exist.
+    ['target whose name starts with a byte-order mark', 'bom.md', ({ link }) => link('bom.md', Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('README.md')])), 'missing target'],
     // `..` must not erase a component the kernel would have to traverse first.
     ['target through a missing directory', 'dotdot.md', ({ link }) => link('dotdot.md', 'missing/../README.md'), 'missing target'],
     ['target through a regular file', 'viafile.md', ({ link }) => link('viafile.md', 'README.md/../CLAUDE.md'), 'missing target'],

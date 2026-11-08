@@ -581,7 +581,8 @@ function classifySymlink(
 ): { target: string } | { reason: string } {
   let link: string;
   try {
-    link = new TextDecoder('utf-8', { fatal: true }).decode(text);
+    // ignoreBOM keeps a leading U+FEFF: to the filesystem it is part of the name.
+    link = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(text);
   } catch {
     return { reason: 'link text is not UTF-8' };
   }

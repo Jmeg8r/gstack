@@ -129,6 +129,12 @@ Each step → verify, then commit (conventional, `-F` message file, `git branch 
     `lib/cso/process.ts` (`linkHash` joins the redaction hash allowlist, so a
     manifest printed through redaction keeps it). Each is the narrowest place
     the fix can live.
+- **Codex re-review at `67a9a59ae`: gate PASS, one P3, fixed.** `TextDecoder` drops a
+  leading UTF-8 BOM by default, so a link to `﻿README.md` (absent) was an alias of
+  `README.md`. The decoder now passes `ignoreBOM: true`; a regression case records it as
+  `missing target`. The case failed before the fix (recorded as an alias) and passes
+  after it. In later runs every failure was the Git shim misfire below (failure count
+  equal to misfire lines in each of six runs); no assertion failed.
 - **Live runs 1 and 2 predate these fixes.** Their `AGENTS.md -> CLAUDE.md`
   classification is unaffected (no intermediate component, no `..`); history
   output and the source identity would differ. Not re-run.
