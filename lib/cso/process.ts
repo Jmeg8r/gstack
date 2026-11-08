@@ -503,13 +503,11 @@ function assertGitConfigIdentities(expected: GitConfigIdentity[]): void {
 }
 function hardenGit(file: string, args: string[]): { args: string[]; configs?: GitConfigIdentity[] } {
   if (!/^(?:git|git\.exe)$/i.test(basename(file))) return { args };
-  let trusted: string;
-  try {
-    trusted = executable('git');
-  } catch {
-    return { args };
-  }
-  if (canonicalExecutable(file) !== trusted) return { args };
+  // A Git-named child that cannot be hardened is refused, never run as-is: an
+  // unresolvable trusted Git propagates its error, and a lookalike is unsafe.
+  const trusted = executable('git');
+  if (canonicalExecutable(file) !== trusted)
+    throw new CsoError('UNSAFE_PATH', 'Refusing a Git executable that is not the trusted Git');
   const positions = args.flatMap((value, index) => (value === '-C' ? [index] : []));
   if (positions.length !== 1 || positions[0] + 1 >= args.length)
     throw new CsoError(
