@@ -52,3 +52,24 @@ merges, this branch is rebased onto `origin/main` before its own merge.
 - **Harden by canonical path instead of basename** (spec C1). Stricter, but it changes
   which children are hardened. That is a separate change.
 - **Keep the fallback and log a warning.** Still runs unhardened Git. Rejected.
+
+## VERIFY results (2026-11-08, Mac Studio, Bun 1.4.4)
+- `bun test test/cso-git-fail-closed.test.ts`: on `21a844ff8` (before the fix) 4 fail,
+  1 pass (the symlink control); on `645b217b8` (the fix) 5 pass.
+- `TMPDIR=$(realpath "$TMPDIR") bun test test/cso-*.test.ts`, after `bun run build:cso`:
+  - fix `645b217b8`: 853 pass, 35 skip, 3 fail, 891 tests across 61 files.
+  - baseline `90edb015c` (PR 26 head): 848 pass, 35 skip, 3 fail, 886 tests across 60 files.
+  - The same 3 failures on both: `cso-cache` 'recovers dead immutable leases' (known), an
+    afterEach hook timeout in `cso-file-ceiling.test.ts`, and `cso-requalification`
+    'the committed catalog is not older than its trigger inputs'. None comes from
+    `hardenGit`.
+- `bun run typecheck`: exit 0.
+- `bun run format:cso:check`: warns on `history.ts`, `process.ts`, `snapshot.ts`, the same
+  three files as on the baseline. Prettier proposes no change in the edited hunk.
+- `snyk test`: 2 medium issues, both in transitive dependencies this change does not touch
+  (`adm-zip` via `onnxruntime-node`, `ip-address` via `socks`).
+
+## Deviations
+- The first suite run in the new worktree showed 67 failures because the gitignored compiled
+  CSO binaries (`bin/gstack-cso-*`) were missing. After `bun run build:cso` the run above
+  matches the baseline. No code changed between the two runs.
