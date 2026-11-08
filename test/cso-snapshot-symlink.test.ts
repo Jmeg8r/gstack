@@ -165,27 +165,29 @@ describe('CSO snapshot tracked symlinks', () => {
 
   posixOnly('fails with SNAPSHOT_RACE when a symlink is retargeted during capture', async () => {
     const { repo, runDir, link } = fixture(),
-      target = path.join(repo, 'AGENTS.md'),
+      target = path.join(repo, 'docs', 'guide.md'),
       readlink = fs.readlinkSync;
-    link('AGENTS.md', 'CLAUDE.md');
+    // Below the root on purpose: the repository-root identity guard would catch a root-level swap first.
+    link('docs/guide.md', '../CLAUDE.md');
     let reads = 0, failure: unknown;
     const patched = spyOn(fs, 'readlinkSync').mockImplementation(((candidate: any, options?: any) => {
       if (String(candidate) === target && ++reads === 2) {
         fs.unlinkSync(target);
-        fs.symlinkSync('README.md', target);
+        fs.symlinkSync('../README.md', target);
       }
       return readlink(candidate, options);
     }) as typeof fs.readlinkSync);
     try { await capture(repo, runDir); } catch (error) { failure = error; } finally { patched.mockRestore(); }
     expect(reads).toBeGreaterThanOrEqual(2);
-    expect(failure).toMatchObject({ code: 'SNAPSHOT_RACE' });
+    expect(failure).toMatchObject({ code: 'SNAPSHOT_RACE', message: expect.stringContaining('docs/guide.md') });
   });
 
   posixOnly('fails with SNAPSHOT_RACE when a symlink is swapped for a regular file during capture', async () => {
     const { repo, runDir, link } = fixture(),
-      target = path.join(repo, 'AGENTS.md'),
+      target = path.join(repo, 'docs', 'guide.md'),
       readlink = fs.readlinkSync;
-    link('AGENTS.md', 'CLAUDE.md');
+    // Below the root on purpose: the repository-root identity guard would catch a root-level swap first.
+    link('docs/guide.md', '../CLAUDE.md');
     let reads = 0, failure: unknown;
     const patched = spyOn(fs, 'readlinkSync').mockImplementation(((candidate: any, options?: any) => {
       if (String(candidate) === target && ++reads === 2) {
@@ -196,7 +198,7 @@ describe('CSO snapshot tracked symlinks', () => {
     }) as typeof fs.readlinkSync);
     try { await capture(repo, runDir); } catch (error) { failure = error; } finally { patched.mockRestore(); }
     expect(reads).toBeGreaterThanOrEqual(2);
-    expect(failure).toMatchObject({ code: 'SNAPSHOT_RACE' });
+    expect(failure).toMatchObject({ code: 'SNAPSHOT_RACE', message: expect.stringContaining('docs/guide.md') });
   });
 
   posixOnly('still refuses a FIFO next to a symlink', async () => {
