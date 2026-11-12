@@ -19,7 +19,7 @@ import { getHostConfig } from '../../hosts/index';
 import { outsideVoiceFor, outsideVoiceGuard, outsideVoiceInvocation, outsideVoicePreflight, outsideVoiceProvenance, generateOutsideVoiceRouting } from './outside-voice';
 
 // Domain modules
-import { generatePreamble } from './preamble';
+import { generateSkillPreamble } from './preamble-hoist';
 import { generateTestFailureTriage } from './preamble';
 import { generateDesignMethodology, generateDesignHardRules, generateDesignOutsideVoices, generateDesignReviewLite, generateDesignSketch, generateDesignSetup, generateDesignMockup, generateDesignShotgunGeneration, generateDesignShotgunLoop, generateTasteProfile, generateUXPrinciples, generateOverusedFonts, generateDesignSlopBullets, generateDesignDetector, generateDesignMdCheck } from './design';
 import { generateTestBootstrap, generateTestCoverageAuditPlan, generateTestCoverageAuditShip, generateTestCoverageGateShip } from './testing';
@@ -29,7 +29,7 @@ import { generateAntiShortcutClause, generateSpecReviewLoop, generateBenefitsFro
 import { generateCodexSecondOpinion, generateAdversarialStep, generateCodexPlanReview, generateCodexDocReview } from './outside-voice-steps';
 import { generateImplementationModelHandoff } from './plan-review';
 import { generateScopeDrift, generateCrossReviewDedup, generateSharedCodeReuse } from './review-scope';
-import { generateSlugEval, generateSlugSetup, generateBaseBranchDetect, generateDeployBootstrap, generateQAMethodology, generateCoAuthorTrailer, generateChangelogWorkflow, generateCodexWebSearchFlag, generateCodexModelConfigFlag, generateClaudeModelFlag, generateSetupCommand } from './utility';
+import { generateSlugEval, generateSlugSetup, generateBaseBranchDetect, generateDeployBootstrap, generateQAMethodology, generateCoAuthorTrailer, generateChangelogWorkflow, generateCodexWebSearchFlag, generateCodexModelConfigFlag, generateCodexReviewModelConfigFlag, generateClaudeModelFlag, generateSetupCommand } from './utility';
 import { generateLearningsSearch, generateLearningsLog } from './learnings';
 import { generateConfidenceCalibration } from './confidence';
 import { generateGateScanBlock } from './gate-scan';
@@ -39,6 +39,7 @@ import { generateDxFramework, generateDxErrorCompact, generateDxErrorItems } fro
 import { generateGBrainContextLoad, generateGBrainSaveResults, generateBrainPreflight, generateBrainCacheRefresh, generateBrainWriteBack } from './gbrain';
 import { generateTasksSectionEmit, generateTasksSectionAggregate } from './tasks-section';
 import { SECTION, SECTION_INDEX } from './sections';
+import { DESIGN_CRAFT_RULE, DESIGN_PERSUADE_CHECKS } from './design-craft';
 import { generateRedactInvocationBlock } from './redact-doc';
 import { generateFreeTextFile } from './free-text-file';
 import { FOREGROUND_DISPATCH_NOTE, codexSelect } from './constants';
@@ -53,8 +54,11 @@ import { generatePlanRealityRows } from './plan-reality';
 import { generateSidewaysSweep, generateFlakeFixNumber } from './sideways';
 import { generateCoordinatorContract } from './coordinator-contract';
 import { generateAutoplanDriverCodes, generateAutoplanDriverCommands, generateAutoplanDriverFiles, generateAutoplanDriverGate, generateAutoplanDriverPhases, generateAutoplanDriverResultFormat } from './autoplan-driver';
+import { generateShipDriverStops } from './ship-driver';
 import { generateQAScope, generateQAExploratory, generateQAFunctional, generateQAResource, generateQAReview, generateQAReviewPreflight, generateQAMethodReads } from './qa';
 import { generateVoiceTriggerRouting } from './voice-triggers';
+import { generateTranscriptDiscovery, generateTranscriptSources } from './transcripts';
+import { generateContractDoneMeans } from './contract-done-means';
 
 export const RESOLVERS: Record<string, ResolverFn> = {
   AUTOPLAN_PUBLICATION_HOOK: generateAutoplanPublicationHook,
@@ -73,6 +77,7 @@ export const RESOLVERS: Record<string, ResolverFn> = {
   SLUG_SETUP: generateSlugSetup,
   CODEX_WEB_SEARCH_FLAG: generateCodexWebSearchFlag,
   CODEX_MODEL_CONFIG_FLAG: generateCodexModelConfigFlag,
+  CODEX_REVIEW_MODEL_CONFIG_FLAG: generateCodexReviewModelConfigFlag,
   CODEX_SELECT: (_ctx, args) => codexSelect(args?.[0] === 'review' ? 'review' : 'exec', undefined, args?.[1] ? { budgetSecs: Number(args[1]), optional: true } : undefined),
   CLAUDE_MODEL_FLAG: generateClaudeModelFlag,
   REDACT_INVOCATION_BLOCK: generateRedactInvocationBlock,
@@ -87,7 +92,7 @@ export const RESOLVERS: Record<string, ResolverFn> = {
   SNAPSHOT_FLAGS: generateSnapshotFlags,
   BROWSE_SETUP: generateBrowseSetup,
   BROWSE_FALLBACK: generateBrowseFallback,
-  PREAMBLE: generatePreamble,
+  PREAMBLE: generateSkillPreamble,
   ASIDE_SETUP: generateAsideSetup,
   ASIDE_COOKBOOK: generateAsideCookbook,
   ASIDE_RESEARCH: generateAsideResearch,
@@ -108,6 +113,8 @@ export const RESOLVERS: Record<string, ResolverFn> = {
   DESIGN_DETECTOR: generateDesignDetector,
   DESIGN_MD_CHECK: generateDesignMdCheck,
   DESIGN_SLOP_BULLETS: generateDesignSlopBullets,
+  DESIGN_CRAFT_RULE,
+  DESIGN_PERSUADE_CHECKS,
   UX_PRINCIPLES: generateUXPrinciples,
   DESIGN_OUTSIDE_VOICES: generateDesignOutsideVoices,
   DESIGN_REVIEW_LITE: generateDesignReviewLite,
@@ -186,6 +193,10 @@ export const RESOLVERS: Record<string, ResolverFn> = {
   AUTOPLAN_DRIVER_GATE: generateAutoplanDriverGate,
   AUTOPLAN_DRIVER_FILES: generateAutoplanDriverFiles,
   AUTOPLAN_DRIVER_CODES: generateAutoplanDriverCodes,
+  SHIP_DRIVER_STOPS: generateShipDriverStops,
   SECTION,
   SECTION_INDEX,
+  TRANSCRIPT_SOURCES: generateTranscriptSources,
+  TRANSCRIPT_DISCOVERY: generateTranscriptDiscovery,
+  CONTRACT_DONE_MEANS: generateContractDoneMeans,
 };

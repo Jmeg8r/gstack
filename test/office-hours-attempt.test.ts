@@ -312,7 +312,8 @@ describe('Office Hours real session runner with fake processes', () => {
         expect(captured.output).toBe('captured output');
         const diagnostic = JSON.parse(fs.readFileSync(path.join(dir, '.gstack/test-transcripts/drain-failure.json'), 'utf8'));
         expect(diagnostic.stderr).toContain('fixture auth failure');
-        expect(running(Number(fs.readFileSync(path.join(dir, 'child.pid'), 'utf8')))).toBe(false);
+        const child = fs.readFileSync(path.join(dir, 'child.pid'), 'utf8').trim();
+        expect(running(Number(child)), `held-pipe child after the runner returned (group ${fs.readFileSync(path.join(dir, 'parent.pid'), 'utf8').trim()}): ${spawnSync('ps', ['-o', 'pid=,ppid=,pgid=,stat=,etime=', '-p', child], { encoding: 'utf8', timeout: 5_000 }).stdout.trim() || 'gone now'}`).toBe(false);
       });
     }, 10_000);
   }
@@ -556,8 +557,6 @@ describe('session runner native CLI max-turns exit semantics', () => {
 const FORMAT_CASES = [
   ['skill-e2e-plan-format.test.ts', 'plan-ceo-review-format-mode'],
   ['skill-e2e-plan-format.test.ts', 'plan-ceo-review-format-approach'],
-  ['skill-e2e-plan-format.test.ts', 'plan-eng-review-format-coverage'],
-  ['skill-e2e-plan-format.test.ts', 'plan-eng-review-format-kind'],
   ['skill-e2e-plan-prosons.test.ts', 'plan-review-prosons-format'],
   ['skill-e2e-plan-prosons.test.ts', 'plan-review-prosons-hardstop-neg'],
   ['skill-e2e-plan-prosons.test.ts', 'plan-review-prosons-neutral-neg'],

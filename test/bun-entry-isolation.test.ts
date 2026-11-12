@@ -6,9 +6,11 @@
  * kinds are held to the isolated form:
  *   1. bun shebangs: exactly ISOLATED_SHEBANG (`bun run <file>` ignores the
  *      shebang, so callers carry the flags too);
- *   2. shell callers in shipped shell files, skill templates, generated skill
- *      docs and resolvers: `bun --no-env-file --config=/dev/null` before
- *      `run`, `-e`/`-p` or a script path;
+ *   2. shell callers: skill templates, generated skill docs and resolvers
+ *      spell `bun --no-env-file --config=/dev/null` before `run`, `-e`/`-p`
+ *      or a script path; shipped shell files spell SHELL_FLAGS after
+ *      CONFIG_DEF, so a Windows bash with MSYS path conversion off passes
+ *      NUL instead of a /dev/null native Bun cannot open (#3415);
  *   3. TypeScript spawns of a Bun: bunIsolationArgs() (or browse's
  *      bunChildFlags()) in the argument list;
  *   4. scriptInvocation, which launches gstack's own bun bins;
@@ -27,6 +29,8 @@ import { emptyBunConfig as browseEmptyBunConfig } from '../browse/src/bun-child-
 const ROOT = path.resolve(import.meta.dir, '..');
 const FLAGS = '--no-env-file --config=/dev/null';
 const ISOLATED_SHEBANG = `#!/usr/bin/env -S bun ${FLAGS}`;
+const SHELL_FLAGS = '--no-env-file --config="${GSTACK_BUN_CONFIG:-/dev/null}"';
+const CONFIG_DEF = 'GSTACK_BUN_CONFIG=/dev/null; case "${OSTYPE:-}" in msys*|cygwin*) if command -v cygpath >/dev/null 2>&1; then GSTACK_BUN_CONFIG=NUL; fi ;; esac';
 
 const TRACKED = spawnSync('git', ['ls-files', '-z'], { cwd: ROOT, encoding: 'utf8', timeout: 30_000 }).stdout.split('\0').filter(Boolean)
   .filter(f => !/(^|\/)test\//.test(f) && fs.existsSync(path.join(ROOT, f)) && fs.statSync(path.join(ROOT, f)).isFile());
@@ -39,11 +43,16 @@ function firstLine(file: string): string {
   } finally { fs.closeSync(fd); }
 }
 
-const BUN_WORD = /(^|[\s;&|({`"']|\$\()(bun|"\$\{?BUN(?:_[A-Z]+)?\}?"|\$\{?BUN(?:_[A-Z]+)?\}?)(?=[ \t])/g;
+const BUN_WORD = /(^|[\s;&|({`"']|\$\()(bun|"\$\{?\w*(?:BUN|[Bb]un)\w*\}?"|\$\{?\w*(?:BUN|[Bb]un)\w*\}?)(?=[ \t])/g;
+/** Any variable at a command position (`"$RUNNER" x.ts`, `OUT=$("$RUNNER" ...)`, `case) "$RUNNER" ...`); it is a Bun when it launches a TypeScript file. */
+const VAR_COMMAND = /(^\s*|[;&|({)`!]\s*|\$\(\s*|\b(?:then|do|else|exec)\s+)("\$\{?[A-Za-z_]\w*\}?"|\$\{?[A-Za-z_]\w*\}?)(?=[ \t])/g;
+
+const afterFlags = (rest: string) => rest.replace(/^\s+/, '').replace(/^(?:--(?:no-env-file|cwd[= ]\S+|config(?:=\S*|\s+\S+))\s+)*/, '');
+const runsTypeScript = (rest: string) => /^(?:run\s+)?["']?[^\s"'|;&)]*\.(?:ts|tsx|mts)(?:["'\s)|;&\\`]|$)/.test(afterFlags(rest));
 
 /** Whether the text after a `bun` word starts a program: -e/-p, a script path, `run <var>` or a bin path. A package script (`bun run build`) is not one. */
 function runsCode(rest: string): boolean {
-  const r = rest.replace(/^\s+/, '').replace(/^(?:--(?:no-env-file|cwd[= ]\S+)\s+)*/, '');
+  const r = afterFlags(rest);
   return /^(?:run\s+)?(?:-e|-p|--eval|--print)(?:\s|=|$)/.test(r)
     || /^(?:run\s+)?["']?[^\s"'|;&)]*\.(?:ts|js|mjs|cjs|tsx)(?:["'\s)|;&\\`]|$)/.test(r)
     || /^run\s+["']?\$\{?[A-Za-z_]/.test(r)
@@ -51,14 +60,20 @@ function runsCode(rest: string): boolean {
 }
 
 /** Bun invocations on one shell line that start a program without the isolation flags. */
-function unisolatedBunCalls(line: string): string[] {
+function unisolatedBunCalls(line: string, flags = FLAGS): string[] {
   if (/^\s*(#|\/\/|\*)/.test(line)) return [];
   const out: string[] = [];
   for (const m of line.matchAll(BUN_WORD)) {
     const at = m.index! + m[1]!.length;
     if (/\bln\s+-\w+\s+$/.test(line.slice(0, at))) continue;
     const rest = line.slice(at + m[2]!.length);
-    if (!rest.startsWith(` ${FLAGS}`) && runsCode(rest)) out.push(line.slice(at, at + 80));
+    if (!rest.startsWith(` ${flags}`) && runsCode(rest)) out.push(line.slice(at, at + 80));
+  }
+  for (const m of line.matchAll(VAR_COMMAND)) {
+    const at = m.index! + m[1]!.length;
+    if (new RegExp(BUN_WORD.source).test(m[2]!)) continue;
+    const rest = line.slice(at + m[2]!.length);
+    if (!rest.startsWith(` ${flags}`) && runsTypeScript(rest)) out.push(line.slice(at, at + 80));
   }
   return out;
 }
@@ -68,6 +83,26 @@ const SHELL_EXEMPT: Record<string, string> = {
   'skillify/SKILL.md.tmpl': 'describes how a codified browser-skill runs its own script in its own directory',
   'skillify/SKILL.md': 'generated from skillify/SKILL.md.tmpl',
 };
+
+/** Run only on Linux (the Ubicloud VM or its Linux-only local fallback), where /dev/null is the spelling; remote command strings expand there. */
+const SHELL_LINUX_ONLY = (f: string) => f.startsWith('scripts/ubicloud/');
+
+/** Lines of shell text that use GSTACK_BUN_CONFIG with no CONFIG_DEF line before them, or define it any other way. A `local` definition covers only the rest of its function. */
+function configDefinitionGaps(text: string): string[] {
+  const gaps: string[] = [];
+  let defined = false;
+  let definedInFunction = false;
+  text.split('\n').forEach((line, i) => {
+    if (/^\s*(?:local\s+)?GSTACK_BUN_CONFIG=/.test(line)) {
+      const local = /^\s*local\s/.test(line);
+      if (line.trim().replace(/^local\s+/, '') !== CONFIG_DEF) gaps.push(`${i + 1}: redefined: ${line.trim()}`);
+      else if (local) definedInFunction = true;
+      else defined = true;
+    } else if (/^}/.test(line)) definedInFunction = false;
+    else if (!defined && !definedInFunction && line.includes('${GSTACK_BUN_CONFIG')) gaps.push(`${i + 1}: used before CONFIG_DEF`);
+  });
+  return gaps;
+}
 
 const isShell = (f: string) => f.endsWith('.sh') || /^#!.*\b(?:ba|z)?sh\b/.test(firstLine(f));
 const isSkillSource = (f: string) => f.endsWith('.tmpl') || /^scripts\/resolvers\/.+\.ts$/.test(f)
@@ -87,8 +122,7 @@ describe('GSTA-56: gstack never takes configuration from the audited repository'
       'scripts/eval-compare.ts',
       'scripts/eval-summary.ts',
       'scripts/garry-output-comparison.ts',
-      'scripts/judge-controls.ts',
-      'scripts/measure-journal-read.ts',
+      'crew/scripts/measure-journal-read.ts',
     ];
     expect(scripts.filter(f => firstLine(f) !== ISOLATED_SHEBANG)).toEqual([]);
   });
@@ -103,6 +137,12 @@ describe('GSTA-56: gstack never takes configuration from the audited repository'
       '"$BUN" -e \'1\'',
       'bun --no-env-file run "$X/bin/gstack-design-detect.ts"',
       'running=$(bun -p process.execPath)',
+      'PINS_OUT=$("$RUNNER" "$ROOT/bin/gstack-runtime-pins.ts" --project "$PROJECT" 2>/dev/null)',
+      '    parser) "$RUNNER" "$ROOT/bin/gstack-runtime-pins.ts" --project "$PROJECT" --bun "$1" | grep -q x ;;',
+      'node_accept() { ! "$RUNNER" "$ROOT/bin/gstack-runtime-pins.ts" --node "$1"; }',
+      '"$RUNNER" run "$ROOT/bin/gstack-runtime-pins.ts"',
+      'v=$("$REC_BUN" -e "console.log(1)")',
+      '"$_bun" run "$X/bin/gstack-design-detect"',
     ]) expect(unisolatedBunCalls(bad)).not.toEqual([]);
     for (const ok of [
       `bun ${FLAGS} run ~/.claude/skills/gstack/bin/gstack-render.ts x.html`,
@@ -113,16 +153,52 @@ describe('GSTA-56: gstack never takes configuration from the audited repository'
       '# bun run scripts/x.ts in a comment',
       'say "installing bun $WANT from its release archive"',
       'ln -sf bun "$HOME/.bun/bin/bunx"',
+      `PINS_OUT=$("$RUNNER" ${FLAGS} "$ROOT/bin/gstack-runtime-pins.ts" --project "$PROJECT")`,
+      '[ -f "$ROOT/bin/gstack-runtime-pins.ts" ] && echo yes',
+      'cp "$SRC" "$DEST/pins.ts"',
+      'echo "$X" a.ts',
+      '"$NODE" -e "console.log(1)"',
+      '_got=$("$RUNNER" --version 2>/dev/null | head -1)',
+      'out=$("$GSTACK_BUN_CONFIG")',
     ]) expect(unisolatedBunCalls(ok)).toEqual([]);
+  });
+
+  test('in shipped shell files the detector requires the Windows-safe, fail-closed config spelling (#3415)', () => {
+    for (const bad of [
+      `printf x | bun ${FLAGS} -e "console.log(1)"`,
+      'bun --no-env-file --config="$GSTACK_BUN_CONFIG" -e 1',
+      'bun --no-env-file --config= -e 1',
+      'bun --no-env-file --config=NUL run "$X/bin/gstack-design-detect.ts"',
+    ]) expect(unisolatedBunCalls(bad, SHELL_FLAGS)).not.toEqual([]);
+    for (const ok of [
+      `printf x | bun ${SHELL_FLAGS} -e "console.log(1)"`,
+      `exec bun ${SHELL_FLAGS} "$HERE/question-log-hook.ts"`,
+      `probe_cmd="bun ${SHELL_FLAGS} --eval 'import x from \\"y\\"'"`,
+      `PINS_OUT=$("$RUNNER" ${SHELL_FLAGS} "$ROOT/bin/gstack-runtime-pins.ts" --project "$PROJECT")`,
+    ]) expect(unisolatedBunCalls(ok, SHELL_FLAGS)).toEqual([]);
+  });
+
+  test('the config-definition check flags a missing, late or altered GSTACK_BUN_CONFIG definition', () => {
+    const use = `bun ${SHELL_FLAGS} -e 1`;
+    expect(configDefinitionGaps(`#!/usr/bin/env bash\n${CONFIG_DEF}\n${use}\n`)).toEqual([]);
+    expect(configDefinitionGaps(`f() {\n  local ${CONFIG_DEF}\n  ${use}\n}\n`)).toEqual([]);
+    expect(configDefinitionGaps(`f() {\n  local ${CONFIG_DEF}\n}\ng() {\n  ${use}\n}\n`)).toEqual(['5: used before CONFIG_DEF']);
+    expect(configDefinitionGaps(`#!/usr/bin/env bash\n${use}\n`)).toEqual(['2: used before CONFIG_DEF']);
+    expect(configDefinitionGaps(`${use}\n${CONFIG_DEF}\n`)).toEqual(['1: used before CONFIG_DEF']);
+    expect(configDefinitionGaps(`GSTACK_BUN_CONFIG=./bunfig.toml\n${use}\n`)).toEqual(['1: redefined: GSTACK_BUN_CONFIG=./bunfig.toml', '2: used before CONFIG_DEF']);
+    expect(configDefinitionGaps(`${CONFIG_DEF}\nGSTACK_BUN_CONFIG=\n${use}\n`)).toEqual(['2: redefined: GSTACK_BUN_CONFIG=']);
   });
 
   test('shell callers, skill templates, generated skill docs and resolvers pass the isolation flags', () => {
     const offenders: string[] = [];
     for (const f of TRACKED) {
       if (f.startsWith('.github/') || SHELL_EXEMPT[f] || !(isSkillSource(f) || isShell(f))) continue;
-      fs.readFileSync(path.join(ROOT, f), 'utf8').split('\n').forEach((line, i) => {
-        for (const call of unisolatedBunCalls(line)) offenders.push(`${f}:${i + 1}: ${call}`);
+      const flags = isSkillSource(f) || SHELL_LINUX_ONLY(f) ? FLAGS : SHELL_FLAGS;
+      const text = fs.readFileSync(path.join(ROOT, f), 'utf8');
+      text.split('\n').forEach((line, i) => {
+        for (const call of unisolatedBunCalls(line, flags)) offenders.push(`${f}:${i + 1}: ${call}`);
       });
+      if (flags === SHELL_FLAGS) for (const gap of configDefinitionGaps(text)) offenders.push(`${f}:${gap}`);
     }
     expect(offenders).toEqual([]);
   });
@@ -134,7 +210,7 @@ describe('GSTA-56: gstack never takes configuration from the audited repository'
     };
     const offenders: string[] = [];
     for (const f of TRACKED) {
-      if (f.startsWith('.github/') || f.startsWith('scripts/') || /\.test\.ts$|^test-setup\.ts$/.test(f) || EXEMPT[f]) continue;
+      if (f.startsWith('.github/') || f.startsWith('scripts/') || f.startsWith('crew/scripts/') || /\.test\.ts$|^test-setup\.ts$/.test(f) || EXEMPT[f]) continue;
       if (!f.endsWith('.ts') && !/^#!.*\bbun\b/.test(firstLine(f))) continue;
       const src = fs.readFileSync(path.join(ROOT, f), 'utf8');
       for (const m of src.matchAll(SPAWN_BUN)) {

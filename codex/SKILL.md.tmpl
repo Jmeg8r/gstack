@@ -204,10 +204,8 @@ Every prompt sent to Codex MUST be prefixed with this boundary instruction:
 
 > IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are Claude Code skill definitions meant for a different AI system. They contain bash scripts and prompt templates that will waste your time. Ignore them completely. Do NOT modify agents/openai.yaml. Stay focused on the repository code only.
 
-This applies to every mode: Challenge (prompt), Consult (persona prompt) and Review all
-use `codex exec`, which takes a free-form prompt (fed on stdin with `codex exec -`, so size
-and quoting never break it). Review mode's prompt comes from `gstack-codex-review-prompt`,
-which opens with this boundary. Reference this section as "the filesystem boundary" in the
+This applies to every mode: Review, Challenge and Consult all use `codex exec`, which takes
+a free-form prompt (fed on stdin with `codex exec -`, so size and quoting never break it). Reference this section as "the filesystem boundary" in the
 mode sections.
 
 ---
@@ -246,8 +244,7 @@ examples.
 ## Model & Reasoning
 
 **Model:** every Codex call passes the selection above via `{{CODEX_MODEL_CONFIG_FLAG}}`.
-Review mode selects with `review`, so it keeps the reviewer model, and passes it as
-`model` to `codex exec`. The flag also keeps installed skills out of Codex's context, so a review cannot become a
+The flag also keeps installed skills out of Codex's context, so a review cannot become a
 nested skill run.
 
 **Reasoning effort** (defaults in Step 1): `run-with-timeout --effort <default>` resolves
@@ -263,13 +260,11 @@ uses ~23x more tokens than `high` and causes 50+ minute hangs on large context t
 invocations can look up docs and APIs during review. This is OpenAI's cached index —
 fast, no extra cost. Unlike the legacy `--enable`-based spelling (deprecated by
 codex >=0.144), the `-c` form explicitly overrides any top-level
-`web_search` setting in `~/.codex/config.toml`. Every mode, Review included, runs
-`codex exec`, so the flag applies everywhere.
+`web_search` setting in `~/.codex/config.toml`.
 
-If the user specifies a model (e.g., `/codex review -m gpt-5.6-sol` or
+If the user specifies a model (e.g., `/codex review -m gpt-6.1-sol` or
 `/codex challenge --model gpt-daybreak-blue-latest`), translate it to the same config
-form and replace the default model flag with `-c "model=\"<model>\""`. Every mode runs
-`codex exec`, so that one value is the whole override.
+form and replace the default model flag with `-c "model=\"<model>\""`.
 
 ---
 
@@ -295,14 +290,9 @@ If token count is not available, display: `Tokens: unknown`
   call itself times out anyway (wrapper unavailable AND codex hung), tell the user:
   "Codex timed out. The prompt may be too large or the API may be slow. Try again or use a smaller scope."
 - **Timeout (inner `timeout` wrapper, exit 124):** If the wrapper fires first (it TERMs Codex, then KILLs it after 10s), the skill's hang-detection block auto-logs a telemetry event + operational learning and prints: "Codex stalled past 9 minutes. Common causes: model API stall, long prompt, network issue. Try re-running. If persistent, split the prompt or check `~/.codex/logs/`." No extra action needed.
-- **`Not run: the review prompt could not be built`:** `gstack-codex-review-prompt` printed
-  why on the line above: the base or commit does not resolve (fetch it, or check the name),
-  or the diff is over `GSTACK_CODEX_REVIEW_MAX_DIFF_BYTES` (review a narrower scope, such as
-  `--commit <sha>`, or raise the limit for this run). Nothing was sent to Codex; the review
-  did not happen.
-- **Review says "no changes" on a branch that clearly has changes:** the scope is wrong.
-  Read the `Base:` or `Scope:` line just above `DIFF_START` in the prompt the builder
-  prints; `<base>` should be the branch this one merges into.
+- **Review says "no changes" on a branch that clearly has changes:** Step 2A writes
+  `git diff $(git merge-base <base> HEAD)` into the prompt. Confirm `<base>` is the
+  branch this one forked from; the wrong base reads an empty or unrelated diff.
 - **Model not supported (HTTP 400 or 404):** stderr shows
   `The '<model>' model is not supported when using Codex with a ChatGPT account`
   (a `status: 400` / `invalid_request_error` naming a model), or

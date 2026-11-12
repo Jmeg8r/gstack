@@ -6,6 +6,7 @@ import {
   PR_PROFILE_CASE_IDS, PR_PROFILE_FILES, PR_PROFILE_MAPS, caseNameAddressable, formatPrCoverageSummary, packageChangeOnlyVersion, selectPrProfile, validatePrProfileInventory,
   type PrProfileMaps,
 } from '../scripts/test-pr-profile';
+import { selectTests } from './helpers/touchfiles';
 
 const maps: PrProfileMaps = {
   e2eTouchfiles: {
@@ -59,6 +60,22 @@ describe('fast PR coverage policy', () => {
     expect(result.e2e).toEqual([]);
     const prompt = select({ selectedE2E: [], selectedJudges: [], changedFiles: ['plan-ceo-review/SKILL.md.tmpl'], derived: null });
     expect(prompt.needsFullValidation || prompt.deferredPromptFiles.length > 0 || prompt.e2e.length > 0).toBe(true);
+  });
+
+  // Value: protects=a changelog.d fragment (every PR carries one since v1.91.342.0) has no eval dependents, so it never restores the full gate, while a touchfile that names a fragment still selects its case; fails_when=a fragment-only PR selects every gate shard as a "real unknown dependency" (GST-400, #3668);
+  //   why_new=knownNonBehaviorFile predates changelog_fragments; seam=.gstack/ship-policy.json changelog_fragments.dir; no_claim=the shadow exercised-path block
+  test('a changelog.d fragment has no eval dependents; a touchfile naming one still selects its case (GST-400)', () => {
+    const fragment = select({ selectedE2E: [], selectedJudges: [], changedFiles: ['changelog.d/gst-400.md', 'changelog.d/README.md'], derived: null });
+    expect([fragment.mode, fragment.unknownFiles, fragment.e2e, fragment.needsFullValidation]).toEqual(['pr', [], [], false]);
+    const outside = select({ selectedE2E: [], selectedJudges: [], changedFiles: ['changelog.d/x.ts', 'changelog.d/nested/x.md'], derived: null });
+    expect([...outside.unknownFiles].sort()).toEqual(['changelog.d/nested/x.md', 'changelog.d/x.ts']);
+    const real = selectPrProfile({ selectedE2E: [], selectedJudges: [], changedFiles: ['changelog.d/gst-400.md'] });
+    expect([real.mode, real.unknownFiles]).toEqual(['pr', []]);
+    const table = { ...maps.e2eTouchfiles, 'ceo-smoke': ['plan-ceo-review/**', 'changelog.d/ceo.md'] };
+    const picked = selectTests(['changelog.d/ceo.md'], table, []).selected;
+    expect(picked).toEqual(['ceo-smoke']);
+    const named = select({ maps: { ...maps, e2eTouchfiles: table }, selectedE2E: picked, selectedJudges: [], changedFiles: ['changelog.d/ceo.md'], derived: null });
+    expect([named.e2e, named.needsFullValidation]).toEqual([['ceo-smoke'], false]);
   });
 
   test('does not add unrelated short probes or drop selected quality judges', () => {
@@ -132,6 +149,27 @@ describe('fast PR coverage policy', () => {
     const result = select({ changedFiles: ['new-skill/SKILL.md.tmpl'] });
     expect(result.mode).toBe('full-fallback');
     expect(result.needsFullValidation).toBe(true);
+  });
+
+  test('a prompt file the diff deletes needs no prompt validation; without the head tree it still does (GST-1717)', () => {
+    const deleted = selectPrProfile({ selectedE2E: [], selectedJudges: [], changedFiles: ['retired-skill/SKILL.md'] });
+    expect([deleted.missingCoverage, deleted.needsFullValidation]).toEqual([[], false]);
+    const blind = selectPrProfile({ selectedE2E: [], selectedJudges: [], changedFiles: ['retired-skill/SKILL.md'], derived: null });
+    expect([blind.missingCoverage, blind.needsFullValidation]).toEqual([['retired-skill/SKILL.md'], true]);
+  });
+
+  test('an untracked prompt file on disk still needs prompt validation (GST-1717)', () => {
+    const root = path.resolve(import.meta.dir, '..');
+    fs.mkdirSync(path.join(root, '.context'), { recursive: true });
+    const dir = fs.mkdtempSync(path.join(root, '.context', 'pr-profile-untracked-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'SKILL.md'), '# new skill\n');
+      const file = path.relative(root, path.join(dir, 'SKILL.md')).split(path.sep).join('/');
+      const result = selectPrProfile({ selectedE2E: [], selectedJudges: [], changedFiles: [file] });
+      expect([result.missingCoverage, result.needsFullValidation]).toEqual([[file], true]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test('a selected judge alone can cover a changed prompt with broad behavioral work deferred', () => {
@@ -216,6 +254,13 @@ describe('fast PR coverage policy', () => {
     expect(prLines).toContain('- Selected: 1 E2E case(s), 1 judge(s); 2 deferred');
     expect(prLines).not.toContain('Reused:');
     expect(prLines).not.toContain('Full gate restored');
+  });
+
+  test('the design lint app profile and build receipt fixtures are free fixtures, so editing them never restores the full gate', () => {
+    const changedFiles = ['test/fixtures/ui-spacing/replica.html', 'test/fixtures/ui-spacing/preview/index.html', 'test/fixtures/ui-spacing/preview/fixtures/lastowner.json'];
+    const result = selectPrProfile({ selectedE2E: [], selectedJudges: [], changedFiles, screenPolicy: 'narrow' });
+    expect(result.unknownFiles).toEqual([]);
+    expect(result.mode).not.toBe('full-fallback');
   });
 
   test('DX-11: an edited paid test file selects its own name-addressable gate cases outside the profile', () => {

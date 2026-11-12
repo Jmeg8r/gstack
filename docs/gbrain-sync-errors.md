@@ -38,8 +38,8 @@ cause, the held files and the fix.
 
 | State | Trigger | Attention line (after `ARTIFACTS_SYNC: attention: `) | Fix |
 |---|---|---|---|
-| `held` | The secret scan held back flagged files and synced the rest | `status=held held=<N>. The secret scan is holding back <N> file(s); everything else still syncs. See which files and how to fix them: <bin> --status` | Edit the file so the scan no longer matches, or `<bin> --skip-file <path>` (permanent; undo with `--unskip-file <path>`) |
-| `blocked` | A re-scan still flagged after the hold, so nothing was committed | `status=blocked. The secret scan flagged a file it could not hold back on its own, so nothing is syncing. See the fix: <bin> --status` | Edit or skip the files `--status` names, or clear the batch with `<bin> --drop-queue --yes` |
+| `held` | The secret scan or the JSON check held back flagged files and synced the rest | `status=held held=<N>. Sync is holding back <N> file(s) that the secret scan flagged or that are not valid JSON; everything else still syncs. See which files and how to fix them: <bin> --status` | Edit the file so the scan no longer matches, or `<bin> --skip-file <path>` (permanent; undo with `--unskip-file <path>`), or repair a file that is not valid JSON |
+| `blocked` | A re-scan still flagged after the hold, or a file would be held during an unfinished git merge, so nothing was committed | `status=blocked. Sync committed nothing: a flagged file could not be held back on its own, or held files are part of an unfinished git merge. See the fix: <bin> --status` | Edit or skip the files `--status` names, or clear the batch with `<bin> --drop-queue --yes`. For an unfinished merge, repair the held files or finish the merge; skipping files or dropping the queue does not clear it |
 | `push_failed` | A commit is saved locally but the push failed | `status=push_failed. Synced files are committed locally but the push failed; it retries at skill start. See the cause: <bin> --status` | The fix `--status` names (usually `gh auth status`) |
 | `error` | The drain stopped before committing and kept the queue | `status=error. The last sync stopped before committing; the queue is kept and retried. See the cause: <bin> --status` | The cause `--status` names: a git index lock, a commit hook, a `git add` failure |
 | `unknown` | The status file holds a status code outside this table | `status=unknown. The sync status file is unreadable. See it: <bin> --status` | Run `<bin> --once` to rewrite it |
@@ -55,13 +55,17 @@ from it.
 **Held files.** When the secret scan flags a file, only that file is held
 back (with any file coupled to it, such as a decision log and its active
 snapshot); everything else syncs. The held file stays queued and is
-re-scanned on every sync, so editing it clears the hold automatically.
+re-scanned on every sync, so removing a secret that was never synced clears
+the hold automatically. A secret already committed in `~/.gstack` stays on a
+removed line of the next diff, so that file stays held until you skip it.
 `--status` lists each held file under `held`, with the scanner rule that
 matched (never the matched text), the files held with it (`dependents`) and
 both fixes:
 
-1. **If it's a real secret**: edit the file to remove it. The next skill run
-   re-scans and syncs it.
+1. **If it's a real secret**: edit the file to remove it. If that line was
+   never synced, the next skill run re-scans and syncs it. If it is already
+   committed in `~/.gstack`, skip the file (fix 2) and, if it was pushed,
+   treat the secret as exposed.
 2. **If the match is a false positive** you never want synced:
    ```bash
    ~/.claude/skills/gstack/bin/gstack-brain-sync --skip-file <path>
@@ -75,6 +79,11 @@ both fixes:
    ```bash
    ~/.claude/skills/gstack/bin/gstack-brain-sync --drop-queue --yes
    ```
+
+A synced `.json` file that does not parse (often git conflict markers from a
+merge) is held the same way under rule `invalid-json`. Its only fix is to
+repair the file; `--skip-file` is not offered, because it would stop that
+file syncing for good. The next sync re-checks it.
 
 **Git index lock.** A git process killed mid-write leaves
 `~/.gstack/.git/index.lock`. The sync removes it once it is older than 10
@@ -107,7 +116,11 @@ After fixing auth, run any skill to retry sync automatically.
 git's error appears after the colon.
 
 **Cause.** Could be network issue, rejected push (remote ahead), server 500,
-or repo access revoked.
+or repo access revoked. The line is git's own error, not its `To <remote>`
+banner or `hint:` lines. After a rejected push, brain-sync fetches and merges
+the other machine's commits; when that merge fails, the status adds
+`; merging origin failed: <reason>` (for example `CONFLICT (content): Merge
+conflict in developer-profile.json`).
 
 **Fix.** Look at `~/.gstack/.brain-sync-status.json` for more detail, or run:
 ```bash

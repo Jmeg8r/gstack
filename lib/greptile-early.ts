@@ -14,8 +14,8 @@
  *   open --base B --title-file F [--ready] [--confirm T]
  *                                  open the early PR through gstack-post and post one
  *                                  `@greptileai` comment when Greptile skips drafts
- *   wait <pr> --since <epoch>      poll (30 s) for a completed Greptile review of the
- *                                  PR's head commit; returns within ~90 s per call,
+ *   wait <pr> --since <epoch>      poll (60 s, REST only) for a completed Greptile review
+ *                                  of the PR's head commit; returns within ~90 s per call,
  *                                  `timeout` once 10 minutes have passed since <epoch>
  *
  * bin/gstack-greptile-early is the CLI; tests drive `runGreptileEarly` with a
@@ -24,7 +24,9 @@
 import * as fs from "fs";
 import * as path from "path";
 import { resolveStateRoot, readConfigKey, type StateRootEnv } from "./state-root";
+import { botLists, botOwning } from "./pr-wait";
 import { remoteSlug } from "./remote-identity";
+import { MIN_POLL_MS, pollDelayMs } from "./gh-poll";
 
 export interface EarlyEnv {
   run(cmd: string, args: string[], input?: string): { status: number; stdout: string; stderr: string };
@@ -40,7 +42,7 @@ export interface EarlyEnv {
 }
 
 export const WAIT_CAP_SECONDS = 600;
-export const POLL_SECONDS = 30;
+export const POLL_SECONDS = MIN_POLL_MS / 1000;
 const CALL_BUDGET_SECONDS = 90;
 const COMMENT_WINDOW_DAYS = 90;
 const TRIGGER = "@greptileai";
@@ -78,14 +80,14 @@ function readOr(file: string): string {
   try { return fs.readFileSync(file, "utf8"); } catch { return ""; }
 }
 
-/** A Greptile comment on any PR of this repo in the last 90 days (conversation or review comments). */
+/** A comment by Greptile's bot account (gstack-pr-wait's login rule, Bot accounts only) on any PR of this repo in the last 90 days. */
 function recentComment(env: EarlyEnv): boolean {
   const since = new Date(env.now() - COMMENT_WINDOW_DAYS * 86_400_000).toISOString();
   for (const kind of ["issues", "pulls"]) {
     const r = env.run("gh", ["api", `repos/{owner}/{repo}/${kind}/comments?sort=created&direction=desc&per_page=100&since=${since}`,
-      "--jq", "[.[] | {login: .user.login, created: .created_at}]"]);
-    const rows = r.status === 0 ? json<Array<{ login: string; created: string }>>(r.stdout) : undefined;
-    if (rows?.some(c => isGreptile(c.login) && c.created >= since)) return true;
+      "--jq", "[.[] | {login: .user.login, type: .user.type, created: .created_at}]"]);
+    const rows = r.status === 0 ? json<Array<{ login: string; type?: string; created: string }>>(r.stdout) : undefined;
+    if (rows?.some(c => c.type === "Bot" && botOwning(c.login, ["greptile"]) && c.created >= since)) return true;
   }
   return false;
 }
@@ -97,7 +99,7 @@ function visibility(env: EarlyEnv): "public" | "private" | "unknown" {
 }
 
 function consentFile(env: EarlyEnv): string | undefined {
-  const slug = env.run(path.join(env.binDir, "gstack-slug"), ["--get", "SLUG"]);
+  const slug = env.run(path.join(env.binDir, "gstack-slug"), ["--get", "REPO_SLUG"]);
   let id = slug.status === 0 ? slug.stdout.trim() : "";
   if (!id) {
     const origin = env.run("git", ["remote", "get-url", "origin"]);
@@ -129,6 +131,8 @@ function detect(env: EarlyEnv): number {
     env.out(`Greptile early review is off for you. Turn it back on: ${config(env)} set ship_greptile_early true\n`);
     return 0;
   }
+  const lists = botLists(env.vars);
+  if (![...lists.gating, ...lists.advisory].includes("greptile")) return off("greptile is not in pr_wait_gating_bots or pr_wait_advisory_bots");
   const root = gitRoot(env);
   if (!root) return off("not in a git repository");
   if (env.run("gh", ["auth", "status"]).status !== 0) return off("gh is missing or not logged in");
@@ -225,7 +229,7 @@ function wait(env: EarlyEnv, args: string[]): number {
   const pr = args[0];
   const since = Number(flag(args, "--since"));
   if (!pr || !/^[1-9][0-9]*$/.test(pr) || !Number.isInteger(since) || since <= 0) { env.err("usage: gstack-greptile-early wait <pr-number> --since <epoch-seconds>\n"); return 64; }
-  const head = env.run("gh", ["pr", "view", pr, "--json", "headRefOid", "--jq", ".headRefOid"]);
+  const head = env.run("gh", ["api", `repos/{owner}/{repo}/pulls/${pr}`, "--jq", ".head.sha"]);
   const sha = head.stdout.trim();
   if (head.status !== 0 || !/^[0-9a-f]{40}$/.test(sha)) { env.out("GREPTILE_REVIEW: unavailable (could not read the PR head commit)\n"); return 0; }
   const started = env.now();
@@ -237,7 +241,7 @@ function wait(env: EarlyEnv, args: string[]): number {
     const mmss = `${Math.floor(elapsed / 60)}m${String(elapsed % 60).padStart(2, "0")}s`;
     env.out(`Greptile: waiting for its review of ${sha.slice(0, 7)} (${mmss} of ${WAIT_CAP_SECONDS / 60}m). Turn early review off: ${config(env)} set ship_greptile_early false\n`);
     if ((env.now() - started) / 1000 + POLL_SECONDS > CALL_BUDGET_SECONDS) { env.out("GREPTILE_REVIEW: pending\n"); return 0; }
-    env.sleep(POLL_SECONDS * 1000);
+    env.sleep(pollDelayMs(POLL_SECONDS * 1000));
   }
 }
 

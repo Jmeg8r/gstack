@@ -127,6 +127,10 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"SCORE: 8"}
 
   test('all four rendered /codex dispatches carry the request level to the probe, over env and codex_effort', () => {
     expect(FENCES.length).toBe(4);
+    const dispatches = (['review-mode', 'challenge-mode', 'consult-mode'] as const).flatMap(mode =>
+      read(`codex/sections/${mode}.md`).split('\n').filter(line => /run-with-timeout\b.*\bcodex (exec|review)\b/.test(line)));
+    expect(dispatches.length).toBe(FENCES.length);
+    expect(dispatches.filter(line => /\bcodex review\b/.test(line))).toEqual([]);
     const state = path.join(TMP, 'state-codex-request-effort');
     fs.mkdirSync(state, { recursive: true });
     fs.writeFileSync(path.join(state, 'config.yaml'), 'codex_effort: low\n');

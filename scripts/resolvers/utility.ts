@@ -1,5 +1,5 @@
 import type { TemplateContext } from './types';
-import { CODEX_MODEL_CONFIG_FLAG, CODEX_WEB_SEARCH_FLAG } from './constants';
+import { CODEX_MODEL_CONFIG_FLAG, CODEX_REVIEW_MODEL_CONFIG_FLAG, CODEX_WEB_SEARCH_FLAG } from './constants';
 import { CLAUDE_CAPTURE_EVAL_MODEL } from '../../lib/eval-model';
 
 /**
@@ -18,6 +18,10 @@ export function generateCodexWebSearchFlag(_ctx: TemplateContext): string {
  */
 export function generateCodexModelConfigFlag(_ctx: TemplateContext): string {
   return CODEX_MODEL_CONFIG_FLAG;
+}
+
+export function generateCodexReviewModelConfigFlag(_ctx: TemplateContext): string {
+  return CODEX_REVIEW_MODEL_CONFIG_FLAG;
 }
 
 export function generateClaudeModelFlag(_ctx: TemplateContext): string {
@@ -387,7 +391,7 @@ export function generateChangelogWorkflow(ctx: TemplateContext): string {
    - Write concise, descriptive bullet points
    - ${ctx.skillName === 'ship' ? 'Insert after the observed file header, before the first release entry, dated today' : 'Insert after the file header (line 5), dated today'}
    - Format: \`## [X.Y.Z.W] - YYYY-MM-DD\`
-   - **Voice:** Lead with what the user can now **do** that they couldn't before. Use plain language, not implementation details. Never mention TODOS.md, internal tracking, or contributor-facing details.
+   - **Voice:** Lead with what the user can now **do** that they couldn't before. Use plain language, not implementation details. Never mention TODOS.md, internal tracking, or contributor-facing details: no tracker codes (GST-123, R-numbers) anywhere in the entry, and a bold lead a user of the project understands without the repository's coined terms (docs/ship-policy.md#plain-titles).
 
 6. **Cross-check:** Compare your CHANGELOG entry against the commit list from step 2.
    Every user-facing change in that list must be represented; add any that is missing.

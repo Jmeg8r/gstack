@@ -17,9 +17,79 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { writeSecureFile, mkdirSecure } from './file-permissions';
 import { TEMP_DIR } from './platform';
+import { reassertDevice, refuseWhileDevice, screenshotTab } from './device-emulation';
 import { resolveConfig } from './config';
 import { filterSessionCookies } from './session-persist';
 import type { Frame } from 'playwright';
+
+/**
+ * Parse screenshot args. Priority: flags (--viewport, --clip, --base64,
+ * --selector) → selector (@ref, CSS) → output path. `outputPath` is set only
+ * when the caller named one; the tunnel gate refuses any that is.
+ */
+export function parseScreenshotArgs(args: string[]): {
+  outputPath?: string;
+  targetSelector?: string;
+  clipRect?: { x: number; y: number; width: number; height: number };
+  viewportOnly: boolean;
+  base64Mode: boolean;
+} {
+  let outputPath: string | undefined;
+  let clipRect: { x: number; y: number; width: number; height: number } | undefined;
+  let targetSelector: string | undefined;
+  let viewportOnly = false;
+  let base64Mode = false;
+
+  const remaining: string[] = [];
+  let flagSelector: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const inline = /^(--clip|--selector)=(.*)$/s.exec(args[i]);
+    const flag = inline ? inline[1] : args[i];
+    const flagValue = () => (inline ? inline[2] : args[++i]);
+    if (flag === '--viewport') {
+      viewportOnly = true;
+    } else if (flag === '--base64') {
+      base64Mode = true;
+    } else if (flag === '--selector') {
+      flagSelector = flagValue();
+      if (!flagSelector) throw new Error('Usage: screenshot --selector <css> [path]');
+    } else if (flag === '--clip') {
+      const coords = flagValue();
+      if (!coords) throw new Error('Usage: screenshot --clip x,y,w,h [path]');
+      const parts = coords.split(',').map(Number);
+      if (parts.length !== 4 || parts.some(isNaN))
+        throw new Error('Usage: screenshot --clip x,y,width,height — all must be numbers');
+      clipRect = { x: parts[0], y: parts[1], width: parts[2], height: parts[3] };
+    } else if (args[i].startsWith('--')) {
+      throw new Error(`Unknown screenshot flag: ${args[i]}`);
+    } else {
+      remaining.push(args[i]);
+    }
+  }
+
+  // Separate target (selector/@ref) from output path
+  for (const arg of remaining) {
+    // File paths containing / and ending with an image/pdf extension are never CSS selectors
+    const isFilePath = arg.includes('/') && /\.(png|jpe?g|webp|pdf)$/i.test(arg);
+    if (isFilePath) {
+      outputPath = arg;
+    } else if (arg.startsWith('@e') || arg.startsWith('@c') || arg.startsWith('.') || arg.startsWith('#') || arg.includes('[')) {
+      targetSelector = arg;
+    } else {
+      outputPath = arg;
+    }
+  }
+
+  // --selector flag takes precedence; conflict with positional selector.
+  if (flagSelector !== undefined) {
+    if (targetSelector !== undefined) {
+      throw new Error('--selector conflicts with positional selector — choose one');
+    }
+    targetSelector = flagSelector;
+  }
+
+  return { outputPath, targetSelector, clipRect, viewportOnly, base64Mode };
+}
 
 /** Tokenize a pipe segment respecting double-quoted strings. */
 function tokenizePipeSegment(segment: string): string[] {
@@ -265,7 +335,7 @@ export async function handleMetaCommand(
     case 'tabs': {
       const tabs = await bm.getTabListWithTitles();
       return tabs.map(t =>
-        `${t.active ? '→ ' : '  '}[${t.id}] ${t.busy ? '(not responding)' : t.title || '(untitled)'} — ${t.url}`
+        `${t.active ? '→ ' : '  '}[${t.id}] ${t.busy ? '(not responding)' : t.title || '(untitled)'} — ${t.url}${t.owner ? ` (${t.owner})` : ''}`
       ).join('\n');
     }
 
@@ -439,61 +509,10 @@ export async function handleMetaCommand(
 
     // ─── Visual ────────────────────────────────────────
     case 'screenshot': {
-      // Parse priority: flags (--viewport, --clip, --base64) → selector (@ref, CSS) → output path
       const page = bm.getPage();
-      let outputPath = `${TEMP_DIR}/browse-screenshot.png`;
-      let clipRect: { x: number; y: number; width: number; height: number } | undefined;
-      let targetSelector: string | undefined;
-      let viewportOnly = false;
-      let base64Mode = false;
-
-      const remaining: string[] = [];
-      let flagSelector: string | undefined;
-      for (let i = 0; i < args.length; i++) {
-        const inline = /^(--clip|--selector)=(.*)$/s.exec(args[i]);
-        const flag = inline ? inline[1] : args[i];
-        const flagValue = () => (inline ? inline[2] : args[++i]);
-        if (flag === '--viewport') {
-          viewportOnly = true;
-        } else if (flag === '--base64') {
-          base64Mode = true;
-        } else if (flag === '--selector') {
-          flagSelector = flagValue();
-          if (!flagSelector) throw new Error('Usage: screenshot --selector <css> [path]');
-        } else if (flag === '--clip') {
-          const coords = flagValue();
-          if (!coords) throw new Error('Usage: screenshot --clip x,y,w,h [path]');
-          const parts = coords.split(',').map(Number);
-          if (parts.length !== 4 || parts.some(isNaN))
-            throw new Error('Usage: screenshot --clip x,y,width,height — all must be numbers');
-          clipRect = { x: parts[0], y: parts[1], width: parts[2], height: parts[3] };
-        } else if (args[i].startsWith('--')) {
-          throw new Error(`Unknown screenshot flag: ${args[i]}`);
-        } else {
-          remaining.push(args[i]);
-        }
-      }
-
-      // Separate target (selector/@ref) from output path
-      for (const arg of remaining) {
-        // File paths containing / and ending with an image/pdf extension are never CSS selectors
-        const isFilePath = arg.includes('/') && /\.(png|jpe?g|webp|pdf)$/i.test(arg);
-        if (isFilePath) {
-          outputPath = arg;
-        } else if (arg.startsWith('@e') || arg.startsWith('@c') || arg.startsWith('.') || arg.startsWith('#') || arg.includes('[')) {
-          targetSelector = arg;
-        } else {
-          outputPath = arg;
-        }
-      }
-
-      // --selector flag takes precedence; conflict with positional selector.
-      if (flagSelector !== undefined) {
-        if (targetSelector !== undefined) {
-          throw new Error('--selector conflicts with positional selector — choose one');
-        }
-        targetSelector = flagSelector;
-      }
+      const parsed = parseScreenshotArgs(args);
+      const { clipRect, targetSelector, viewportOnly, base64Mode } = parsed;
+      const outputPath = parsed.outputPath ?? `${TEMP_DIR}/browse-screenshot.png`;
 
       validateOutputPath(outputPath);
 
@@ -511,10 +530,11 @@ export async function handleMetaCommand(
           const resolved = await bm.resolveRef(targetSelector);
           const locator = 'locator' in resolved ? resolved.locator : page.locator(resolved.selector);
           buffer = await locator.screenshot({ timeout: 5000 });
+          await reassertDevice(bm.getActiveSession());
         } else if (clipRect) {
-          buffer = await page.screenshot({ clip: clipRect });
+          buffer = await screenshotTab(bm.getActiveSession(), { clip: clipRect });
         } else {
-          buffer = await page.screenshot({ fullPage: !viewportOnly });
+          buffer = await screenshotTab(bm.getActiveSession(), { fullPage: !viewportOnly });
           // Guard the most common API-bricking case (fullPage). Element /
           // clip captures usually stay within the cap; we still guard the
           // path-mode below for fullPage writes.
@@ -530,15 +550,16 @@ export async function handleMetaCommand(
         const resolved = await bm.resolveRef(targetSelector);
         const locator = 'locator' in resolved ? resolved.locator : page.locator(resolved.selector);
         await locator.screenshot({ path: outputPath, timeout: 5000 });
+        await reassertDevice(bm.getActiveSession());
         return `Screenshot saved (element): ${outputPath}`;
       }
 
       if (clipRect) {
-        await page.screenshot({ path: outputPath, clip: clipRect });
+        await screenshotTab(bm.getActiveSession(), { path: outputPath, clip: clipRect });
         return `Screenshot saved (clip ${clipRect.x},${clipRect.y},${clipRect.width},${clipRect.height}): ${outputPath}`;
       }
 
-      await page.screenshot({ path: outputPath, fullPage: !viewportOnly });
+      await screenshotTab(bm.getActiveSession(), { path: outputPath, fullPage: !viewportOnly });
       if (!viewportOnly) await guardScreenshotPath(outputPath);
       return `Screenshot saved${viewportOnly ? ' (viewport)' : ''}: ${outputPath}`;
     }
@@ -574,6 +595,7 @@ export async function handleMetaCommand(
     }
 
     case 'responsive': {
+      refuseWhileDevice(bm.getActiveSession(), 'responsive');
       const page = bm.getPage();
       const prefix = args[0] || `${TEMP_DIR}/browse-responsive`;
       validateOutputPath(prefix);
@@ -921,12 +943,13 @@ export async function handleMetaCommand(
 
       if (action === 'save') {
         const state = await bm.saveState();
+        const activeId = bm.getActiveTabId();
         // V1: cookies + URLs only (not localStorage — breaks on load-before-navigate)
         const saveData = {
           version: 1,
           savedAt: new Date().toISOString(),
           cookies: state.cookies,
-          pages: state.pages.map(p => ({ url: p.url, isActive: p.isActive })),
+          pages: state.pages.map(p => ({ url: p.url, isActive: p.tabId === activeId })),
         };
         writeSecureFile(statePath, JSON.stringify(saveData, null, 2));
         return `State saved: ${statePath} (${state.cookies.length} cookies, ${state.pages.length} pages)\n⚠️  Cookies stored in plaintext. Delete when no longer needed.`;

@@ -44,7 +44,7 @@ IMPORTANT: Do NOT read or execute any SKILL.md files or paths containing skills/
 
   File: <ENG_INPUT>
 
-Write the **complete prompt and context**, including actual plan/spec/source, to a private file. Substitute its shell-quoted path for `<prepared-prompt-file>`; never interpolate user text into shell source. Request a severity (Critical, High, Medium or Low) per finding and a final Recommendation: <action> because <specific reason> line, including an explicit no-findings rationale.
+Write the **complete prompt and context**, including actual plan/spec/source, to a private file. Substitute its shell-quoted path for `<prepared-prompt-file>`; never interpolate user text into shell source. Request severity (Critical, High, Medium or Low) per finding, a Recommendation: <action> because <reason> line, and `VERDICT: CLEAN` or `VERDICT: FINDINGS` as the last line.
 
 ```bash
 # GSTACK_ACTIVE_HOST names the harness, never the model.
@@ -63,7 +63,6 @@ _OUTSIDE_TMP=$(mktemp -d "${TMPDIR:-/tmp}/gstack-outside.XXXXXXXX") || exit 1
 trap 'rm -rf "$_OUTSIDE_TMP"' EXIT
 _OUTSIDE_INPUT="$_OUTSIDE_TMP/prompt"
 cat -- '<prepared-prompt-file>' >"$_OUTSIDE_INPUT" || exit 1
-
 _CODEX_PROBE="$HOME/.claude/skills/gstack/bin/gstack-codex-probe"
 export _CODEX_DEADLINE=$(($(date +%s)+540)); _CODEX_OUT=$("$_CODEX_PROBE" role-ready exec) || exit $?
 _CODEX_SEL=$(echo "$_CODEX_OUT" | sed -n 's/^CODEX_SEL: //p')
@@ -93,12 +92,12 @@ Failed/incomplete outside review → unavailable; disabled → skip outside. Bot
 
 Retain the historical review-log skill ID; add `"host":"claude","outside_provider":"codex","outside_status":"completed|unavailable|disabled|skipped","phase":"eng"`. Record differing attempt outcomes separately. `source:"codex"` requires completed CLI output; native uses `source:"in-host"` (historical `source:"claude"`: native Claude). Availability/native fallback is not outside completion. Preserve all reported modelUsage; unknown model identity stays unknown. Under `GSTACK_CODEX_NO_SANDBOX=1` add `"codex_sandbox":"danger-full-access"`.
 
-  Error handling: Phase 1 failure/degradation policy applies.
+  Errors: Phase 1 failure/degradation policy applies.
 
 - Architecture choices: explicit over clever (P5). If Codex disagrees with valid reason → TASTE DECISION. Scope changes both models agree on → USER CHALLENGE.
 - Evals: always include all relevant suites (P1)
 - Test plan: generate artifact at `$GSTACK_STATE_ROOT/projects/$SLUG/{user}-{branch}-eng-review-test-plan-{datetime}.md` (the loaded eng skill's name and root)
-- TODOS.md: collect all deferred scope expansions from every prior phase (Eng runs last), auto-write
+- TODOS.md: collect every prior phase's deferred scope expansions (Eng runs last), auto-write
 
 **Required execution checklist (Eng):**
 
@@ -110,14 +109,14 @@ Retain the historical review-log skill ID; add `"host":"claude","outside_provide
 
 2. Step 0.5 (Dual Voices): Present the completed calls above under Codex SAYS
    (eng — architecture challenge) and Claude SUBAGENT (eng — independent review).
-   Produce eng consensus table:
+   Eng consensus table:
 
 ```
 ENG DUAL VOICES — CONSENSUS TABLE:
   Dimension                           Claude  Codex  Consensus
   1. Architecture sound?               —       —      —
   2. Test coverage sufficient?         —       —      —
-  3. Performance risks addressed?      —       —      —
+  3. Perf risks + budget/bench named?  —       —      —
   4. Security threats covered?         —       —      —
   5. Error paths handled?              —       —      —
   6. Deployment risk manageable?       —       —      —
@@ -142,7 +141,7 @@ Missing/disabled voice = N/A, never CONFIRMED. Flag any single-voice critical fi
      skipping the analysis.
    - Write the test plan artifact to disk
 
-6. Section 4 (Performance): Evaluate N+1 queries, memory, caching, slow paths.
+6. Section 4 (Performance): Evaluate N+1 queries, memory, caching, slow paths; a hot path with no budget nor bench step is a finding.
 
 **Mandatory outputs from Phase 3:**
 - "NOT in scope" section
@@ -151,8 +150,8 @@ Missing/disabled voice = N/A, never CONFIRMED. Flag any single-voice critical fi
 - Test diagram mapping codepaths to coverage (Section 3)
 - Test plan artifact written to disk (Section 3)
 - Failure modes registry with critical gap flags
-- Completion Summary (the full summary from the Eng skill)
-- TODOS.md updates (collected from all phases)
+- Completion Summary (from the Eng skill)
+- TODOS.md updates (all phases)
 
 **Close this phase:**
 

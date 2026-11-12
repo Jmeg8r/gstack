@@ -21,10 +21,12 @@ const GATE = 'node scripts/remote-gate.js';
 /** A fake remote gate: reports the tree it was handed (or GATE_TREE), GATE_TESTS / GATE_FAILED, and records its env. */
 const GATE_SCRIPT = [
   "const fs = require('node:fs');",
-  "fs.writeFileSync('../gate-env.json', JSON.stringify({ tree: process.env.PREGATE_TREE, cap: process.env.PREGATE_SPEND_CAP_USD, files: fs.readFileSync(process.env.PREGATE_FILES_FILE, 'utf8') }));",
+  "fs.writeFileSync('../gate-env.json', JSON.stringify({ tree: process.env.PREGATE_TREE, cap: process.env.PREGATE_SPEND_CAP_USD, timeout: process.env.PREGATE_TIMEOUT_S, files: fs.readFileSync(process.env.PREGATE_FILES_FILE, 'utf8') }));",
+  "if (process.env.GATE_QUIET_MS) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(process.env.GATE_QUIET_MS));",
   "if (process.env.GATE_SILENT) process.exit(0);",
   "const spent = process.env.GATE_SPENT ? ` spent=${process.env.GATE_SPENT}` : '';",
   "console.log(`PREGATE_REMOTE: tree=${process.env.GATE_TREE || process.env.PREGATE_TREE} tests=${process.env.GATE_TESTS ?? 3} failed=${process.env.GATE_FAILED ?? 0}${spent}`);",
+  "if (process.env.GATE_EXIT) process.exitCode = Number(process.env.GATE_EXIT);",
 ].join('\n') + '\n';
 
 function gated(pregate: Record<string, unknown> = { ...BASE_PREGATE, remote_gate: GATE }): FixtureRepo {
@@ -100,6 +102,38 @@ describe('small machines record the test tier for the remote gate (C4)', () => {
     expect(ok.out).not.toContain('attested');
   });
 
+  // GBRA-347 (gbrain#8730): a stage run's log prints the gate's line under the lanes check (`    lanes:   PREGATE_REMOTE: …`),
+  //   and `clear --receipt` on that log refused "has no PREGATE_REMOTE: line".
+  // Value: protects=a gstack-pregate --remote log is a receipt clear accepts, validated like the bare line; fails_when=clear
+  //   refuses the indented form, takes a line indented under another check, or takes the log of a run whose gate exited 1;
+  //   seam=gstack-pregate clear --receipt
+  test('`clear --receipt` takes the stage run\'s own log, where the gate\'s line sits under lanes:', async () => {
+    const repo = gated();
+    const run = runBin(repo, 'gstack-pregate', ['--base', 'main', '--stage', 'tests', '--remote', '--spend-cap', '5', '--allow-repo-commands']);
+    expect(run.status, run.err).toBe(EXIT.ok);
+    const log = path.join(repo.root, 'stage-run.log');
+    fs.writeFileSync(log, run.out);
+    expect(run.out).toMatch(/^ +lanes: +PREGATE_REMOTE: tree=[0-9a-f]{40} tests=3 failed=0$/m);
+    expect(run.out).not.toMatch(/^PREGATE_REMOTE: /m);
+    const failed = runBin(repo, 'gstack-pregate', ['--base', 'main', '--stage', 'tests', '--remote', '--spend-cap', '5', '--allow-repo-commands'], { GATE_EXIT: '1' });
+    expect(failed.out).toMatch(/^ +lanes: +PREGATE_REMOTE: tree=[0-9a-f]{40} tests=3 failed=0$/m);
+    const failedLog = path.join(repo.root, 'failed-run.log');
+    fs.writeFileSync(failedLog, failed.out);
+    const fileAt = path.join(repo.work, '.gstack/tmp/pregate.json');
+    const { file } = await lanesOn(repo, { cores: 4, testBackend: 'local' });
+    fs.writeFileSync(fileAt, JSON.stringify(file));
+    const clear = (receipt: string) => runBin(repo, 'gstack-pregate', ['clear', '--remote', 'pregate.json/remote_gate', '--receipt', receipt]);
+    const other = path.join(repo.root, 'other-check.log');
+    fs.writeFileSync(other, `    guards:   PREGATE_REMOTE: tree=${file.tree} tests=3 failed=0\n`);
+    expect(clear(other).err).toContain('has no PREGATE_REMOTE: line');
+    const refused = clear(failedLog);
+    expect(refused.status).not.toBe(EXIT.ok);
+    expect(refused.err).toContain('under a lanes check that is incomplete, not requires-remote');
+    const ok = clear(log);
+    expect(ok.status, ok.err).toBe(EXIT.ok);
+    expect(ok.out).toContain(`PREGATE_CLEARED: pregate.json/remote_gate receipt=remote-gate tree=${file.tree.slice(0, 12)} tests=3 `);
+  });
+
   test('`clear` on a test_backend obligation records the run URL as attested, not validated, and says so', async () => {
     const repo = gated(BASE_PREGATE);
     const fileAt = path.join(repo.work, '.gstack/tmp/pregate.json');
@@ -129,10 +163,9 @@ describe('gstack-pregate --remote (C-c)', () => {
   const lanes = (repo: FixtureRepo) => JSON.parse(fs.readFileSync(path.join(repo.work, '.gstack/tmp/pregate.json'), 'utf8')).checks.find((c: any) => c.id === 'lanes');
   const pregateFile = (repo: FixtureRepo) => JSON.parse(fs.readFileSync(path.join(repo.work, '.gstack/tmp/pregate.json'), 'utf8'));
 
-  test('needs --allow-repo-commands, the base policy and a spend cap', () => {
+  test('needs --allow-repo-commands and a spend cap', () => {
     const repo = gated();
     expect(remote(repo, ['--remote', '--spend-cap', '5']).status).toBe(EXIT.refused);
-    expect(remote(repo, ['--remote', '--spend-cap', '5', '--allow-repo-commands', '--policy-from', 'head']).status).toBe(EXIT.refused);
     const noCap = remote(repo, ['--remote', '--allow-repo-commands']);
     expect(noCap.status).toBe(EXIT.usage);
     expect(noCap.err).toContain('pass --spend-cap <usd> (or set GSTACK_SPEND_CAP_USD)');
@@ -142,6 +175,7 @@ describe('gstack-pregate --remote (C-c)', () => {
 
   test('a gate reporting the tested tree, tests > 0 and failed = 0 clears the obligation and reports its spend', () => {
     const repo = gated();
+    expect(runBin(repo, 'gstack-pregate', ['--base', 'main', '--stage', 'preflight', '--allow-repo-commands']).status).toBe(EXIT.ok);
     const r = remote(repo, ['--remote', '--allow-repo-commands'], { GSTACK_SPEND_CAP_USD: '4', GATE_SPENT: '0.37' });
     expect(r.status).toBe(EXIT.ok);
     const file = pregateFile(repo);
@@ -150,9 +184,59 @@ describe('gstack-pregate --remote (C-c)', () => {
     expect(lanes(repo).detail).toContain('spend: spent $0.37, reserved $0, unknown $0 (cap $4)');
     expect(r.err).toContain('PREGATE_REMOTE_SPEND: spent $0.37, reserved $0, unknown $0 (cap $4)');
     const env = JSON.parse(fs.readFileSync(path.join(repo.root, 'gate-env.json'), 'utf8'));
-    expect(env).toEqual({ tree: file.tree, cap: '4', files: 'test/util.test.js\n' });
+    expect(env).toEqual({ tree: file.tree, cap: '4', timeout: '600', files: 'test/util.test.js\n' });
     expect(runBin(repo, 'gstack-pregate', ['verify']).status).toBe(EXIT.ok);
   });
+
+  // Value: protects=a head policy that only adds lanes can clear the remote obligation on a small machine, with the base copy's gate and the
+  //   policy's timeout_s as the gate's deadline (PREGATE_TIMEOUT_S); a head policy that changes the gate is refused (GST-419, GST-420);
+  //   fails_when=--remote refuses head mode, the gate deadline ignores timeout_s or --timeout, or a head remote_gate runs; why_new=head mode
+  //   could never clear on under-8-core crew machines; seam=fake gate; no_claim=the Ubicloud VM
+  test('under --policy-from head the base gate runs with the head lanes and the timeout_s deadline; a head policy that changes the gate is refused', () => {
+    const policy = { ...BASE_PREGATE, remote_gate: GATE, timeout_s: 900 };
+    const repo = gated(policy);
+    const lane = { ...BASE_PREGATE.dependencies, 'lib/orphan.js': ['test/util.test.js'] };
+    commit(repo, { 'lib/orphan.js': 'exports.lonely = () => 2;\n', '.gstack/pregate.json': JSON.stringify({ ...policy, dependencies: lane }) + '\n' });
+    const env = () => JSON.parse(fs.readFileSync(path.join(repo.root, 'gate-env.json'), 'utf8'));
+    expect(remote(repo, ['--remote', '--allow-repo-commands', '--policy-from', 'head', '--spend-cap', '2']).status).toBe(EXIT.ok);
+    expect(env().timeout).toBe('900');
+    expect(env().files).toContain('test/util.test.js');
+    expect(remote(repo, ['--remote', '--allow-repo-commands', '--policy-from', 'head', '--spend-cap', '2', '--timeout', '1200']).status).toBe(EXIT.ok);
+    expect(env().timeout).toBe('1200');
+    commit(repo, { '.gstack/pregate.json': JSON.stringify({ ...policy, remote_gate: 'node scripts/other-gate.js', dependencies: lane }) + '\n' });
+    const changed = remote(repo, ['--remote', '--allow-repo-commands', '--policy-from', 'head', '--spend-cap', '2']);
+    expect(changed.status).toBe(EXIT.refused);
+    expect(changed.err).toContain('remote_gate differs from the trusted policy');
+  }, 60_000);
+
+  // Value: protects=a bootstrap head policy (no base copy, no user-owned file) cannot run its own remote_gate to clear its obligation;
+  //   fails_when=--remote under head runs a branch-authored gate and verify passes with no test run; why_new=--remote now runs under
+  //   head once the additive check passes, and a bootstrap has nothing to check against; seam=fake gate; no_claim=none
+  test('--remote under --policy-from head with no trusted policy is refused before any gate runs', () => {
+    const repo = makeFixtureRepo({ pregate: null });
+    repos.push(repo);
+    commit(repo, { 'scripts/remote-gate.js': GATE_SCRIPT, '.gstack/pregate.json': JSON.stringify({ ...BASE_PREGATE, remote_gate: GATE }) + '\n', 'lib/util.js': "exports.add = (a, b) => a + b + 0;\n" });
+    const r = remote(repo, ['--remote', '--allow-repo-commands', '--policy-from', 'head', '--spend-cap', '2'], { GSTACK_PROJECT_SLUG: 'remote-bootstrap' });
+    expect(r.status).toBe(EXIT.refused);
+    expect(r.err).toContain('the head file is a bootstrap and its remote_gate cannot clear its own obligation');
+    expect(fs.existsSync(path.join(repo.root, 'gate-env.json'))).toBe(false);
+  }, 60_000);
+
+  // Value: protects=a remote gate that waits quietly on CI is bounded by its deadline (--timeout, else timeout_s), not killed by the
+  //   test-output stall timer; a gate past its deadline still stays uncleared (GST-431); fails_when=the stall timer kills a quiet gate
+  //   inside its deadline, or a gate past --timeout clears; why_new=a CI-waiting gate died at 300 s on qm (CAPY-1); seam=fake gate;
+  //   no_claim=the Ubicloud VM
+  test('a gate that is quiet past the stall timeout but inside its deadline clears; past --timeout it stays uncleared', () => {
+    const repo = gated();
+    const quiet = remote(repo, ['--remote', '--allow-repo-commands', '--spend-cap', '2', '--stall-timeout', '1', '--timeout', '60'], { GATE_QUIET_MS: '2500' });
+    expect(quiet.status).toBe(EXIT.ok);
+    expect(pregateFile(repo).verdict).toBe('requires-remote cleared');
+    const late = remote(repo, ['--remote', '--allow-repo-commands', '--spend-cap', '2', '--timeout', '2'], { GATE_QUIET_MS: '8000' });
+    expect(late.status).toBe(EXIT.fail);
+    expect(lanes(repo)).toMatchObject({ status: 'incomplete', code: 'PREGATE_INCOMPLETE' });
+    expect(lanes(repo).detail).toContain('the remote gate did not finish (timed out after 2 s, --timeout)');
+    expect(pregateFile(repo).requires_remote[0].receipt).toBeNull();
+  }, 60_000);
 
   test('a wrong tree, zero tests, a failure, a missing line or a non-zero exit leaves the obligation uncleared and the check incomplete; unreported spend counts at the cap', () => {
     const repo = gated();

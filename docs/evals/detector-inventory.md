@@ -31,7 +31,7 @@ Dispositions:
 | F3 | test/helpers/pty/runners/floor.ts:497 | screen Write render / plan-ready text → fail | Write/ExitPlanMode tool_use in run.transcript | no | (b) |
 | A1 | test/helpers/auq-sdk-capture.ts:30-43 `scoreAuqFormat` | question has ELI10:, Recommendation:, Pros / cons, ✅, ❌, Net:, (recommended) | AUQ tool input (its prose is the contract) | yes | (c) |
 
-Cases that use S1-S8: plan-ceo-review-plan-mode, plan-devex-review-plan-mode, plan-mode-no-op, office-hours-auto-mode (gate); auto-decide-preserved, plan-eng-review-plan-mode, plan-design-review-plan-mode-smoke (periodic). S9-S10: plan-mode-no-op, plan-eng-review-plan-mode, plan-design-review-plan-mode-smoke. F1-F3: plan-ceo-finding-floor, plan-devex-finding-floor (gate); plan-design-finding-floor, plan-eng-finding-floor (periodic). A1: auq-format-gate (gate); the three standalone AUQ files (periodic).
+Cases that use S1-S8: plan-ceo-review-plan-mode, plan-devex-review-plan-mode, plan-mode-no-op, office-hours-auto-mode (gate); auto-decide-preserved, plan-design-review-plan-mode-smoke (periodic). S9-S10: plan-mode-no-op, plan-design-review-plan-mode-smoke. F1-F3: plan-ceo-finding-floor, plan-devex-finding-floor (gate); plan-design-finding-floor (periodic). A1: auq-format-gate (gate); the three standalone AUQ files (periodic). plan-eng-review-plan-mode and plan-eng-finding-floor were deleted with standalone /plan-eng-review (GST-1698).
 
 ## Gate tier
 
@@ -63,7 +63,7 @@ The plan-ceo-review-plan-mode (:89, :108), plan-devex-review-plan-mode (:181-222
 | auq-format-gate | test/skill-e2e-ask-user-question-format-compliance.test.ts:58 | question ~ `options differ in kind` | AUQ tool input | yes | (c) |
 | auq-format-gate | test/skill-e2e-ask-user-question-format-compliance.test.ts:61, :68 | recommendation substance ≥ 4 | — | — | judge |
 | plan-tune-inspect | test/skill-e2e-plan-tune.test.ts:167-169, :185 | output names ≥2 of 3 seeded question IDs or aliases | question-log is seeded fixture input | yes (inspection report) | (c) |
-| plan-review-report | test/skill-e2e-plan.test.ts:463-491 | plan.md `## GSTACK REVIEW REPORT`, CEO/Eng/Design rows, ends with `NO UNRESOLVED DECISIONS` or a bullet | rows come from the seeded review log; the table is rendered | yes | (c) |
+| plan-review-report | test/skill-e2e-plan.test.ts:472-500 | plan.md `## GSTACK REVIEW REPORT`, CEO/Eng/Design rows, ends with `NO UNRESOLVED DECISIONS` or a bullet | rows come from the seeded review log; the table is rendered | yes | (c) |
 
 ### test/skill-e2e-design.test.ts (gate cases)
 
@@ -89,14 +89,14 @@ The plan-ceo-review-plan-mode (:89, :108), plan-devex-review-plan-mode (:181-222
 |---|---|---|---|---|---|
 | shared-libs-read-only | test/skill-e2e-shared-libs.test.ts:113-120 | report ~ uncommitted/overlay/raw, tip and branch SHAs, retry-worker/route, no blob link for branch-only file | none (read-only by contract) | yes | (c) |
 | shared-libs-unsupported-git | test/skill-e2e-shared-libs.test.ts:136, :144 | report ~ unavailable/unsupported/limited; not "no commits/PRs found" | none | yes | (c) |
-| shared-libs-review-path-eligibility | test/skill-e2e-shared-libs-paths.test.ts:133-134 | `trace + output` ~ submodule/160000, check-ignore/ignored (output alone satisfies) | Bash command trace (first operand) | no | (b) |
+| shared-libs-review-path-eligibility | test/skill-e2e-shared-libs-paths.test.ts:134-135 | `trace + output` ~ submodule/160000, check-ignore/ignored (output alone satisfies) | Bash command trace (first operand) | no | (b) |
 
 ### test/skill-e2e-ship-docsync.test.ts, test/skill-e2e-docsync-spawned.test.ts
 
 | Case | Check (file:line) | Matches | Structured source | User-visible | Disposition |
 |---|---|---|---|---|---|
 | ship-docsync-store | test/skill-e2e-ship-docsync.test.ts:74, :78 | ship report ~ `Documentation…blocked`; not `Documentation: current` | no receipt, no publish call (:75-77) | yes (report status) | (c) |
-| ship-docsync-completion, ship-docsync-current | test/skill-e2e-ship-docsync.test.ts:81, :97 | parsed docs contract, then report contains `contract.documentation_section` | docs dispatch JSON (ship/sections/documentation.md.tmpl:52-56) | yes | (a) |
+| ship-docsync-completion, ship-docsync-current | test/skill-e2e-ship-docsync.test.ts:85, :105 | parsed docs contract, then report contains `contract.documentation_section` | docs dispatch JSON (ship/sections/documentation.md.tmpl:52-56) | yes | (a) |
 | ship-docsync-late-result, -missing-marker, -missing-asset, -launch-failure, -timeout-unsettled, -failure | test/helpers/docsync-fault-eval.ts:28, :30 | non-success report ~ `Documentation…blocked`, no `Documentation: current` outside inline code | actor event log decides dispatch count and publication first (:22-27) | yes | (c) |
 | ship-docsync-recovery, -stale-before, -stale-after | test/helpers/docsync-fault-eval.ts:31 | report contains the accepted audit id | actor state `acceptedId` | yes | (a) |
 | docsync-spawned | test/skill-e2e-docsync-spawned.test.ts:60 | `contract.blockers` ~ security/sensitive | parsed docs contract | no | (a) |
@@ -205,18 +205,18 @@ Gate cases with no phrase-only checks: the shared-libs review-lifecycle, revalid
 | plan-eng-multi-finding-batching | test/helpers/eng-seeded-coverage.ts:33-104 | distinct-issue identity per answered AUQ ("Issue N:", D/R-ID, ELI10 gates) | ledger R records, used only as fallback behind the prose gates | no | (b) |
 | plan-eng-multi-finding-batching | test/helpers/pty/classify.ts:555 via counting.ts:554 | screen completion text ends counting | review-log row / ExitPlanMode tool_use | no | (b) |
 | plan-eng-review-artifact | test/skill-e2e-plan-eng-artifact.test.ts:78 | test-plan artifact ~ dashboard/fetchStats/`/api/stats` | artifact schema has no field naming the change (scripts/resolvers/testing.ts:501-528) | no | (d) |
-| carve-section-loading [plan-eng-review] | test/helpers/carve-section-case.ts:120 → test/helpers/auq-sdk-capture.ts:381 | report or output ~ report/review/summary/design doc/handoff | review-log row in the capture state root, deleted before the verdict (auq-sdk-capture.ts:368-370) | no | (b) |
+| carve-section-loading [plan-eng-review] (deleted, GST-1698) | test/helpers/carve-section-case.ts:120 → test/helpers/auq-sdk-capture.ts:381 | report or output ~ report/review/summary/design doc/handoff | review-log row in the capture state root, deleted before the verdict (auq-sdk-capture.ts:368-370) | no | (b) |
 | carve-section-loading [12 other skills] | same | same loose regex | none (Bash not allowed, auq-sdk-capture.ts:358-359) | no | (d) |
 
-The plan-eng-review-plan-mode and plan-design-review-plan-mode-smoke verdicts are S1-S10. plan-eng-finding-floor and plan-design-finding-floor verdicts are F1-F3.
+The plan-design-review-plan-mode-smoke verdicts are S1-S10, and the plan-design-finding-floor verdicts are F1-F3. Their plan-eng twins were deleted with standalone /plan-eng-review (GST-1698).
 
 ### Question format: test/skill-e2e-plan-format.test.ts, test/skill-e2e-plan-prosons.test.ts, standalone AUQ files
 
 | Case | Check (file:line) | Matches | Structured source | User-visible | Disposition |
 |---|---|---|---|---|---|
-| plan-ceo-review-format-mode, plan-eng-review-format-kind | test/skill-e2e-plan-format.test.ts:174-175, :377-378 | no `Completeness: N/10`; kind note present | captured question | yes | (c) |
-| plan-ceo-review-format-approach, plan-eng-review-format-coverage | test/skill-e2e-plan-format.test.ts:241, :310 | `Completeness: N/10` present | captured question | yes | (c) |
-| all four format cases | test/skill-e2e-plan-format.test.ts:177, :243, :312, :380 | recommendation quality | — | — | judge |
+| plan-ceo-review-format-mode | test/skill-e2e-plan-format.test.ts:173-174 | no `Completeness: N/10`; kind note present | captured question | yes | (c) |
+| plan-ceo-review-format-approach | test/skill-e2e-plan-format.test.ts:240 | `Completeness: N/10` present | captured question | yes | (c) |
+| both format cases | test/skill-e2e-plan-format.test.ts:176, :242 | recommendation quality | — | — | judge |
 | plan-review-prosons-format | test/skill-e2e-plan-prosons.test.ts:184-196 | `D\d+ —`, ELI10:, Stakes…:, Recommendation:, Pros / cons:, ^Net:, ✅≥4, ❌≥2, (recommended) | captured question | yes | (c) |
 | plan-review-prosons-hardstop-neg | test/skill-e2e-plan-prosons.test.ts:246-249 | no hard-stop escape line; ✅/❌ counts | captured question | yes | (c) |
 | plan-review-prosons-neutral-neg | test/skill-e2e-plan-prosons.test.ts:299-303 | no `taste call`; (recommended); `Recommendation:.*because` | captured question | yes | (c) |
@@ -315,6 +315,6 @@ Red cases that are not convert candidates: shared-libs-plan-callers (3 reds, act
 - Census commits `a8ace39` through `fd6854b` are not in this checkout, so the wave-reds line numbers could not be mapped to assertions; reds are attributed from the trial error text.
 - The skill-llm-eval.test.ts judge cases are outside `E2E_TIERS` and are not covered.
 - codex-ci-access.test.ts, codex-hardening.test.ts, codex-under-codex-detection.test.ts, e2e-shard-reuse.test.ts and skill-routing-e2e.test.ts name the umbrella keys but are free tests or route to the files audited above.
-- plan-eng-review-artifact-full is `marathon` and out of scope.
+- plan-eng-review-artifact-full was `marathon` and was deleted with standalone /plan-eng-review (GST-1698).
 - The aside-* cases need a live Aside on macOS and never run in CI.
 - "Not verified" in the structured-source column means the template writes the record, but the audit did not confirm that the fixture installs the helper.

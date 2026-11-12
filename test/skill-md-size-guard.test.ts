@@ -7,14 +7,15 @@
  * Skills already over the limit are pinned at their exact size in
  * test/fixtures/skill-md-size-allowlist.json (a ratchet): growth past a pin
  * fails, and a shrink below a pin fails until the pin is lowered. The shared
- * preamble hoist that would retire most pins is deferred (owner Garry,
- * revisit 2026-11-15).
+ * preamble hoist (GSTA-96) already moved each tier 2+ skill's shared preamble
+ * into sections/preamble.md.
  */
 import { afterAll, describe, expect, test } from 'bun:test';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { ALL_HOST_CONFIGS } from '../hosts/index';
+import { RETIRED_SKILLS } from '../scripts/discover-skills';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const ALLOWLIST_FILE = 'test/fixtures/skill-md-size-allowlist.json';
@@ -57,7 +58,7 @@ const SIZE_FIX = 'Fix: move skill-specific prose into sections/*.md that the ski
   + 'to CARVED_ON_EVERY_HOST in scripts/resolvers/sections.ts so its sections stop being inlined), or cut duplicated text; '
   + 'then run `bun run gen:skill-docs` and rerun this test. A pin may only go down: when a pinned skill shrinks, '
   + `lower its pin in ${ALLOWLIST_FILE} to the new size, and delete it once the skill is within the limit. `
-  + 'Raising a pin is an owner decision. The shared-preamble hoist (#3199) is deferred: owner Garry, revisit 2026-11-15.';
+  + 'Raising a pin is an owner decision.';
 
 function renderAllHosts(outDir: string): Record<string, number> {
   const render = Bun.spawnSync(
@@ -81,6 +82,11 @@ function renderAllHosts(outDir: string): Record<string, number> {
       if (!fs.existsSync(file)) continue;
       if (host.name === 'claude' && !fs.existsSync(`${file}.tmpl`)) continue;
       sizes[`${host.name}/${dir === '.' ? 'gstack' : dir}`] = countChars(fs.readFileSync(file, 'utf-8'));
+    }
+    // A retired skill's methodology ships beside /autoplan; it keeps its pin.
+    for (const skill of RETIRED_SKILLS) {
+      const file = path.join(skillsRoot, 'gstack-autoplan', `${skill}.md`);
+      if (host.name !== 'claude' && fs.existsSync(file)) sizes[`${host.name}/gstack-${skill}`] = countChars(fs.readFileSync(file, 'utf-8'));
     }
   }
   return sizes;

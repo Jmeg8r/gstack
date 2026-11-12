@@ -21,6 +21,8 @@ import { TEMP_DIR } from './platform';
 import { SAFE_DIRECTORIES } from './path-security';
 import { modifyStyle, undoModification, resetModifications, getModificationHistory } from './cdp-inspector';
 import { withCdpSession } from './cdp-bridge';
+import { handleDeviceCommand, reassertDevice, refuseWhileDevice } from './device-emulation';
+import { TOUCH_COMMANDS, handleTouchCommand } from './touch-commands';
 
 /**
  * Aggressive page cleanup selectors and heuristics.
@@ -141,6 +143,8 @@ export async function handleWriteCommand(
   // Frame-aware target for locator-based operations (click, fill, etc.)
   const target = session.getActiveFrameOrPage();
   const inFrame = session.getFrame() !== null;
+  if (command === 'device') return handleDeviceCommand(args, session);
+  if (TOUCH_COMMANDS.has(command)) return handleTouchCommand(command, args, session);
 
   switch (command) {
     case 'goto': {
@@ -457,11 +461,14 @@ export async function handleWriteCommand(
 
     case 'scroll': {
       // Parse --times N and --wait ms flags
-      const timesIdx = args.indexOf('--times');
-      const times = timesIdx >= 0 ? parseInt(args[timesIdx + 1], 10) || 1 : 0;
-      const waitIdx = args.indexOf('--wait');
-      const waitMs = waitIdx >= 0 ? parseInt(args[waitIdx + 1], 10) || 1000 : 1000;
-      const selector = args.find(a => !a.startsWith('--') && args.indexOf(a) !== timesIdx + 1 && args.indexOf(a) !== waitIdx + 1);
+      let times = 0;
+      let waitMs = 1000;
+      let selector: string | undefined;
+      for (let i = 0; i < args.length; i++) {
+        if (args[i] === '--times') times = parseInt(args[++i], 10) || 1;
+        else if (args[i] === '--wait') waitMs = parseInt(args[++i], 10) || 1000;
+        else if (!args[i].startsWith('--') && selector === undefined) selector = args[i];
+      }
 
       if (times > 0) {
         // Repeated scroll mode
@@ -526,6 +533,7 @@ export async function handleWriteCommand(
     }
 
     case 'viewport': {
+      refuseWhileDevice(session, 'viewport');
       // Parse args: [<WxH>] [--scale <n>]. Either may be omitted, but NOT both.
       let sizeArg: string | undefined;
       let scaleArg: number | undefined;
@@ -1126,6 +1134,7 @@ export async function handleWriteCommand(
       if (viewportWidth && originalViewport) {
         await page.setViewportSize(originalViewport);
       }
+      await reassertDevice(session);
 
       const parts = ['Screenshot saved'];
       if (doCleanup) parts.push('(cleaned)');

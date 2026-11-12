@@ -14,7 +14,7 @@ import { spawnSync } from 'child_process';
 import {
   buildRenderScript, lengthToInches, paperInches, renderWithAside, RENDER_SENTINEL,
   resolveBrowseBin, browsePdfPayload, browseScreenshotArgs, renderWithBrowse, NO_BROWSER,
-  serveDir, pickEngine, SAFE_TMP_DIR,
+  serveDir, pickEngine, SAFE_TMP_DIR, noBrowserHelp, NO_BROWSER_HELP,
   type RenderSpec, type RenderResult, type AsideProbe, type EngineChoice,
 } from '../lib/aside-render';
 import { asideAvailable } from './helpers/aside-available';
@@ -187,6 +187,21 @@ describe('aside-render: browse fallback — binary resolution', () => {
     expect(resolveBrowseBin(noPath, [rootC])).toBe(builtB);
   });
 
+  test.skipIf(process.platform === 'win32')('a PATH browse that links to another program (Debian xdg-open) is not gstack\'s', () => {
+    const binDir = path.join(home, 'path-bin');
+    fs.mkdirSync(binDir, { recursive: true });
+    const xdg = fakeBin(binDir, 'xdg-open');
+    fs.symlinkSync(xdg, path.join(binDir, 'browse'));
+    expect(resolveBrowseBin({ PATH: binDir }, [empty])).toBeNull();
+    const realDir = path.join(home, 'path-real');
+    fakeBin(realDir, 'browse');
+    expect(resolveBrowseBin({ PATH: realDir }, [empty])).toBe(path.join(realDir, 'browse'));
+    const linkDir = path.join(home, 'path-link');
+    fs.mkdirSync(linkDir, { recursive: true });
+    fs.symlinkSync(builtA, path.join(linkDir, 'browse'));
+    expect(resolveBrowseBin({ PATH: linkDir }, [empty])).toBe(path.join(linkDir, 'browse'));
+  });
+
   test('directories are never "executables"', () => {
     const rootD = path.join(home, 'd');
     fs.mkdirSync(path.join(rootD, 'browse/dist/browse'), { recursive: true });
@@ -350,7 +365,7 @@ function writeDriver(dir: string): string {
   fs.writeFileSync(driver, `const M = await import(${JSON.stringify(LIB)});
 const job = JSON.parse(process.argv[2]);
 let out;
-if (job.fn === 'probeAside') out = M.probeAside(job.timeoutMs);
+if (job.fn === 'probeAside') out = M.probeAside(job.timeoutMs, job.platform);
 else if (job.fn === 'renderWithAside') out = await M.renderWithAside(job.spec);
 else if (job.fn === 'render') {
   if (job.primeAside) M.pickEngine(true, { probe: () => ({ ok: true, version: 'fake-aside' }) });
@@ -383,9 +398,9 @@ describe.skipIf(!HERMETIC)('aside-render: probeAside classifies a fake CLI the w
   let driver: string;
   beforeAll(() => { fs.mkdirSync(bin); driver = writeDriver(tmp); });
   afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
-  const probe = (env?: Record<string, string>): AsideProbe => {
+  const probe = (env?: Record<string, string>, platform = 'darwin'): AsideProbe => {
     fs.rmSync(log, { force: true });
-    return runDriver<AsideProbe>(driver, { fn: 'probeAside', timeoutMs: 5_000 }, { binDir: bin, env });
+    return runDriver<AsideProbe>(driver, { fn: 'probeAside', timeoutMs: 5_000, platform }, { binDir: bin, env });
   };
 
   test('no `aside` on PATH → NEEDS_ASIDE (install it), never "not running"', () => {
@@ -441,6 +456,23 @@ describe.skipIf(!HERMETIC)('aside-render: probeAside classifies a fake CLI the w
     expect(r.reason).toBe('NEEDS_ASIDE');
     expect(r.detail).toContain('GSTACK_SKIP_ASIDE=1');
     expect(fs.existsSync(log)).toBe(false);
+  });
+
+  test.each(['linux', 'win32'])('on %s → NEEDS_ASIDE naming the platform, and the CLI is never invoked, even when one is on PATH (#2864)', platform => {
+    writeFakeAside(bin, { repl: 'echo "ASIDE_READY /x"', log });
+    const r = probe(undefined, platform);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe('NEEDS_ASIDE');
+    expect(r.detail).toBe(`Aside is macOS-only (this is ${platform})`);
+    expect(fs.existsSync(log)).toBe(false);
+  });
+
+  test('GSTACK_SKIP_ASIDE=1 keeps precedence over the platform check', () => {
+    const r = probe({ GSTACK_SKIP_ASIDE: '1' }, 'linux');
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.detail).toContain('GSTACK_SKIP_ASIDE=1');
   });
 });
 
@@ -850,6 +882,51 @@ describe.skipIf(!HERMETIC)('aside-render: renderWithBrowse — daemon CLI contra
     expect(r.evals[0]).toBe('Fake Title');
   });
 
+  // Value: protects=a lazy Capy install (Chromium skipped until first use) renders on the first call: Playwright's missing-browser launch
+  //   error runs the checkout's gstack-browser-ensure once and retries newtab; fails_when=the render stops on "browse newtab failed: [browse]
+  //   Starting server..." with the cause hidden; why_new=GST-1204 (gbrain-evals#317: gstack-pr-shots on a Capy machine); seam=bin/gstack-browser-ensure
+  const MISSING = "echo '[browse] Starting server...' >&2; echo '\u2554\u2550 Looks like Playwright was just installed or updated. \u2557' >&2; echo \"launch: Executable doesn't exist at /x/chrome-headless-shell\" >&2; exit 1";
+  const lazyCheckout = (ensureBody: string, installedNewtab = ''): { browse: string; ensureLog: string; marker: string } => {
+    const root = fs.mkdtempSync(path.join(tmp, 'lazy-'));
+    const dist = path.join(root, 'browse', 'dist');
+    fs.mkdirSync(dist, { recursive: true });
+    fs.mkdirSync(path.join(root, 'bin'));
+    const ensureLog = path.join(root, 'ensure.log');
+    const marker = path.join(root, 'chromium');
+    writeExecutable(path.join(root, 'bin', 'gstack-browser-ensure'), 'printf "%s\\n" "$*" >> ' + JSON.stringify(ensureLog) + '\n' + ensureBody.replace('MARKER', JSON.stringify(marker)) + '\n');
+    fs.rmSync(log, { force: true });
+    const browse = writeFakeBrowse(dist, log, { newtab: 'if [ ! -f ' + JSON.stringify(marker) + ' ]; then ' + MISSING + '; fi; ' + installedNewtab + ' echo \'{"tabId":7}\'' });
+    return { browse, ensureLog, marker };
+  };
+
+  test('a missing Playwright Chromium runs gstack-browser-ensure once, then the render proceeds', async () => {
+    const { browse, ensureLog } = lazyCheckout(": > MARKER; echo 'BROWSER_OK playwright 140.0'");
+    const r = await renderWithBrowse({ file: doc, steps: [{ kind: 'eval', expression: 'document.title' }] }, browse);
+    expectOk(r);
+    expect(readLines(ensureLog)).toEqual(['--quiet']);
+    expect(readLines(log).filter((l) => l === 'newtab --json').length).toBe(2);
+    expect(r.stdout).toContain('newtab: Chromium is not installed');
+  });
+
+  // Value: protects=a Chromium download longer than the render budget leaves the retried newtab its own time; fails_when=the retry runs on
+  //   the 1 s floor and the first render on a fresh machine times out; why_new=GST-1204 review (outside voice + adversarial P2); seam=deadline
+  test('the install time does not count against the render deadline', async () => {
+    const { browse, ensureLog } = lazyCheckout("sleep 3; : > MARKER", 'sleep 1.5;');
+    const r = await renderWithBrowse({ file: doc, timeoutMs: 2_500, steps: [{ kind: 'eval', expression: 'document.title' }] }, browse);
+    expectOk(r);
+    expect(readLines(ensureLog)).toEqual(['--quiet']);
+  }, 20_000);
+
+  test('when gstack-browser-ensure cannot install Chromium, the error names the launch failure, not the daemon banner', async () => {
+    const { browse, ensureLog } = lazyCheckout("echo 'BROWSER_UNAVAILABLE offline'; exit 1");
+    const r = await renderWithBrowse({ file: doc, steps: [] }, browse);
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain("browse newtab failed: launch: Executable doesn't exist");
+    expect(r.error).toContain('BROWSER_UNAVAILABLE offline');
+    expect(readLines(ensureLog).length).toBe(1);
+    expect(readLines(log).filter((l) => l === 'newtab --json').length).toBe(1);
+  });
+
   test('any other newtab failure is not retried', async () => {
     const r = await renderWithBrowse({ file: doc, steps: [] }, fake({ newtab: `echo 'browser launch failed: no display' >&2; exit 1` }));
     expect(r.ok).toBe(false);
@@ -886,6 +963,23 @@ describe.skipIf(!HERMETIC)('aside-render: renderWithBrowse — daemon CLI contra
     expect(r.error).toContain('timed out after');
     expect(Date.now() - t0).toBeLessThan(8_000);
   }, 20_000);
+});
+
+describe('aside-render: missing-browser advice (#3735)', () => {
+  // Value: protects=Aside recovery advice only on macOS, bundled-browser advice everywhere; fails_when=Linux or Windows hosts are told to open the macOS-only Aside app, or a host loses the ./setup remedy; why_new=no test covered the advice per platform; seam=none
+  test.each(['linux', 'win32', 'darwin'] as const)('%s gets only the remedies it can use', (platform) => {
+    const help = noBrowserHelp(platform);
+    expect(help).toContain('./setup');
+    expect(help).toContain('GSTACK_BROWSE_BIN');
+    expect(help.includes('open the Aside app')).toBe(platform === 'darwin');
+    expect(help.includes('aside.com')).toBe(platform === 'darwin');
+  });
+
+  test('NO_BROWSER_HELP and the no-engine error use this host\'s advice', () => {
+    expect(NO_BROWSER_HELP).toBe(noBrowserHelp(process.platform));
+    const choice = pickEngine(true, { probe: () => ({ ok: false, reason: 'NEEDS_ASIDE', detail: 'stub' }), resolveBin: () => null });
+    expect(choice.engine === null && choice.error).toBe(`${NO_BROWSER}: ${NO_BROWSER_HELP} (NEEDS_ASIDE: stub)`);
+  });
 });
 
 describe('aside-render: pickEngine — cached engine choice through the probe/resolver seam', () => {

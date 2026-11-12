@@ -48,20 +48,35 @@ export const GATE_OUTCOMES = {
     summary: 'the reviewer declined to review',
     fix: 're-run the review; if it declines again, review the change natively',
   },
+  truncated: {
+    state: 'unavailable', anchor: 'outside-review-truncated',
+    summary: 'the reviewer hit its output token limit and the response is cut off',
+    fix: 're-run with a larger --max-tokens (or a smaller prompt); a cut-off response never counts as a review',
+  },
   missing_markers: {
     state: 'unavailable', anchor: 'outside-review-missing-markers',
     summary: 'the response lacks the markers this gate requires',
     fix: 're-run the review; a response without its required markers never counts as a pass',
   },
+  missing_verdict: {
+    state: 'ran', anchor: 'outside-review-missing-verdict',
+    summary: 'the review does not end with the required VERDICT: CLEAN or VERDICT: FINDINGS line',
+    fix: 'read the full reply above and decide; it is not a pass. Re-run the review from current skills, whose prompts ask for that line (https://github.com/garrytan/gstack/blob/main/docs/troubleshooting.md#outside-review-missing-verdict)',
+  },
   untagged_review: {
     state: 'ran', anchor: 'outside-review-unverified',
-    summary: 'the review completed without severity tags or an explicit no-findings line',
+    summary: 'the review reports findings without a readable severity tag',
     fix: 'read the output above and decide; it is not a pass',
   },
   unparsed_severity: {
     state: 'ran', anchor: 'outside-review-unparsed-severity',
     summary: 'the review labels a finding with a P0-P3 severity in a form the parser cannot read',
     fix: 'read the quoted line and the full reply above and decide; it is not a pass. Re-run the review asking for [P0]-[P3] or "P1:" labels, or re-check a corrected reply with bun lib/outside-review-result.ts --verdict <gate> <reply-file> from your gstack checkout (https://github.com/garrytan/gstack/blob/main/docs/troubleshooting.md#outside-review-unparsed-severity)',
+  },
+  unverified_verdict: {
+    state: 'ran', anchor: 'outside-review-unverified-verdict',
+    summary: "the reviewer's own verdict does not say the change is ready",
+    fix: 'read the quoted verdict and the full reply above and decide; it is not a pass. Fix what the verdict names (an excluded file, a suite that could not run), then re-run the review (https://github.com/garrytan/gstack/blob/main/docs/troubleshooting.md#outside-review-unverified-verdict)',
   },
   model_unusable: {
     state: 'unavailable', anchor: 'codex-model-unusable',

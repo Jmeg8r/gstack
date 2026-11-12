@@ -1,4 +1,5 @@
 import { generateAdversarialStep } from '../scripts/resolvers/outside-voice-steps';
+import { classifyOutsideReview } from '../lib/outside-review-result';
 import { RESOLVERS } from '../scripts/resolvers';
 import { HOST_PATHS } from '../scripts/resolvers/types';
 import { describe, test, expect } from 'bun:test';
@@ -611,15 +612,21 @@ describe('codex review-mode section Step 2A: PROMPT + --base mutual exclusion gu
         }
       }
       expect(offendingLines).toEqual([]);
+      // Step 2A no longer runs `codex review` at all, so no invocation is left
+      // that could combine a prompt with --base.
+      expect(lines.filter((l) => /run-with-timeout\b.*\bcodex\s+review\b/.test(l))).toEqual([]);
     });
 
     test(`${relPath}: Step 2A still contains at least one fix-path invocation`, () => {
       const section = extractStep2A(path.join(ROOT, relPath));
-      // At least one of: bare `codex review --base` OR `codex exec ...` must
-      // remain. Guards against accidental deletion of both fix paths.
-      const bareReview = /codex\s+review\s+--base\b/.test(section);
-      const execRoute = /codex\s+exec\b/.test(section);
-      expect(bareReview || execRoute).toBe(true);
+      // The one `codex exec` path must remain, with its scope taken from
+      // `git merge-base <base> HEAD` and inlined between the diff markers.
+      expect(section).toMatch(/run-with-timeout\b.*\bcodex\s+exec\s+-\s/);
+      expect(section).toContain('DIFF_BASE=$(git merge-base <base> HEAD)');
+      expect(section).toContain('git diff "$DIFF_BASE"');
+      expect(section.indexOf("printf 'DIFF_START\\n'")).toBeGreaterThan(-1);
+      expect(section.indexOf("printf 'DIFF_START\\n'")).toBeLessThan(section.indexOf('git diff "$DIFF_BASE"'));
+      expect(section.indexOf('git diff "$DIFF_BASE"')).toBeLessThan(section.indexOf("printf '\\nDIFF_END\\n'"));
     });
   }
 });
@@ -710,26 +717,20 @@ describe('codex skeleton+sections union: review sandbox + fail-closed gate + tim
   for (const relPath of ['codex tmpl union', 'codex rendered union'] as const) {
     const read = () => readCodexUnion(relPath === 'codex tmpl union' ? 'tmpl' : 'rendered');
 
-    test(`${relPath}: (a) the structured review runs codex exec on the built prompt, sandboxed by the selection`, () => {
-      const content = read();
-      const runs = content
+    test(`${relPath}: (a) every codex invocation pins the sandbox from the selected sandbox, and review runs codex exec`, () => {
+      const invocations = read()
         .split('\n')
         .filter((l) => /run-with-timeout\s+(?:--user-invoked\s+)?(?:--effort\s+\w+\s+(?:--request-effort\s+'[^']*'\s+)?)?\d+\s+codex\s+(?:exec|review)\b/.test(l));
-      // Native `codex review` takes no prompt, so it can never print NO_FINDINGS
-      // (change 2026-10-28-codex-exec-review-gate); no wrapped call may use it.
-      expect(runs.filter((l) => /\scodex\s+review\b/.test(l))).toEqual([]);
-      const reviews = runs.filter((l) => l.includes('< "$_PROMPT_FILE"'));
-      expect(reviews.length).toBe(1);
-      expect(content).toMatch(/gstack-codex-review-prompt <scope>[^\n]*> "\$_PROMPT_FILE"/);
-      for (const line of runs) {
+      expect(invocations.length).toBeGreaterThanOrEqual(4);
+      expect(invocations.filter((l) => /\bcodex\s+review\b/.test(l))).toEqual([]);
+      expect(invocations.some((l) => /\b330\s+codex\s+exec\s+-\s+-s\s+"\$\{_CODEX_SANDBOX_MODE:\?\}"/.test(l))).toBe(true);
+      for (const line of invocations) {
         // select-model reports read-only (full access only for
         // GSTACK_CODEX_NO_SANDBOX=1, test/codex-model-probe.test.ts); :? stops
         // an unselected command instead of inheriting config.toml's default.
-        // `exec resume` has no -s flag, so it pins the same value through -c.
-        const pinned = /\scodex exec resume\s/.test(line)
-          ? line.includes('sandbox_mode=\\"${_CODEX_SANDBOX_MODE:?}\\"')
-          : line.includes('-s "${_CODEX_SANDBOX_MODE:?}"');
-        expect(pinned, line).toBe(true);
+        // `codex exec resume` takes the config override; every other exec takes -s.
+        expect(line.includes('-s "${_CODEX_SANDBOX_MODE:?}"') || line.includes('sandbox_mode=\\"${_CODEX_SANDBOX_MODE:?}\\"'), line).toBe(true);
+        expect(line).not.toMatch(/\s-s\s+read-only\b/);
       }
     });
 
@@ -747,22 +748,21 @@ describe('codex skeleton+sections union: review sandbox + fail-closed gate + tim
       expect(content).toContain('`_CODEX_EXIT` is non-zero (including 124) → **GATE: FAIL**');
       expect(content).toContain('empty or whitespace-only → **GATE: FAIL**');
       expect(content).toContain('`[P0]`');
-      expect(content).toContain('PASS is only reachable through checks 4 and 6');
+      expect(content).toContain('PASS is only reachable through check 5');
     });
 
-    test(`${relPath}: (b2) a clean review passes only on NO_FINDINGS, untagged prose is UNVERIFIED, P2/P3-only can PASS (#2769)`, () => {
+    test(`${relPath}: (b2) untagged prose without the verdict line is UNVERIFIED, and VERDICT: clean is the only PASS route (#2769)`, () => {
       const content = read();
-      expect(content).toContain('has a line containing only\n      `NO_FINDINGS` that its conclusion agrees with → **GATE: PASS**');
-      expect(content).toContain(
-        'no `NO_FINDINGS` line → **GATE: UNVERIFIED** (Codex completed without\n      following the output contract; read the output above)',
-      );
-      expect(content).toContain('GATE: UNVERIFIED (Codex completed without following the output contract; read the output above)');
-      expect(content).toContain('(only P2/P3 advisory) →\n      **GATE: PASS**');
+      expect(content).toContain('The validator printed `VERDICT: unverified` → **GATE: UNVERIFIED**');
+      expect(content).toContain('GATE: UNVERIFIED (Codex completed without a readable verdict; read the output above)');
+      expect(content).toContain('The validator printed `VERDICT: clean`: the reply ended with its verdict\n      line and no finding is P0/P1 → **GATE: PASS**');
+      expect(content).toContain('check 5 is\n   `VERDICT: clean` with `FINDINGS: none`, `P2` or `P3`');
+      expect(content).toContain('End with exactly VERDICT: CLEAN (no findings) or VERDICT: FINDINGS as the last line.');
       expect(content).not.toContain('**GATE: FAIL** (fail-closed: untagged output');
       expect(content).toContain('"unverified" if UNVERIFIED');
-      // The captured clean review from native `codex review` carries no tag and
-      // no NO_FINDINGS line, so it takes check 5 (UNVERIFIED): the reason the
-      // review moved to codex exec. The captured P2 review takes check 6.
+      // The captured clean review from the real CLI carries no severity tag and
+      // no verdict line, so check 4 is the branch it takes; with the verdict
+      // line it takes check 5, as does the captured P2 review.
       const fixtures = path.join(ROOT, 'test', 'fixtures', 'codex-review');
       const clean = fs.readFileSync(path.join(fixtures, 'clean-review.stdout.txt'), 'utf-8');
       const p2 = fs.readFileSync(path.join(fixtures, 'p2-review.stdout.txt'), 'utf-8');
@@ -770,9 +770,13 @@ describe('codex skeleton+sections union: review sandbox + fail-closed gate + tim
       const blocking = (t: string) => /\[P[01]\]|(^|\s)P[01]:/m.test(t);
       expect(clean.trim().length).toBeGreaterThan(0);
       expect(tagged(clean)).toBe(false);
-      expect(clean).not.toMatch(/^NO_FINDINGS$/m);
       expect(tagged(p2)).toBe(true);
       expect(blocking(p2)).toBe(false);
+      const verdict = (text: string) => classifyOutsideReview({ text, gate: 'structured', exit: 0 });
+      expect(verdict(clean)).toMatchObject({ verdict: 'unverified', reason: 'missing_verdict' });
+      expect(verdict(p2)).toMatchObject({ verdict: 'unverified', reason: 'missing_verdict' });
+      expect(verdict(`${clean.trimEnd()}\nVERDICT: CLEAN\n`).verdict).toBe('clean');
+      expect(verdict(`${p2.trimEnd()}\nVERDICT: FINDINGS\n`).verdict).toBe('clean');
     });
 
     test(`${relPath}: (c) every Bash gate sits strictly above its section's wrapper budgets`, () => {
@@ -987,10 +991,10 @@ describe('codex broken-install detection (#2742)', () => {
 // --- Live codex smokes keep away from the real Codex home -------------------
 
 describe('live codex smokes run codex in a private HOME and CODEX_HOME', () => {
-  // Every codex run writes $CODEX_HOME/tmp/arg0. The two smokes below probe the
-  // CLI at module load or in free-tier tests, so with a real codex on PATH they
+  // Every codex run writes $CODEX_HOME/tmp/arg0. The smoke below probes the
+  // CLI at module load or in free-tier tests, so with a real codex on PATH it
   // used to write into the developer's ~/.codex.
-  for (const file of ['test/codex-resume-flag-semantics.test.ts', 'test/codex-e2e-sol-scope.test.ts']) {
+  for (const file of ['test/codex-resume-flag-semantics.test.ts']) {
     test(`${file} never runs codex with the caller's HOME or Codex home`, () => {
       const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-codex-smoke-home-'));
       try {

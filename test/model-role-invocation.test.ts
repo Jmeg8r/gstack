@@ -44,7 +44,7 @@ if (probe) {
 }
 if (!claude || args.includes('-')) await Bun.stdin.text();
 if (!claude && process.env.FAKE_DISPATCH_MODEL_ERROR) { console.error('ERROR: The model is not supported by this account.'); process.exit(1); }
-const response = process.env.FAKE_RESPONSE || 'Medium: the plan couples two rollouts.\\nRecommendation: split the migration because the plan couples two rollouts.';
+const response = process.env.FAKE_RESPONSE || 'Medium: the plan couples two rollouts.\\nRecommendation: split the migration because the plan couples two rollouts.\\nVERDICT: FINDINGS';
 if (claude && process.env.FAKE_PROVIDER_ERROR) { console.log(JSON.stringify({ is_error: true, result: process.env.FAKE_PROVIDER_ERROR })); process.exit(Number(process.env.FAKE_ERROR_EXIT ?? '1')); }
 if (claude) console.log(JSON.stringify({ result: response, session_id: 's', modelUsage: { 'model-actual': { inputTokens: 1 } } }));
 else writeFileSync(args[args.indexOf('-o') + 1], response);
