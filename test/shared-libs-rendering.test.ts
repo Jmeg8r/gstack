@@ -4,13 +4,15 @@ import { mkdtempSync, readFileSync, readdirSync, existsSync, rmSync } from 'node
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { ALL_HOST_CONFIGS } from '../hosts';
-import { discoverTemplates } from '../scripts/discover-skills';
+import { discoverTemplates, RETIRED_SKILLS } from '../scripts/discover-skills';
 import { sharedLibsPlanExcerpt } from './helpers/shared-libs-plan-excerpt';
+import { readSkillEffective } from './helpers/skill-startup';
 
 const ROOT = resolve(import.meta.dir, '..');
 let output: string;
 
 function rendered(host: (typeof ALL_HOST_CONFIGS)[number], skill: string): string {
+  if (host.name !== 'claude' && RETIRED_SKILLS.includes(skill)) return readFileSync(join(output, host.hostSubdir, 'skills', 'gstack-autoplan', `${skill}.md`), 'utf8');
   const dir = host.name === 'claude' ? join(output, skill)
     : join(output, host.hostSubdir, 'skills', `gstack-${skill}`);
   const sections = join(dir, 'sections');
@@ -89,7 +91,7 @@ describe('shared-code skill distribution', () => {
         }
         if (host.name !== 'codex' && !host.suppressedResolvers?.includes('REVIEW_ARMY')) {
           const stages = ['#### 1. Parse outputs', '#### 2. Validate severity', '#### 3. Identify and merge',
-            '#### 4. Apply specialist confidence gates', '#### 5. Score and present specialists'];
+            '#### 4. Lead judgment', '#### 5. Apply specialist confidence gates', '#### 6. Score and present specialists'];
           const positions = stages.map(stage => parent.indexOf(stage));
           expect(positions.every(position => position >= 0)).toBe(true);
           expect(positions).toEqual([...positions].sort((a, b) => a - b));
@@ -116,7 +118,7 @@ describe('shared-code skill distribution', () => {
   });
 
   test('the bounded plan fixture includes the generated decision prerequisites before Code Quality', () => {
-    const entrypoint = readFileSync(join(output, 'plan-eng-review/SKILL.md'), 'utf8');
+    const entrypoint = readSkillEffective(join(output, 'plan-eng-review/SKILL.md'));
     const review = readFileSync(join(output, 'plan-eng-review/sections/review-sections.md'), 'utf8');
     const excerpt = sharedLibsPlanExcerpt(entrypoint, review);
     const headings = ['## AskUserQuestion Format', '## My engineering preferences',

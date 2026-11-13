@@ -29,9 +29,7 @@ import {
 } from '../scripts/one-way-doors';
 import {
   SIGNAL_MAP,
-  applySignal,
   validateRegistrySignalKeys,
-  newDimensionTotals,
   normalizeToDimensionValue,
   resolveOptionKey,
   ALL_DIMENSIONS,
@@ -168,7 +166,6 @@ describe('one-way door safety', () => {
       'cso-finding-fix',                   // security finding
       'land-and-deploy-merge-confirm',     // actual merge
       'land-and-deploy-rollback',          // rollback decision
-      'investigate-fix-apply',             // applying a fix
       'plan-ceo-review-premise-revise',    // changing agreed premise
       'plan-eng-review-arch-finding',      // architecture change
       'office-hours-landscape-privacy-gate',// sending data to search provider
@@ -204,7 +201,6 @@ describe('registry breadth', () => {
       'plan-design-review',
       'plan-devex-review',
       'qa',
-      'investigate',
       'land-and-deploy',
       'cso',
     ];
@@ -244,26 +240,6 @@ describe('psychographic signal map', () => {
   test('every signal_key in registry has a SIGNAL_MAP entry', () => {
     const { missing } = validateRegistrySignalKeys();
     expect(missing).toEqual([]);
-  });
-
-  test('applySignal mutates dimension totals per mapping', () => {
-    const dims = newDimensionTotals();
-    const applied = applySignal(dims, 'scope-appetite', 'expand');
-    expect(applied.length).toBeGreaterThan(0);
-    expect(dims.scope_appetite).toBeCloseTo(0.06, 5);
-  });
-
-  test('applySignal returns [] for unknown signal_key', () => {
-    const dims = newDimensionTotals();
-    const applied = applySignal(dims, 'no-such-signal', 'anything');
-    expect(applied).toEqual([]);
-    expect(dims.scope_appetite).toBe(0);
-  });
-
-  test('applySignal returns [] for unknown user_choice', () => {
-    const dims = newDimensionTotals();
-    const applied = applySignal(dims, 'scope-appetite', 'definitely-not-a-real-choice');
-    expect(applied).toEqual([]);
   });
 
   test('normalizeToDimensionValue maps 0 → 0.5 (neutral)', () => {

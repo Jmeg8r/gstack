@@ -72,6 +72,16 @@ D) Defer
     expect(asideDriveOptions('A) Open the Aside app; if READY, I drive the dashboard.')).toHaveLength(1);
   });
 
+  test('a drive option that names Aside only as missing is not an Aside drive (gate 42748129558)', () => {
+    for (const option of ["B) I drive it in gstack's own visible browser (recommended, since Aside isn't available). I open the dashboard in a visible browser window and stop whenever you need to act.",
+      "B) Aside isn't available, so I drive it in gstack's own browser.", "B) Aside was not detected; I drive it in gstack's own browser.",
+      "B) Since the Aside browser is unavailable, I drive it in gstack's own browser.", "B) With no Aside installed, I drive it in gstack's browser."])
+      expect(asideDriveOptions(option), option).toEqual([]);
+    for (const option of ["A) Aside isn't open yet, so I open Aside and drive the dashboard.",
+      'A) I drive it in your Aside browser; Aside is not the only option.', "A) Aside wasn't running, but now I drive it in your Aside browser."])
+      expect(asideDriveOptions(option), option).toHaveLength(1);
+  });
+
   test.each(recoveryFixture.responses)('native recovery response $attempt defers drive consent to a new question', ({ text }) => {
     expect(asideDriveOptions(text)).toEqual([]);
     expect(asideDriveOptions(text.replace('option included.', 'option included; then I drive in your Aside browser.'))).toHaveLength(1);
@@ -441,6 +451,30 @@ describe("NEEDS_ASIDE: Darwin download pitch detector", () => {
     expect(asideDownloadPitchCount(red.text)).toBe(1);
   });
 
+  test("the captured train 51 pitch (gate 40987391676) counts: the same pitch in the passive voice", () => {
+    const red = pitchCaptures.captures.find(c => c.case === 'tpa-absent-darwin' && c.run === '40987391676')!;
+    expect(red.passed).toBe(false);
+    expect(red.text).toContain('Aside runs on macOS 15+ and can be downloaded at aside.com');
+    expect(asideDownloadPitchCount(red.text)).toBe(1);
+    for (const text of ['Aside cannot be downloaded at aside.com on Linux.', 'The policy says Aside can be downloaded at aside.com, but this is Linux.',
+      "Aside can't be downloaded at aside.com here.", 'I skipped the line about how it can be downloaded at aside.com.',
+      'Aside is not something that can be downloaded at aside.com.', 'It no longer can be downloaded at aside.com.',
+      "It isn't a tool that can be downloaded at aside.com on Linux."])
+      expect(asideDownloadPitchCount(text), text).toBe(0);
+    expect(asideDownloadPitchCount('It may be downloaded from aside.com (macOS 15+); open, sign in, re-run.')).toBe(1);
+  });
+
+  test("a negation counts against the passive pitch only inside the download predicate's own coordinate clause", () => {
+    for (const text of ['Aside is not installed but can be downloaded at aside.com.', 'Probe: Aside is not running yet and can be downloaded from aside.com.',
+      'Aside is not installed but it can be downloaded at aside.com (macOS 15+).', 'It is not on this Mac yet but can be downloaded at aside.com.'])
+      expect(asideDownloadPitchCount(text), text).toBe(1);
+    for (const text of ['Aside is not installed but cannot be downloaded at aside.com.', 'Aside is not installed and is not available to download at aside.com.',
+      "Aside isn't installed and can't be downloaded at aside.com.", 'Aside is not installed but it never can be downloaded at aside.com.',
+      'Aside is not installed but is not something that can be downloaded at aside.com.', 'Aside is not installed but can not be downloaded at aside.com.',
+      'Aside is not installed; the policy says it can be downloaded at aside.com.'])
+      expect(asideDownloadPitchCount(text), text).toBe(0);
+  });
+
   test("short forms count only at a sentence start; negated canonical phrases never count", () => {
     expect('Download it (macOS 15+) at aside.com; open, sign in, re-run.').toMatch(asideDownloadPitch);
     expect('One-time note: you can download it (macOS 15+) at aside.com.').toMatch(asideDownloadPitch);
@@ -533,14 +567,56 @@ describe('Opus consent renders (gate captures)', () => {
   const consent = opusRenders.renders.filter(render => render.case !== 'tpa-apple-ban');
 
   test('every consent question offers defer as a lettered option, including the paraphrased ones', () => {
-    expect(consent).toHaveLength(28);
+    expect(consent).toHaveLength(29);
     for (const render of consent) expect(offersDefer(render.assistantText), `${render.case} ${render.run}`).toBe(true);
     const paraphrased = consent.filter(render => !letteredOptions(render.assistantText).some(option => /defer/i.test(option)));
     expect(paraphrased.map(render => `${render.case} ${render.run}`).sort()).toEqual([
-      'tpa-absent-darwin 39166935531', 'tpa-absent-linux 39166935531', 'tpa-absent-linux 39199692993', 'tpa-broken 39195396438']);
+      'tpa-absent-darwin 39166935531', 'tpa-absent-linux 39166935531', 'tpa-absent-linux 39199692993', 'tpa-broken 39195396438',
+      'tpa-present 40290033102']);
+    // Gate 40290033102 slice 14: the one red tpa-present render; its D) option waits for now and marks the step blocked.
+    expect(letteredOptions(renders('tpa-present').find(render => render.run === '40290033102')!.assistantText).at(-1))
+      .toBe("Wait for now. I'll mark this step as blocked on you.");
     for (const option of ['- **D)** Put this off for now. The token step stays blocked until you do it.',
       '- **D)** We skip it for now and come back to it later.', '> **D)** Defer: I mark the step blocked on you.',
-      'D) Postpone this step.', 'D) Leave it for later.']) expect(offersDefer(option), option).toBe(true);
+      'D) Postpone this step.', 'D) Leave it for later.', "D) Wait for now. I'll mark this step as blocked on you.",
+      '- **D)** Hold off for now; the step stays blocked on you.', 'D) Not yet: we wait on this step for now.',
+      "D) Let's hold off on it for now.", "D) Wait for now\u2014I'll mark this step as blocked on you.", 'D) Let\u2019s hold off on it for now.'])
+      expect(offersDefer(option), option).toBe(true);
+  });
+
+  test('the defer outcome counts in any words, and a refusal of it never does', () => {
+    // Gate 42431616220 slice 15: the red tpa-present render's D) option, missed by the spelling list.
+    for (const option of ["D) Do it later. I'll mark this step as waiting on you.", 'D) Not yet: the step stays blocked on you.',
+      'D) Later. This step remains waiting on you.', 'D) Later, so this step remains waiting on you.', "D) Do it later \u2014 I'll leave this step as blocked on you.",
+      "D) Do it later - I'll leave this step as blocked on you.", 'D) Not now. The step stays blocked on you.',
+      'D) Sign in yourself later. The step is waiting on you.'])
+      expect(offersDefer(option), option).toBe(true);
+    for (const text of ['D) Continue now. I will not mark this step as blocked on you.',
+      "D) Continue now. I won't mark this step as waiting on you.", 'D) Continue now. I never mark this step as blocked on you.',
+      'D) Go ahead now. I cannot leave it waiting on you.', 'D) Continue now. The step is not blocked on you.',
+      'D) Continue now; this step is no longer blocked on you.', 'D) Continue now, so nothing stays blocked on you.',
+      'D) Continue now without leaving it waiting on you.',
+      'D) Continue now. I refuse to mark this step as blocked on you.',
+      'D) Continue now. I decline to leave it waiting on you.',
+      "D) Continue now. I'll avoid marking this step as blocked on you.",
+      'D) Continue now rather than leave it waiting on you.',
+      "D) Continue now. Otherwise I'll mark this step as blocked on you.",
+      "D) Continue now. If you skip it, I'll mark this step as blocked on you.",
+      'D) Continue now unless you want me to keep it waiting on you.',
+      "D) Continue now. I won't re-mark this step as blocked on you.",
+      "D) Do it later. I'll mark this step as waiting on you to approve it.",
+      'A) I drive it in your Aside browser; the step stays blocked on you.',
+      "B) I drive it in gstack's own browser and mark this step as waiting on you.",
+      "C) Manual instructions; I'll mark this step as blocked on you.",
+      'C) I give you the steps to do it yourself. The step stays blocked on you.',
+      // /ship note at d98f9bb5 (PR #4223): a state line after a non-defer instruction is not a defer offer.
+      'D) Sign in yourself. Until then the step stays blocked on you.',
+      'D) Approve the token in the dashboard. The step is waiting on you.',
+      'D) Continue now. The step is waiting on you.',
+      'D) Do it now, not later. The step stays blocked on you.',
+      'D) The step is waiting on you. Do it later.',
+      "I'll mark this step as waiting on you.\nA) I drive it in your Aside browser\nB) Manual instructions"])
+      expect(offersDefer(text), text).toBe(false);
   });
 
   test('defer counts only as a lettered option', () => {
@@ -549,7 +625,14 @@ describe('Opus consent renders (gate captures)', () => {
     expect(withoutD).not.toBe(present);
     for (const text of [withoutD, 'If you would rather defer, tell me.\nA) I drive it in your Aside browser\nB) Manual instructions',
       "- B) I drive it in gstack's own visible browser; I skip the sign-in for now and hand it to you.",
-      'D) I drive it later in Aside.', 'I will defer this step for now.']) expect(offersDefer(text), text).toBe(false);
+      'D) I drive it later in Aside.', 'I will defer this step for now.', 'Wait for now.\nA) I drive it in your Aside browser',
+      'A) I drive it in your Aside browser; at the sign-in wall I wait for now while you sign in, then continue.',
+      "B) I drive it in gstack's own browser and wait for your go-ahead for now.", 'A) You wait for now; I drive it in Aside.',
+      'D) Do not wait for now; I drive it in Aside at once.', 'A) I drive it in Aside; I wait for now while you sign in.',
+      'A) I drive it in your Aside browser. At the sign-in wall I stop. Wait for now while you sign in, then I continue.',
+      'B) Manual instructions: wait for now and do it yourself.', "C) I do it in gstack's own browser. We wait for now only if sign-in is needed.",
+      'A) I drive it in Aside. I wait for now.', 'B) I drive it in your Aside browser; hold off for now.'])
+      expect(offersDefer(text), text).toBe(false);
   });
 
   test('the Aside drive offer is found in every tpa-present render, including first-person and blockquoted options', () => {

@@ -13,6 +13,7 @@
  *   1. Aside refuses `file://` URLs ("Cannot navigate to a file URL without
  *      local file access"), so the HTML's directory is served over loopback
  *      with Bun.serve on an ephemeral port for the duration of ONE render.
+ *      An http(s) `file` is opened as it is and nothing is served.
  *   2. One `aside repl` process runs ONE generated script: open the page,
  *      wait, run the steps in order, close the tab. Nothing persists between
  *      `aside repl` calls and tabs die with the script, so a render is always
@@ -37,7 +38,8 @@
  * bookkeeping is best-effort: after a `cookie-import` the daemon refuses `js`
  * on other origins, and a pdf/screenshot-only spec must still print. Not
  * mirrored on this path: pageRanges/scale, screenshot quality, the 2x default
- * device scale.
+ * device scale, and an eval step's deviceScaleFactor and mobile (the browse
+ * daemon's `viewport` takes a size alone).
  *
  * Node builtins + Bun only (bun build --compile embeds this into make-pdf).
  */
@@ -74,10 +76,13 @@ export type AsideProbe =
   | { ok: true; version: string }
   | { ok: false; reason: 'NEEDS_ASIDE' | 'ASIDE_NOT_RUNNING'; detail: string };
 
-/** Same probe the skills run in BROWSER SETUP: binary present, app answering. */
-export function probeAside(timeoutMs = 30_000): AsideProbe {
+/** Same probe the skills run in BROWSER SETUP: binary present, app answering. Aside ships only for macOS, so any other platform answers NEEDS_ASIDE without spawning. */
+export function probeAside(timeoutMs = 30_000, platform: NodeJS.Platform = process.platform): AsideProbe {
   if (process.env.GSTACK_SKIP_ASIDE === '1') {
     return { ok: false, reason: 'NEEDS_ASIDE', detail: 'GSTACK_SKIP_ASIDE=1 — Aside skipped by request' };
+  }
+  if (platform !== 'darwin') {
+    return { ok: false, reason: 'NEEDS_ASIDE', detail: `Aside is macOS-only (this is ${platform})` };
   }
   const which = spawnSync('aside', ['--version'], { encoding: 'utf8', timeout: 10_000 });
   if (which.error) {
@@ -133,11 +138,13 @@ export type RenderStep =
    * the result is written to that file: strings verbatim; `data:` URLs are
    * decoded to bytes; other values as JSON. Without `out`, the result comes
    * back in `RenderResult.evals` (strings are truncated to `maxInline` chars).
+   * With `width`, the viewport is set before the eval the way a sized
+   * screenshot sets it, and cleared after.
    */
-  | { kind: 'eval'; expression: string; out?: string; maxInline?: number };
+  | { kind: 'eval'; expression: string; out?: string; maxInline?: number; width?: number; height?: number; deviceScaleFactor?: number; mobile?: boolean };
 
 export interface RenderSpec {
-  /** Absolute path of the HTML file to open. */
+  /** Absolute path of the HTML file to open, or an http(s) URL (opened as it is, nothing served). */
   file: string;
   /** Directory served over loopback (default: the file's directory). Must contain `file`. */
   serveRoot?: string;
@@ -217,8 +224,18 @@ export function buildRenderScript(url: string, spec: RenderSpec): string {
   if (wait?.expression) {
     L.push(`{ const deadline = Date.now() + ${wait.timeoutMs ?? DEFAULT_WAIT_MS}; let ok = false; while (Date.now() < deadline) { try { ok = !!(await pg.evaluate((src) => (0, eval)(src), ${JSON.stringify(wait.expression)})); } catch (e) {} if (ok) break; await sleep(150); } if (!ok) throw new Error("waitFor expression never became truthy: " + ${JSON.stringify(wait.expression)}); }`);
   }
+  // The device override is set when a sized step's size differs from the one in force and cleared before an un-sized step, so consecutive evals at one width pay one override, not one per step.
+  let override: string | null = null;
+  const sized = (step: Exclude<RenderStep, { kind: 'pdf' }>): string | null => (step.width ? JSON.stringify({ width: step.width, height: step.height ?? Math.round(step.width * DEFAULT_ASPECT), deviceScaleFactor: step.deviceScaleFactor ?? DEFAULT_DEVICE_SCALE, mobile: step.mobile ?? step.width <= MOBILE_MAX_WIDTH }) : null);
+  const setOverride = (want: string | null) => {
+    if (want === override) return;
+    if (want) L.push(`await pg._sendToTarget("Emulation.setDeviceMetricsOverride", ${want}); await sleep(250);`);
+    else L.push(`await pg._sendToTarget("Emulation.clearDeviceMetricsOverride", {});`);
+    override = want;
+  };
   spec.steps.forEach((step, i) => {
     if (step.kind === 'pdf') {
+      setOverride(null);
       const o = step.options ?? {};
       if (o.waitForPagedJs) {
         L.push(`{ const deadline = Date.now() + 3000; let ready = false; while (Date.now() < deadline) { try { ready = await pg.evaluate(() => !!window.__pagedjsAfterFired); } catch (e) {} if (ready) break; await sleep(150); } }`);
@@ -233,9 +250,7 @@ export function buildRenderScript(url: string, spec: RenderSpec): string {
       const shot: Record<string, unknown> = { path: name, fullPage: step.fullPage !== false };
       if (step.type) shot.type = step.type;
       if (step.quality !== undefined) shot.quality = step.quality;
-      if (step.width) {
-        L.push(`await pg._sendToTarget("Emulation.setDeviceMetricsOverride", ${JSON.stringify({ width: step.width, height: step.height ?? Math.round(step.width * DEFAULT_ASPECT), deviceScaleFactor: step.deviceScaleFactor ?? DEFAULT_DEVICE_SCALE, mobile: step.mobile ?? step.width <= MOBILE_MAX_WIDTH })}); await sleep(250);`);
-      }
+      setOverride(sized(step));
       if (step.selector) {
         const sel: Record<string, unknown> = { path: name };
         if (step.type) sel.type = step.type;
@@ -243,10 +258,11 @@ export function buildRenderScript(url: string, spec: RenderSpec): string {
       } else {
         L.push(`await pg.screenshot(${JSON.stringify(shot)});`);
       }
-      if (step.width) L.push(`await pg._sendToTarget("Emulation.clearDeviceMetricsOverride", {});`);
+      setOverride(null);
       L.push(`console.log("STEP_OK ${i}");`);
     } else {
       // eval: promises are awaited by evaluate; write or inline the result
+      setOverride(sized(step));
       L.push(`{ const v = await pg.evaluate((src) => (0, eval)(src), ${JSON.stringify(step.expression)});`);
       if (step.out) {
         L.push(`  const name = ${JSON.stringify(artifactName(i, step.out))};`);
@@ -262,6 +278,7 @@ export function buildRenderScript(url: string, spec: RenderSpec): string {
       }
     }
   });
+  setOverride(null);
   L.push(`console.log("PAGE_ERRORS=" + JSON.stringify(await pg.evaluate(() => window.__gstackErrs || [])));`);
   L.push(`console.log("ASIDE_DIR=" + pwd);`);
   L.push(`await closeTab(pg);`);
@@ -304,10 +321,10 @@ export function serveDir(root: string, nonce: string = randomBytes(16).toString(
 
 // ─── Async spawn (keeps the loopback server's event loop free) ────────────────
 
-async function runProc(cmd: string, args: string[], timeoutMs: number): Promise<{ code: number | null; stdout: string; stderr: string; error?: string }> {
+async function runProc(cmd: string, args: string[], timeoutMs: number, env?: Record<string, string | undefined>): Promise<{ code: number | null; stdout: string; stderr: string; error?: string }> {
   let child: Bun.Subprocess<'ignore', 'pipe', 'pipe'>;
   try {
-    child = Bun.spawn([cmd, ...args], { stdout: 'pipe', stderr: 'pipe', stdin: 'ignore' });
+    child = Bun.spawn([cmd, ...args], { stdout: 'pipe', stderr: 'pipe', stdin: 'ignore', ...(env ? { env } : {}) });
   } catch (e) {
     return { code: null, stdout: '', stderr: '', error: (e as Error).message };
   }
@@ -340,17 +357,33 @@ export async function renderWithAside(spec: RenderSpec): Promise<RenderResult> {
   return { ...(await asideRender(spec)), engine: 'aside' };
 }
 
-async function asideRender(spec: RenderSpec): Promise<RenderResult> {
+/** What the engine opens: an http(s) `file` as it is, else the file served from its root over loopback. */
+type PageTarget = { kind: 'url'; url: string } | { kind: 'file'; root: string; rel: string } | { kind: 'error'; error: string };
+
+function pageTarget(spec: RenderSpec): PageTarget {
+  if (/^https?:\/\//.test(spec.file)) return { kind: 'url', url: spec.file };
   const file = path.resolve(spec.file);
-  if (!fs.existsSync(file)) return { ok: false, outputs: [], evals: {}, stdout: '', error: `HTML file not found: ${file}` };
+  if (!fs.existsSync(file)) return { kind: 'error', error: `HTML file not found: ${file}` };
   const root = path.resolve(spec.serveRoot ?? path.dirname(file));
   const rel = path.relative(root, file);
-  if (rel.startsWith('..')) return { ok: false, outputs: [], evals: {}, stdout: '', error: `file ${file} is outside serveRoot ${root}` };
+  if (rel.startsWith('..')) return { kind: 'error', error: `file ${file} is outside serveRoot ${root}` };
+  return { kind: 'file', root, rel };
+}
 
-  const srv = serveDir(root);
+/** Serve a file target for one render; an http(s) target needs no server. */
+function openTarget(target: Exclude<PageTarget, { kind: 'error' }>): { url: string; stop: () => void } {
+  if (target.kind === 'url') return { url: target.url, stop: () => {} };
+  const srv = serveDir(target.root);
+  return { url: `${srv.url}/${target.rel.split(path.sep).map(encodeURIComponent).join('/')}`, stop: srv.stop };
+}
+
+async function asideRender(spec: RenderSpec): Promise<RenderResult> {
+  const target = pageTarget(spec);
+  if (target.kind === 'error') return { ok: false, outputs: [], evals: {}, stdout: '', error: target.error };
+
+  const srv = openTarget(target);
   try {
-    const url = `${srv.url}/${rel.split(path.sep).map(encodeURIComponent).join('/')}`;
-    const script = buildRenderScript(url, spec);
+    const script = buildRenderScript(srv.url, spec);
     // Async spawn: a synchronous wait would block this event loop, and the
     // loopback server above runs on it — Page.navigate would then time out.
     const proc = await runProc('aside', ['repl', script], (spec.timeoutMs ?? DEFAULT_TIMEOUT_MS) + processSlackMs());
@@ -423,7 +456,9 @@ function executable(p: string): string | null {
 /**
  * Locate gstack's own browse binary: $GSTACK_BROWSE_BIN → $BROWSE_BIN →
  * <root>/browse/dist/browse → <root>/browse/bin/find-browse (per root, repo
- * then install) → `browse` on PATH. Null when nothing resolves.
+ * then install) → `browse` on PATH. Null when nothing resolves. A PATH
+ * `browse` that resolves to a file with another name is skipped: Debian and
+ * Ubuntu ship /usr/bin/browse as a link to xdg-open, which is not gstack's.
  */
 export function resolveBrowseBin(env: NodeJS.ProcessEnv = process.env, roots: string[] = BROWSE_ROOTS): string | null {
   const PATH = env.PATH ?? env.Path ?? '';
@@ -441,7 +476,13 @@ export function resolveBrowseBin(env: NodeJS.ProcessEnv = process.env, roots: st
     const found = r.status === 0 ? executable((r.stdout ?? '').trim()) : null;
     if (found) return found;
   }
-  return Bun.which('browse', { PATH }) ?? null;
+  const onPath = Bun.which('browse', { PATH });
+  if (!onPath) return null;
+  try {
+    return path.basename(fs.realpathSync(onPath)).replace(/\.(exe|cmd|bat)$/i, '') === 'browse' ? onPath : null;
+  } catch {
+    return null;
+  }
 }
 
 /** PdfStepOptions (CDP, inches) → the browse `pdf --from-file` payload (Playwright shapes, string lengths). */
@@ -486,33 +527,101 @@ function screenshotName(i: number, step: ScreenshotStep): string {
  * Aside path, one CLI call per action, artifacts staged under /tmp and copied
  * to the caller's paths. The tab is closed in a finally; the daemon stays up.
  */
+/** The checkout's bin/gstack-browser-ensure next to a browse/dist/browse binary; it installs gstack's Chromium on first use. */
+function browserEnsureBin(bin: string): string | null {
+  const root = /^(.*)[\\/]browse[\\/]dist[\\/]browse(?:\.exe)?$/.exec(bin)?.[1];
+  const ensure = root ? path.join(root, 'bin', 'gstack-browser-ensure') : null;
+  return ensure && fs.existsSync(ensure) ? ensure : null;
+}
+
+type BrowseRunner = { deadline: number; browseEnv: Record<string, string | undefined>; run: (args: string[]) => Promise<string> };
+
+/** browse CLI calls sharing one deadline. A failed call throws its most useful line, plus Chromium's own "No usable sandbox" line when the launch hit one. */
+function browseRunner(bin: string, log: string[], timeoutMs: number): BrowseRunner {
+  const browseEnv = { ...process.env, BROWSE_SESSION: '' };
+  const b: BrowseRunner = {
+    deadline: Date.now() + timeoutMs,
+    browseEnv,
+    run: async (args) => {
+      const r = await runProc(bin, args, Math.max(1_000, Math.min(120_000, b.deadline - Date.now())), b.browseEnv);
+      log.push(`$ browse ${args.join(' ').slice(0, 300)}\n${r.stdout}${r.stderr}`.trim());
+      if (r.error || r.code !== 0) {
+        const lines = (r.stderr || r.stdout || r.error || '').split('\n').map((l) => l.trim()).filter(Boolean);
+        const first = lines.find((l) => /Executable doesn't exist/.test(l)) ?? lines.find((l) => !/^\[browse\] (Starting server|Server failed to start)/.test(l) && !/^[\u2554\u2551\u255a]/.test(l)) ?? lines[0] ?? '';
+        if (/JS execution blocked/.test(`${r.stderr}${r.stdout}`)) {
+          // After `$B cookie-import` the daemon refuses page JS on every other
+          // origin, 127.0.0.1 included; a local-HTML render cannot proceed in it.
+          throw new Error(`browse ${args[0]} refused: the daemon has imported cookies and blocks page JS on other origins (127.0.0.1 included) — restart it ($B stop) before rendering local HTML, or open Aside`);
+        }
+        const fatal = lines.find((l) => l.includes('No usable sandbox'));
+        throw new Error(`browse ${args[0]} failed: ${first}${fatal && fatal !== first ? `\n${fatal}` : ''}`);
+      }
+      return r.stdout;
+    },
+  };
+  return b;
+}
+
+/**
+ * Open a tab, which starts the daemon and gstack's Chromium on first use.
+ * A cold daemon can answer "Unable to connect" once while it comes up, so that
+ * is retried once after a short pause; a missing Chromium is installed once
+ * with gstack-browser-ensure, and the install time does not count against the
+ * deadline.
+ */
+async function openBrowseTab(bin: string, b: BrowseRunner, log: string[]): Promise<number> {
+  const openTab = async () => (await b.run(['newtab', '--json'])).match(/\{[^\n]*"tabId"[^\n]*\}/)?.[0];
+  let opened: string | undefined;
+  try {
+    opened = await openTab();
+  } catch (e) {
+    const message = (e as Error).message;
+    const ensure = /Executable doesn't exist/.test(message) ? browserEnsureBin(bin) : null;
+    if (ensure) {
+      log.push('newtab: Chromium is not installed — running gstack-browser-ensure once');
+      const installStart = Date.now();
+      const installed = await runProc('bash', [ensure, '--quiet'], 600_000, b.browseEnv);
+      b.deadline += Date.now() - installStart;
+      const last = installed.stdout.trim().split('\n').at(-1) ?? '';
+      log.push(`${ensure} --quiet\n${installed.stdout}${installed.stderr}`.trim());
+      if (installed.error || installed.code !== 0) throw new Error(`${message} (gstack-browser-ensure: ${last || installed.error || `exit ${installed.code}`})`);
+      opened = await openTab();
+    } else {
+      if (!/Unable to connect/.test(message)) throw e;
+      log.push('newtab: daemon not up yet — retrying once');
+      await Bun.sleep(1_500);
+      opened = await openTab();
+    }
+  }
+  const tab = opened ? JSON.parse(opened).tabId : undefined;
+  if (typeof tab !== 'number') throw new Error('browse newtab --json returned no tabId');
+  return tab;
+}
+
+/** The cheapest real launch of gstack's browser, for design-build preflight: open one tab, then close it. Null when it opened, else why it did not. */
+export async function launchBrowse(bin: string): Promise<string | null> {
+  const log: string[] = [];
+  const b = browseRunner(bin, log, DEFAULT_TIMEOUT_MS);
+  try {
+    const tab = await openBrowseTab(bin, b, log);
+    await runProc(bin, ['closetab', String(tab)], 15_000, b.browseEnv);
+    return null;
+  } catch (e) {
+    return (e as Error).message;
+  }
+}
+
 export async function renderWithBrowse(spec: RenderSpec, bin: string | null = resolveBrowseBin()): Promise<RenderResult> {
   const outputs: string[] = [];
   const evals: Record<number, string> = {};
   const log: string[] = [];
   const fail = (error: string): RenderResult => ({ ok: false, engine: 'browse', outputs, evals, stdout: log.join('\n'), error });
   if (!bin) return fail(`${NO_BROWSER}: ${NO_BROWSER_HELP}`);
-  const file = path.resolve(spec.file);
-  if (!fs.existsSync(file)) return fail(`HTML file not found: ${file}`);
-  const root = path.resolve(spec.serveRoot ?? path.dirname(file));
-  const rel = path.relative(root, file);
-  if (rel.startsWith('..')) return fail(`file ${file} is outside serveRoot ${root}`);
+  const target = pageTarget(spec);
+  if (target.kind === 'error') return fail(target.error);
 
-  const deadline = Date.now() + (spec.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-  const run = async (args: string[]): Promise<string> => {
-    const r = await runProc(bin, args, Math.max(1_000, Math.min(120_000, deadline - Date.now())));
-    log.push(`$ browse ${args.join(' ').slice(0, 300)}\n${r.stdout}${r.stderr}`.trim());
-    if (r.error || r.code !== 0) {
-      const first = (r.stderr || r.stdout || r.error || '').trim().split('\n')[0];
-      if (/JS execution blocked/.test(`${r.stderr}${r.stdout}`)) {
-        // After `$B cookie-import` the daemon refuses page JS on every other
-        // origin, 127.0.0.1 included; a local-HTML render cannot proceed in it.
-        throw new Error(`browse ${args[0]} refused: the daemon has imported cookies and blocks page JS on other origins (127.0.0.1 included) — restart it ($B stop) before rendering local HTML, or open Aside`);
-      }
-      throw new Error(`browse ${args[0]} failed: ${first}`);
-    }
-    return r.stdout;
-  };
+  const b = browseRunner(bin, log, spec.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const run = b.run;
   const copyOut = (src: string, out: string, i: number) => {
     if (!fs.existsSync(src)) throw new Error(`step ${i} produced no artifact (${src})`);
     fs.mkdirSync(path.dirname(path.resolve(out)), { recursive: true });
@@ -525,22 +634,8 @@ export async function renderWithBrowse(spec: RenderSpec, bin: string | null = re
   let tab: number | undefined;
   try {
     work = fs.mkdtempSync(path.join(SAFE_TMP_DIR, 'gstack-render-browse-'));
-    srv = serveDir(root);
-    // The first CLI call auto-starts the daemon; on a cold start it can answer
-    // "Unable to connect" once while the server is still coming up. One retry
-    // after a short pause turns that into the wait it really is.
-    const openTab = async () => (await run(['newtab', '--json'])).match(/\{[^\n]*"tabId"[^\n]*\}/)?.[0];
-    let opened: string | undefined;
-    try {
-      opened = await openTab();
-    } catch (e) {
-      if (!/Unable to connect/.test((e as Error).message)) throw e;
-      log.push('newtab: daemon not up yet — retrying once');
-      await Bun.sleep(1_500);
-      opened = await openTab();
-    }
-    tab = opened ? JSON.parse(opened).tabId : undefined;
-    if (typeof tab !== 'number') throw new Error('browse newtab --json returned no tabId');
+    srv = openTarget(target);
+    tab = await openBrowseTab(bin, b, log);
     const T = ['--tab-id', String(tab)];
     const js = async (expr: string, extra: string[] = []) => (await run(['js', expr, ...extra, ...T])).replace(/\n$/, '');
     // Poll until truthy. A throw inside the page (e.g. `window.later.ok` before
@@ -555,7 +650,7 @@ export async function renderWithBrowse(spec: RenderSpec, bin: string | null = re
       throw new Error(`${what} (waited ${timeoutMs}ms)`);
     };
 
-    await run(['goto', `${srv.url}/${rel.split(path.sep).map(encodeURIComponent).join('/')}`, ...T]);
+    await run(['goto', srv.url, ...T]);
     // Best-effort: once `$B cookie-import` has run, the daemon blocks `js` on
     // every other origin (127.0.0.1 included). pdf/screenshot/`js --out` steps
     // must still run; a waitFor or eval step that is genuinely blocked fails
@@ -568,8 +663,16 @@ export async function renderWithBrowse(spec: RenderSpec, bin: string | null = re
     if (wait?.selector) await until(`document.querySelector(${JSON.stringify(wait.selector)})`, `waitFor selector never attached: ${wait.selector}`, wait.timeoutMs ?? DEFAULT_WAIT_MS);
     if (wait?.expression) await until(wait.expression, `waitFor expression never became truthy: ${wait.expression}`, wait.timeoutMs ?? DEFAULT_WAIT_MS);
 
+    // The viewport is set when a sized step's size differs from the one in force and reset to the daemon's default before an un-sized step, so consecutive evals at one width pay one `viewport` spawn, not two per step.
+    let vp: string | null = null;
+    const viewport = async (want: string | null) => {
+      if (want === vp) return;
+      await run(['viewport', want ?? '1280x720', ...T]);
+      vp = want;
+    };
     for (const [i, step] of spec.steps.entries()) {
       if (step.kind === 'pdf') {
+        await viewport(null);
         const tmp = path.join(work, artifactName(i, step.out));
         const payload = path.join(work, `pdf-${i}.json`);
         fs.writeFileSync(payload, JSON.stringify(browsePdfPayload(step.options ?? {}, tmp)));
@@ -578,33 +681,38 @@ export async function renderWithBrowse(spec: RenderSpec, bin: string | null = re
       } else if (step.kind === 'screenshot') {
         const tmp = path.join(work, screenshotName(i, step));
         if (step.width) {
-          const vp = [`${step.width}x${step.height ?? Math.round(step.width * DEFAULT_ASPECT)}`];
+          const args = [`${step.width}x${step.height ?? Math.round(step.width * DEFAULT_ASPECT)}`];
           // `--scale` recreates the daemon's browser context (and is refused in
           // headed mode), so it is passed only when the caller asked for it; the
           // 2x default stays Aside-only (see the header's "not mirrored" list).
-          if (step.deviceScaleFactor) vp.push('--scale', String(step.deviceScaleFactor));
-          await run(['viewport', ...vp, ...T]);
-        }
+          if (step.deviceScaleFactor) args.push('--scale', String(step.deviceScaleFactor));
+          await run(['viewport', ...args, ...T]);
+          vp = args[0];
+        } else await viewport(null);
         await run([...browseScreenshotArgs(step, tmp), ...T]);
         copyOut(tmp, step.out, i);
         // Aside clears its device override after each shot; restore the daemon's
         // default so a later un-sized screenshot is not taken at this width.
-        if (step.width) await run(['viewport', '1280x720', ...T]);
-      } else if (step.out) {
-        const tmp = path.join(work, artifactName(i, step.out));
-        await js(step.expression, ['--out', tmp]); // the daemon decodes data: URLs to bytes itself
-        copyOut(tmp, step.out, i);
+        if (step.width) await viewport(null);
       } else {
-        evals[i] = (await js(step.expression)).slice(0, step.maxInline ?? DEFAULT_MAX_INLINE);
+        await viewport(step.width ? `${step.width}x${step.height ?? Math.round(step.width * DEFAULT_ASPECT)}` : null);
+        if (step.out) {
+          const tmp = path.join(work, artifactName(i, step.out));
+          await js(step.expression, ['--out', tmp]); // the daemon decodes data: URLs to bytes itself
+          copyOut(tmp, step.out, i);
+        } else {
+          evals[i] = (await js(step.expression)).slice(0, step.maxInline ?? DEFAULT_MAX_INLINE);
+        }
       }
     }
+    await viewport(null);
     const errs = await bestEffortJs('JSON.stringify(window.__gstackErrs || [])', 'PAGE_ERRORS');
     if (errs !== null) log.push(`PAGE_ERRORS=${errs}`);
     return { ok: true, engine: 'browse', outputs, evals, stdout: log.join('\n') };
   } catch (e) {
     return fail((e as Error).message);
   } finally {
-    if (tab !== undefined) await runProc(bin, ['closetab', String(tab)], 15_000);
+    if (tab !== undefined) await runProc(bin, ['closetab', String(tab)], 15_000, b.browseEnv);
     srv?.stop();
     if (work) fs.rmSync(work, { recursive: true, force: true });
   }
@@ -613,7 +721,12 @@ export async function renderWithBrowse(spec: RenderSpec, bin: string | null = re
 // ─── Engine choice ───────────────────────────────────────────────────────────
 
 export const NO_BROWSER = 'no browser available';
-export const NO_BROWSER_HELP = "open the Aside app (macOS 15+, aside.com), or run ./setup in the gstack repo to build gstack's own headless browser (or point GSTACK_BROWSE_BIN at a browse binary)";
+/** Recovery advice for a missing browser. Aside ships only for macOS, so other platforms get only the bundled-browser remedies. */
+export function noBrowserHelp(platform: NodeJS.Platform = process.platform): string {
+  const aside = platform === 'darwin' ? 'open the Aside app (macOS 15+, aside.com), or ' : '';
+  return `${aside}run ./setup in the gstack repo to build gstack's own headless browser (or point GSTACK_BROWSE_BIN at a browse binary)`;
+}
+export const NO_BROWSER_HELP = noBrowserHelp();
 
 export type EngineChoice =
   | { engine: 'aside'; version: string }

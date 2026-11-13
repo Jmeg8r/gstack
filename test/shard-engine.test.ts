@@ -6,10 +6,11 @@
  * run-shard-child and strict-output-* tests pin the moved primitives.
  */
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
-import type { ChildProcess } from 'node:child_process';
+import { spawnSync, type ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { FIXTURE_MARKER } from '../lib/fixture-marker';
 import {
   cliUsage,
   BunTestOutputClassifier,
@@ -24,6 +25,7 @@ import {
   strictShardStatus,
   writeDurationSeed,
   zeroExecutionVerdict,
+  CAPY_LAUNCH_MARKERS,
 } from '../scripts/lib/shard-engine';
 import { FREE_LANE_POLICY, exitCodeFor, runFreeShard } from '../scripts/test-free-shards';
 import {
@@ -170,7 +172,10 @@ describe('shard engine: process lifecycle', () => {
     });
     expect(paid.status).toBe('timed-out');
     expect(summaryExitCode(summarize([paid]))).toBe(1);
-    expect(await waitDead(Number(fs.readFileSync(pidFile, 'utf8')))).toBe(true);
+    const paidChild = Number(fs.readFileSync(pidFile, 'utf8'));
+    const paidChildDead = await waitDead(paidChild);
+    const procStat = (pid: number) => { try { return fs.readFileSync(`/proc/${pid}/stat`, 'utf8').trim(); } catch { return 'no /proc entry'; } };
+    expect(paidChildDead, `paid grandchild ${paidChild} of group ${paid.groupPid} 2 s after the timeout kill: ${procStat(paidChild)}`).toBe(true);
   }, 30_000);
 
   test('win32 semantics: no process group and never a negative-pid kill', async () => {
@@ -237,7 +242,13 @@ describe('shard engine: capture and isolation', () => {
   });
 
   test('each shard gets its own tmp and Chromium profile, removed by the backstop', async () => {
-    const base = { KEEP: '1', TMPDIR: '/inherited', CHROMIUM_PROFILE: '/shared-profile' };
+    const base = {
+      KEEP: '1', TMPDIR: '/inherited', CHROMIUM_PROFILE: '/shared-profile',
+      // The Capy launch file's markers (GSTA-99): a lane started from a shell that sourced it must
+      // not hand them to the product-under-test children, which set their own session kind.
+      GSTACK_SESSION_KIND: 'unattended', GSTACK_CAPY: '1', GSTACK_EPHEMERAL: '1', GSTACK_INSTALL_VERDICT: '/v.json',
+      GSTACK_STATE_ROOT: '/kept-root',
+    };
     const a = createShardSandbox('gstack-unit-shard-', base);
     const b = createShardSandbox('gstack-unit-shard-', base, { realpath: true });
     try {
@@ -246,6 +257,8 @@ describe('shard engine: capture and isolation', () => {
       for (const box of [a, b]) {
         expect(box.env.KEEP).toBe('1');
         expect(box.env.GSTACK_HOME).toBeUndefined();
+        for (const key of CAPY_LAUNCH_MARKERS) expect(box.env[key]).toBeUndefined();
+        expect(box.env.GSTACK_STATE_ROOT).toBe('/kept-root');
         for (const key of ['TMPDIR', 'TEMP', 'TMP']) expect(box.env[key]).toBe(box.tmp);
         expect(box.env.CHROMIUM_PROFILE).toBe(path.join(box.stateDir, 'chromium-profile'));
         expect(fs.statSync(box.tmp).isDirectory()).toBe(true);
@@ -259,6 +272,34 @@ describe('shard engine: capture and isolation', () => {
       fs.rmSync(a.stateDir, { recursive: true, force: true });
       fs.rmSync(b.stateDir, { recursive: true, force: true });
     }
+  });
+
+  // Value: protects=a shard's state dir carries the test fixture marker beside an empty tmp/, and a bun test run in that sandbox keeps the shard's TMPDIR as handed instead of nesting its own root;
+  //   fails_when=the preload nests gst-XXXXXX under the shard's TMPDIR, so a case that compares its mkdtemp parent with the runner's temp dir fails (qa-bootstrap's 'wrong bootstrap root or run' on screen run 42333856900),
+  //   or the marker lands inside tmp/ and breaks the retention scope's empty-dir check; why_new=GST-1695 screen red; seam=createShardSandbox, test-setup.ts; no_claim=that a test which sets its own TMPDIR is marked
+  test('a shard sandbox is marked beside its tmp, and bun test inside it keeps the shard TMPDIR', () => {
+    const outside = path.dirname(process.env.GSTACK_TEST_TMP ?? os.tmpdir());
+    const inherited = process.env.TMPDIR;
+    process.env.TMPDIR = outside;
+    let box: ReturnType<typeof createShardSandbox>;
+    try { box = createShardSandbox('gstack-unit-shard-', { ...process.env }, { realpath: true }); } finally { process.env.TMPDIR = inherited; }
+    try {
+      expect(fs.statSync(path.join(box.stateDir, FIXTURE_MARKER)).isFile()).toBe(true);
+      expect(fs.readdirSync(box.tmp)).toEqual([]);
+      const work = fs.mkdtempSync(path.join(box.stateDir, 'probe-'));
+      const report = path.join(work, 'report.json');
+      const file = path.join(work, 'probe.test.ts');
+      fs.writeFileSync(file, [
+        "import { test } from 'bun:test';",
+        "import * as fs from 'node:fs';",
+        "import * as os from 'node:os';",
+        `test('reports', () => { fs.writeFileSync(${JSON.stringify(report)}, JSON.stringify({ tmp: os.tmpdir(), root: process.env.GSTACK_TEST_TMP })); });`,
+      ].join('\n'));
+      const r = spawnSync(process.execPath, ['test', file], { cwd: path.resolve(import.meta.dir, '..'), encoding: 'utf8', timeout: 60_000, env: box.env });
+      expect(r.status, r.stderr).toBe(0);
+      expect(JSON.parse(fs.readFileSync(report, 'utf8'))).toEqual({ tmp: box.tmp, root: box.stateDir });
+      expect(fs.readdirSync(box.tmp)).toEqual([]);
+    } finally { fs.rmSync(box.stateDir, { recursive: true, force: true }); }
   });
 
   test('flag loop: declared handlers consume values; anything else is Unknown argument', () => {

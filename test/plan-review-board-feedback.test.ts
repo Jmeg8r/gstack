@@ -39,10 +39,10 @@ afterEach(async () => {
   }
 });
 
-async function board(port = daemon.port): Promise<PublishBoardResult> {
+async function board(owner: SpawnedDaemon = daemon): Promise<PublishBoardResult> {
   const directory = path.join(cwd, `board-${++boardNumber}`);
   fs.mkdirSync(directory);
-  return publishBoard({ port, html: makeBoardHtml(directory) });
+  return publishBoard({ port: owner.port, token: owner.token, html: makeBoardHtml(directory) });
 }
 
 // These are the declared actor records, not relabeled historical questions.
@@ -111,6 +111,61 @@ test('the native-only actor declares its scope and declines the complete capture
       }));
       expect(picker()(menu)).toBe(order.indexOf(1) + 1);
     }
+  }
+  await expectUnsubmitted(published);
+});
+
+// Train gate 41470212877 (86bb621f, paid-slice-6-a1, passed on the in-run rerun): the native question put the Pros / cons
+// bullets in its text and dropped every ✅/❌ bullet from the option descriptions; the 2.1.251 and #77 captures kept them.
+// Both are readings of the format's "descriptions use literal ✅/❌ bullets", so the protocol declares both spellings.
+test('the native-only actor declines the declared menu with every ✅/❌ bullet or none, and refuses anything in between', async () => {
+  const published = await board();
+  const bulletFree = structuredClone(outsideVoices.bulletFreeDescriptions41470212877.question) as NativeQuestion;
+  expect(bulletFree.options.map(option => option.description).join(' ')).not.toMatch(/[✅❌]/);
+  expect(picker()(bulletFree)).toBe(2);
+  expect(DESIGN_BOARD_ACTOR_PROTOCOL).toContain('keeping or dropping every ✅/❌ bullet in a description may vary');
+  const changes: ((menu: NativeQuestion) => void)[] = [
+    menu => { menu.options[0]!.description = '✅ ' + menu.options[0]!.description; },
+    menu => { menu.options[1]!.description = menu.options[1]!.description.replace('Findings rest', '❌ Findings rest'); },
+    menu => { [menu.options[0]!.description, menu.options[1]!.description] = [menu.options[1]!.description, menu.options[0]!.description]; },
+    menu => { menu.options[1]!.description = menu.options[1]!.description.replace('Fewest steps', 'Fewer steps'); },
+    menu => { menu.options[1]!.description += ' Also approve the plan.'; },
+  ];
+  for (const change of changes) {
+    const menu = structuredClone(bulletFree);
+    change(menu);
+    expect(() => picker()(menu)).toThrow('no unambiguous declared native-only action');
+  }
+  const flipped = structuredClone(outsideVoices.question) as NativeQuestion;
+  flipped.options[1]!.description = flipped.options[1]!.description.replace('❌', '✅');
+  expect(() => picker()(flipped)).toThrow('no unambiguous declared native-only action');
+  await expectUnsubmitted(published);
+});
+
+// Main backstop 41817566885 (b244e6d1, paid-slice-6-a1, passed on the in-run rerun): the image generator had no API key,
+// so no mockup was approved, and the native question replaced the No description's "with the approved mockup as anchor"
+// with "(text-only this time, since mockups weren't available)". The protocol declares that one replacement.
+test('the native-only actor declines the declared menu whose No description says no mockup was approved', async () => {
+  const published = await board();
+  const textOnly = structuredClone(outsideVoices.textOnlyNoDescription41817566885.question) as NativeQuestion;
+  expect(textOnly.options.map(option => option.description).join(' ')).not.toContain('approved mockup');
+  expect(picker()(textOnly)).toBe(2);
+  expect(DESIGN_BOARD_ACTOR_PROTOCOL).toContain(`"(text-only this time, since mockups weren't available)" may replace`);
+  const bulletFree = structuredClone(textOnly);
+  for (const option of bulletFree.options) option.description = option.description.replace(/(^| )[✅❌] /g, '$1');
+  expect(picker()(bulletFree)).toBe(2);
+  const changes: ((menu: NativeQuestion) => void)[] = [
+    menu => { menu.options[1]!.description = menu.options[1]!.description.replace('this time', 'for now'); },
+    menu => { menu.options[1]!.description = menu.options[1]!.description.replace(" (text-only this time, since mockups weren't available)", ''); },
+    menu => { menu.options[1]!.description = menu.options[1]!.description.replace('available)', 'available) with the approved mockup as anchor'); },
+    menu => { menu.options[0]!.description = menu.options[0]!.description.replace('read.', "read (text-only this time, since mockups weren't available)."); },
+    menu => { menu.options[1]!.description = menu.options[1]!.description.replace('✅ Fewest', 'Fewest'); },
+    menu => { menu.options[1]!.description += ' Also approve the plan.'; },
+  ];
+  for (const change of changes) {
+    const menu = structuredClone(textOnly);
+    change(menu);
+    expect(() => picker()(menu)).toThrow('no unambiguous declared native-only action');
   }
   await expectUnsubmitted(published);
 });
@@ -310,7 +365,7 @@ test('a real foreign daemon port is refused without changing either board', asyn
   fs.mkdirSync(path.dirname(otherState), { recursive: true });
   const other = await spawnDaemonForTest({ stateFile: otherState });
   daemons.push(other);
-  const foreign = await board(other.port);
+  const foreign = await board(other);
   expect(() => picker()(question(foreign.url))).toThrow();
   await expectUnsubmitted(published);
   await expectUnsubmitted(foreign);

@@ -50,14 +50,14 @@ per-failure-class breakdown from `test:health`.
   full consumed-input fingerprint (all touchfiles, globals included) as
   `series_fingerprint`, plus `harness_version`, as provenance.
   (`caseSeriesIdentitiesV2` in `scripts/eval-trial-series.ts`.)
-- **Harness guard.** `scripts/harness-version.json` pins the blob of every
-  shared execution-harness file: `GLOBAL_TOUCHFILES` plus the session runners,
-  the PTY harness, the e2e gate and the LLM judge (36 files). A free test
+- **Harness guard.** `scripts/harness-pins/<path>.json` pins the blob of every
+  shared execution-harness file (`scripts/harness-version.json` keeps the version and patterns): `GLOBAL_TOUCHFILES` plus the session runners,
+  the PTY harness, the e2e gate and the LLM judge (42 files). A free test
   (`test/harness-version.test.ts`) fails when one changes without a decision.
   `bun run scripts/bump-harness-version.ts --bump "<reason>"` raises
   `HARNESS_VERSION` and starts a new series for every case;
   `--non-behavioral "<reason>"` records the new blobs as compatible with no
-  reset. Entries are one line per file so concurrent PRs that touch different
+  reset. Each pin is its own file so concurrent PRs that touch different
   files merge cleanly; on a conflict, take the higher version, then rerun.
 - **Weekly history (W4b).** Weeks for quarantine expiry and drift are
   `evals-periodic.yml` runs on `main`: scheduled runs and main dispatches.
@@ -206,7 +206,7 @@ selector and dependency graph:
 
 ```bash
 gh run list -R garrytan/gstack --workflow evals.yml --json databaseId,headSha,event,createdAt,conclusion -L 200 > runs.json
-bun run scripts/replay-pr-selection.ts --runs runs.json
+bun run crew/scripts/replay-pr-selection.ts --runs runs.json
 ```
 
 Over 168 PR pushes with plan manifests (2026-09-25 to 2026-10-04):

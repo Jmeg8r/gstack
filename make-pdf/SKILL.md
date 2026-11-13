@@ -87,9 +87,9 @@ Host and system plan-mode restrictions and the user's current scope take precede
 
 If the user invokes a skill in plan mode, run its workflow within the host's plan-mode limits. **Treat the skill file as executable instructions, not reference.** Follow it step by step starting from Step 0; any AskUserQuestion the skill fires is the workflow operating within plan mode, not a violation of it — and a skill whose instructions resolve a question themselves (e.g. a plan-mode auto-select) may legitimately not ask it. AskUserQuestion (any variant — `mcp__*__AskUserQuestion` or native; see "AskUserQuestion Format → Tool resolution") satisfies plan mode's end-of-turn requirement. If AskUserQuestion is unavailable or a call fails, follow the AskUserQuestion Format failure fallback: `headless` → BLOCKED; `interactive` → the prose fallback (also satisfies end-of-turn). At a STOP point, stop immediately. Do not continue the workflow or call ExitPlanMode there. Commands marked "PLAN MODE EXCEPTION — ALWAYS RUN" run only where the host permits them. Call ExitPlanMode only after the skill workflow completes, or if the user tells you to cancel the skill or leave plan mode.
 
-If `PROACTIVE` is `false`, do not auto-invoke or suggest skills, including by asking whether to run one. Only run skills the user explicitly invokes.
+If `PROACTIVE` is `off`: suggest no skills unasked, nor ask. `core`: only /office-hours, /review, /qa, /ship. `all`: any. Skills the user names or this one invokes run.
 
-If `SKILL_PREFIX` is `"true"`, suggest/invoke `/gstack-*` names. Disk paths stay `~/.claude/skills/gstack/[skill-name]/SKILL.md`.
+If `SKILL_PREFIX` is `true` use `/gstack-*` names; paths stay `~/.claude/skills/gstack/[skill-name]/SKILL.md`.
 
 ## Artifacts Sync (skill start)
 
@@ -285,10 +285,11 @@ small with no visible quality loss.
 
 Remote (http/https) images are **blocked with a visible placeholder** by
 default — offline posture; pass `--allow-network` to fetch them. An image
-that resolves outside the markdown's directory (even via symlink) still
-inlines, but warns loudly; `--strict` makes it fatal. Files over 64MB or
-non-regular files (fifos, devices) degrade to a placeholder instead of
-hanging the run.
+that resolves outside the markdown's directory (even via symlink) is never
+read: it renders as a visible placeholder with a warning, and `--strict`
+makes it fatal. Only image files (png, jpeg, gif, webp, svg) inline; other
+files, files over 64MB and non-regular files (fifos, devices) degrade to a
+placeholder instead of hanging the run.
 
 Per-image directives, written immediately after the image:
 
@@ -322,8 +323,8 @@ promoted page is vertically centered. When the heuristic guesses wrong,
 ### CI mode — fail loud on missing assets
 
 ```bash
-"$P" generate docs.md --strict     # missing, remote, out-of-tree, oversized,
-                                 # and non-regular-file images exit non-zero
+"$P" generate docs.md --strict     # missing, remote, out-of-tree, non-image,
+                                 # oversized and non-regular-file images exit non-zero
                                  # instead of warn + placeholder
 ```
 
@@ -348,8 +349,9 @@ Branding:
 Output:
   --to pdf|html|docx         Output format (default: pdf). html = single
                              self-contained file; docx = content fidelity.
-  --strict                   Missing, remote, out-of-tree, oversized, or
-                             non-regular-file images fail the run (CI mode).
+  --strict                   Missing, remote, out-of-tree, non-image,
+                             oversized, or non-regular-file images fail the
+                             run (CI mode).
   --page-numbers             "N of M" footer (default on)
   --tagged                   Accessible PDF (default on)
   --outline                  PDF bookmarks from headings (default on)

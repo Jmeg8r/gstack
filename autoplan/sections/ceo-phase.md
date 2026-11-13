@@ -11,11 +11,12 @@ announcement. Dispatching a reviewer never completes its step.
 - Premises: accept reasonable ones (P6). Queue clearly-wrong/challenged premises
   as User Challenges for Phase 4: assumption, reason and cost of proceeding.
   The user decides there; never stop mid-pipeline.
+- List each part the plan adds to gstack (skill, step, instruction, check, default) with its
+  evidence or owned, dated test plan; a missing one is a finding.
 - Alternatives: pick highest completeness (P1). If tied, pick simplest (P5).
   If top 2 are close → mark TASTE DECISION.
 - Scope expansion: in blast radius + <1d CC → approve (P2). Outside → defer to TODOS.md (P3).
   Duplicates → reject (P4). Borderline (3-5 files) → mark TASTE DECISION.
-- All 11 review sections: run fully, auto-decide each issue, log every decision.
 
 **Required execution checklist (CEO):**
 
@@ -38,8 +39,7 @@ Before every spec dispatch, including after each accepted spec fix, run:
 ```bash
 bun "<SNAPSHOT_TOOL>" amend-input ceo "<ACTIVE_PLAN>" "<CEO_STEP0_CHECKPOINT>" "<RESTORE_PATH>" "<methodologyPath>"
 ```
-This applies the recorded requirements and exports the complete current
-`Implementation plan`. Keep returned `checkpointPath` as the amendment baseline;
+Keep returned `checkpointPath` as the amendment baseline;
 use returned `reviewInputPath` as `<CEO_SPEC_INPUT>`. Read that file at every
 returned `readRanges` offset/limit through EOF, then read the CEO scope summary in full.
 Reconcile dispositions, scope counts, proposal IDs and actual heading/test references
@@ -92,7 +92,7 @@ IMPORTANT: Do NOT read or execute any SKILL.md files or paths containing skills/
   No compliments. Just the strategic blind spots.
   File: <CEO_INPUT>
 
-Write the **complete prompt and context**, including actual plan/spec/source, to a private file. Substitute its shell-quoted path for `<prepared-prompt-file>`; never interpolate user text into shell source. Request a severity (Critical, High, Medium or Low) per finding and a final Recommendation: <action> because <specific reason> line, including an explicit no-findings rationale.
+Write the **complete prompt and context**, including actual plan/spec/source, to a private file. Substitute its shell-quoted path for `<prepared-prompt-file>`; never interpolate user text into shell source. Request severity (Critical, High, Medium or Low) per finding, a Recommendation: <action> because <reason> line, and `VERDICT: CLEAN` or `VERDICT: FINDINGS` as the last line.
 
 ```bash
 # GSTACK_ACTIVE_HOST names the harness, never the model.
@@ -111,7 +111,6 @@ _OUTSIDE_TMP=$(mktemp -d "${TMPDIR:-/tmp}/gstack-outside.XXXXXXXX") || exit 1
 trap 'rm -rf "$_OUTSIDE_TMP"' EXIT
 _OUTSIDE_INPUT="$_OUTSIDE_TMP/prompt"
 cat -- '<prepared-prompt-file>' >"$_OUTSIDE_INPUT" || exit 1
-
 _CODEX_PROBE="$HOME/.claude/skills/gstack/bin/gstack-codex-probe"
 export _CODEX_DEADLINE=$(($(date +%s)+540)); _CODEX_OUT=$("$_CODEX_PROBE" role-ready exec) || exit $?
 _CODEX_SEL=$(echo "$_CODEX_OUT" | sed -n 's/^CODEX_SEL: //p')

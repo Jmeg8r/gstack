@@ -21,7 +21,7 @@ interface Call { cmd: string; args: string[]; file?: string }
 function fixture(opts: {
   files?: Record<string, string>;
   visibility?: string;
-  comments?: Array<{ login: string; created: string }>;
+  comments?: Array<{ login: string; type?: string; created: string }>;
   openPrs?: Array<{ number: number; url: string }>;
   checks?: Array<{ name: string; status: string; app: string }>;
   reviews?: Array<{ login: string; commit: string }>;
@@ -64,7 +64,7 @@ function fixture(opts: {
       if (cmd === "gh" && args[0] === "repo") return ok("{}");
       if (cmd === "gh" && joined.includes("/comments?sort=created")) return ok(JSON.stringify(joined.includes("/issues/") ? opts.comments ?? [] : []));
       if (cmd === "gh" && joined.startsWith("pr list")) return ok(JSON.stringify(opts.openPrs ?? []));
-      if (cmd === "gh" && joined.startsWith("pr view")) return ok(SHA + "\n");
+      if (cmd === "gh" && joined.startsWith("api repos/{owner}/{repo}/pulls/12 ")) return ok(SHA + "\n");
       if (cmd === "gh" && joined.includes("/check-runs")) return ok(JSON.stringify(opts.checks ?? []));
       if (cmd === "gh" && joined.includes("/reviews")) return ok(JSON.stringify(opts.reviews ?? []));
       if (cmd === "gh" && joined.includes("/issues/12/comments")) return ok(JSON.stringify(opts.summaries ?? []));
@@ -103,12 +103,24 @@ describe("detection (CEO-8, DX-10)", () => {
   });
 
   test("a Greptile comment counts only within 90 days", () => {
-    const recent = fixture({ comments: [{ login: "greptile-apps[bot]", created: new Date(NOW - 10 * DAY).toISOString() }] });
+    const recent = fixture({ comments: [{ login: "greptile-apps[bot]", type: "Bot", created: new Date(NOW - 10 * DAY).toISOString() }] });
     expect(value(recent.run("detect").out, "GREPTILE_SIGNAL")).toBe("comment");
-    const old = fixture({ comments: [{ login: "greptile-apps[bot]", created: new Date(NOW - 120 * DAY).toISOString() }, { login: "octocat", created: new Date(NOW - DAY).toISOString() }] });
+    const old = fixture({ comments: [{ login: "greptile-apps[bot]", type: "Bot", created: new Date(NOW - 120 * DAY).toISOString() }, { login: "octocat", type: "User", created: new Date(NOW - DAY).toISOString() }] });
     const r = old.run("detect");
     expect(value(r.out, "GREPTILE_SIGNAL")).toBe("none");
     expect(value(r.out, "GREPTILE_EARLY")).toBe("off");
+  });
+
+  test("a human account named like Greptile is no signal (#3122)", () => {
+    const f = fixture({ comments: [{ login: "greptile-ci", type: "User", created: new Date(NOW - DAY).toISOString() }, { login: "notgreptile[bot]", type: "Bot", created: new Date(NOW - DAY).toISOString() }] });
+    expect(value(f.run("detect").out, "GREPTILE_SIGNAL")).toBe("none");
+  });
+
+  test("early review is off when greptile is in neither review-bot list (#3122)", () => {
+    const f = fixture({ files: { ".greptile/config.json": "{}" }, config: "pr_wait_gating_bots: coderabbit\npr_wait_advisory_bots: none\n" });
+    const r = f.run("detect");
+    expect(value(r.out, "GREPTILE_EARLY")).toBe("off");
+    expect(value(r.out, "GREPTILE_EARLY_REASON")).toBe("greptile is not in pr_wait_gating_bots or pr_wait_advisory_bots");
   });
 
   test("without Greptile nothing changes", () => {
@@ -139,6 +151,8 @@ describe("public-repo consent (ENG-20)", () => {
     expect(value(r.out, "GREPTILE_EARLY")).toBe("ask");
     expect(f.run("consent", "yes").out).toContain("GREPTILE_CONSENT: granted");
     expect(JSON.parse(fs.readFileSync(path.join(f.state, "projects/acme-widget/ship-greptile-early.json"), "utf8")).consent).toBe("yes");
+    expect(f.calls.filter(c => c.cmd.endsWith("gstack-slug")).map(c => c.args)).toContainEqual(["--get", "REPO_SLUG"]);
+    expect(f.calls.filter(c => c.cmd.endsWith("gstack-slug") && c.args.join(" ") !== "--get REPO_SLUG")).toEqual([]);
     r = f.run("detect");
     expect(value(r.out, "GREPTILE_CONSENT")).toBe("granted");
     expect(value(r.out, "GREPTILE_EARLY")).toBe("on");
@@ -223,7 +237,7 @@ describe("waiting for the review (CEO-8 completion signal)", () => {
     const f = fixture();
     const polls = () => f.calls.filter(c => c.args.join(" ").includes("/check-runs")).length;
     f.run("wait", "12", "--since", since);
-    expect(polls()).toBe(4); // at 0, 30, 60 and 90 seconds
+    expect(polls()).toBe(2); // at 0 and 60-75 seconds: polls are at least 60 s apart (GST-1713)
     f.advance(9 * 60_000);
     const r = f.run("wait", "12", "--since", since);
     expect(r.out).toContain("GREPTILE_REVIEW: timeout");

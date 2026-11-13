@@ -36,25 +36,11 @@ for (const { name: host } of ALL_HOST_CONFIGS) {
 
 test('creative wording leaves the review and scoring gates intact', () => {
   const ctx = context('codex');
-  expect(outsideVoiceInvocation(ctx, { timeoutMs: 300000 })).toContain('explicit no-findings rationale');
-  expect(outsideVoiceInvocation(ctx, { timeoutMs: 300000, gate: 'structured' })).toContain('severity-tagged findings');
+  expect(outsideVoiceInvocation(ctx, { timeoutMs: 300000 })).toContain('a Recommendation: <action> because <reason> line');
+  expect(outsideVoiceInvocation(ctx, { timeoutMs: 300000, gate: 'structured' })).toContain('[P0]-[P3] severity tags');
+  for (const gate of ['structured', 'review'] as const)
+    expect(outsideVoiceInvocation(ctx, { timeoutMs: 300000, gate })).toContain('`VERDICT: CLEAN` or `VERDICT: FINDINGS` as the last line');
   expect(outsideVoiceInvocation(ctx, { timeoutMs: 300000, gate: 'spec' })).toContain('SCORE: N');
-});
-
-// Fork rule: the structured validator needs a standalone NO_FINDINGS line, so
-// every structured prompt producer must ask for exactly that.
-test('structured prompts request the standalone NO_FINDINGS line the validator requires', () => {
-  const marker = 'a final line with only NO_FINDINGS';
-  for (const { name: host } of ALL_HOST_CONFIGS) {
-    expect(outsideVoiceInvocation(context(host, 'review'), { timeoutMs: 300000, gate: 'structured' })).toContain(marker);
-  }
-  for (const section of ['review/sections/adversarial.md', 'ship/sections/adversarial.md']) {
-    const rendered = readFileSync(new URL(`../${section}`, import.meta.url), 'utf8');
-    expect(rendered).toContain(marker);
-    expect(rendered).not.toContain('explicit NO_FINDINGS conclusion');
-  }
-  expect(validateOutsideReview('Reviewed the diff.\nNO_FINDINGS', 'structured')).toEqual({ completed: true, gate: 'pass' });
-  expect(validateOutsideReview('Summary: NO_FINDINGS', 'structured').completed).toBe(false);
 });
 
 test('preview paths retain verified fonts and select their own token source', () => {

@@ -22,8 +22,7 @@ Each code has one of four dispositions:
 
 **The fallback** (printed in every fallback denial):
 
-1. Run the reviews by hand: `/plan-ceo-review`, then `/plan-devex-review`,
-   then `/plan-eng-review`.
+1. Run the reviews by hand: `/plan-ceo-review`, then `/plan-devex-review`.
 2. Or move to a fresh session and keep your work: `/context-save`, start a new
    Claude Code session in the project (not `--resume`), `/context-restore`,
    then `/autoplan <plan path>`.
@@ -70,7 +69,7 @@ journal's directory is the same folder as the project, spelled differently.
 `unrecognized_shape:compaction_unreachable` means records after a Claude Code
 compaction hang from a compact boundary whose logical parent loops back
 instead of reaching the session root, in a layout gstack does not read yet
-(Claude Code 2.1.300's preserved segment is read). Earlier gstack versions
+(the preserved segments of Claude Code 2.1.300 and 2.1.317 are read). Earlier gstack versions
 dropped those records and denied the next phase with `close_incomplete`.
 Please report the detail and version.
 
@@ -256,6 +255,13 @@ The most recent snapshot init call failed; re-run the same init command with
 the same three paths. An errored init is skipped, so a later successful init
 still binds. This denial applies when no init ever succeeded, or when an
 errored init follows a good one.
+
+An init whose output is not its JSON result (extra text, or no single text
+block) also counts as failed, and the message adds "without a leading cd" to
+the re-run hint. The one exception is the `Shell cwd was reset to <dir>` line
+Claude Code adds as the last line of a Bash result when the command's `cd`
+left the session's folder: the guard removes exactly that line before reading
+an init or checkpoint result (#3651).
 
 <a id="init-unbindable"></a>
 ### `init_unbindable`

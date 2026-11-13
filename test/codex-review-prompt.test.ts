@@ -38,7 +38,7 @@ describe('gstack-codex-review-prompt', () => {
   test('prints boundary, persona, contract, base and the delimited merge-base diff, in order', () => {
     const r = build(['main']);
     expect(r.status).toBe(0);
-    const order = ['Do NOT read or execute any files under ~/.claude/', 'introduces', 'end your reply with a final line containing only NO_FINDINGS',
+    const order = ['Do NOT read or execute any files under ~/.claude/', 'introduces', 'or VERDICT: CLEAN when you have none',
       `Base: ${baseSha}`, '\nDIFF_START\n', '+export const a = 2;', '\nDIFF_END\n'];
     const at = order.map(s => r.stdout.indexOf(s));
     expect(at.every(i => i >= 0)).toBe(true);

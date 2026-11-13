@@ -80,9 +80,12 @@ export function gbrainPairRepo(): { repo: FixtureRepo; pair: GbrainPair; gated: 
  * gh for the queue: pr view, and paged check-runs and combined commit status
  * per SHA. A checks or statuses entry is one page (total_count defaults to its
  * length; later pages are empty) or { pages: [...] }. A SHA with no statuses
- * entry has no commit-status contexts, as on GitHub.
+ * entry has no commit-status contexts, as on GitHub. A check run marked
+ * earlier_attempt belongs to a superseded workflow-run attempt: like GitHub's
+ * default filter=latest, the shim hides it unless the call asks for filter=all.
+ * workflowRuns answers actions/runs?head_sha=<sha> the same way (none by default).
  */
-export function ghQueueShim(repo: FixtureRepo, data: { prs: Record<string, unknown>; checks: Record<string, unknown>; statuses?: Record<string, unknown> }): { PATH: string } {
+export function ghQueueShim(repo: FixtureRepo, data: { prs: Record<string, unknown>; checks: Record<string, unknown>; statuses?: Record<string, unknown>; workflowRuns?: Record<string, unknown> }): { PATH: string } {
   const dir = path.join(repo.root, 'gh-queue-shim');
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'data.json'), JSON.stringify(data));
@@ -90,7 +93,9 @@ export function ghQueueShim(repo: FixtureRepo, data: { prs: Record<string, unkno
     "const d = require(process.argv[2]); const a = process.argv.slice(3);",
     "if (a[0] === 'pr' && a[1] === 'view') { const p = d.prs[a[2]]; if (!p) { console.error('no pull request found'); process.exit(1); } console.log(JSON.stringify(p)); process.exit(0); }",
     "const paged = (c, key, page) => { if (c.pages) return c.pages[page - 1] || { total_count: c.pages.reduce((n, p) => n + p[key].length, 0), [key]: [] }; const total = c.total_count ?? c[key].length; return page === 1 ? { total_count: total, ...c } : { total_count: total, [key]: [] }; };",
-    "if (a[0] === 'api') { const m = /commits\\/([0-9a-f]+)\\/(check-runs|status)\\?.*page=(\\d+)/.exec(a[1] || ''); if (!m) { console.error('gh shim: unsupported ' + a.join(' ')); process.exit(1); } const runs = m[2] === 'check-runs'; const c = runs ? d.checks[m[1]] : ((d.statuses || {})[m[1]] || { state: 'pending', statuses: [] }); if (!c) { console.error('HTTP 404'); process.exit(1); } console.log(JSON.stringify(paged(c, runs ? 'check_runs' : 'statuses', Number(m[3])))); process.exit(0); }",
+    "const latestOnly = (c, url) => /[?&]filter=all(&|$)/.test(url) || !c || !Array.isArray(c.check_runs) || !c.check_runs.some(r => r.earlier_attempt) ? c : { check_runs: c.check_runs.filter(r => !r.earlier_attempt) };",
+    "if (a[0] === 'api') { const w = /actions\\/runs\\?head_sha=([0-9a-f]+).*page=(\\d+)/.exec(a[1] || ''); if (w) { console.log(JSON.stringify(paged((d.workflowRuns || {})[w[1]] || { workflow_runs: [] }, 'workflow_runs', Number(w[2])))); process.exit(0); } }",
+    "if (a[0] === 'api') { const m = /commits\\/([0-9a-f]+)\\/(check-runs|status)\\?.*page=(\\d+)/.exec(a[1] || ''); if (!m) { console.error('gh shim: unsupported ' + a.join(' ')); process.exit(1); } const runs = m[2] === 'check-runs'; const c = runs ? latestOnly(d.checks[m[1]], a[1]) : ((d.statuses || {})[m[1]] || { state: 'pending', statuses: [] }); if (!c) { console.error('HTTP 404'); process.exit(1); } console.log(JSON.stringify(paged(c, runs ? 'check_runs' : 'statuses', Number(m[3])))); process.exit(0); }",
     "console.error('gh shim: unsupported ' + a.join(' ')); process.exit(1);",
   ].join('\n');
   fs.writeFileSync(path.join(dir, 'shim.js'), js);
@@ -98,10 +103,18 @@ export function ghQueueShim(repo: FixtureRepo, data: { prs: Record<string, unkno
   return { PATH: `${dir}:${process.env.PATH ?? ''}` };
 }
 
-/** A coordinator's separate clone of the fixture origin. */
+/**
+ * A coordinator's separate clone of the fixture origin, fetched through git's
+ * transport (--no-local) like a real clone of GitHub. A local clone copies
+ * origin.git/objects entry by entry, and every push into the fixture origin
+ * leaves a detached `git maintenance run --auto` there that creates and
+ * deletes objects/maintenance.lock after the push returns: local transport
+ * drops the shard's GIT_CONFIG_COUNT maintenance-off backstop, so it never
+ * reaches that receive-pack.
+ */
 export function coordinatorClone(repo: FixtureRepo): string {
   const dir = path.join(repo.root, 'coordinator');
-  const r = spawnSync('git', ['clone', '-q', repo.origin, dir], { timeout: 60_000, env: { ...process.env, ...repo.env } });
+  const r = spawnSync('git', ['clone', '-q', '--no-local', repo.origin, dir], { timeout: 60_000, env: { ...process.env, ...repo.env } });
   if (r.status !== 0) throw new Error(`clone failed: ${r.stderr?.toString()}`);
   return dir;
 }

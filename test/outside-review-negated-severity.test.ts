@@ -21,12 +21,12 @@ const highest = (text: string, gate: OutsideGate = 'structured') => classifyOuts
 describe('an allowlisted clean phrasing is not a finding', () => {
   test('sovereign-forge #188 run 2: the CLI no longer prints VERDICT: findings, FINDINGS: P1', () => {
     const r = spawnSync(process.execPath, [LIB, '--verdict', 'structured', SF188], { encoding: 'utf8', timeout: 10000 });
-    // Untagged and without the NO_FINDINGS line the structured gate asks for, so a human reads it.
-    expect([r.status, r.stdout]).toEqual([4, 'VERDICT: unverified\nFINDINGS: none\nREASON: untagged_review\n']);
+    // Untagged and without the VERDICT line the structured gate asks for, so a human reads it.
+    expect([r.status, r.stdout]).toEqual([4, 'VERDICT: unverified\nFINDINGS: none\nREASON: missing_verdict\n']);
   });
 
-  test('the same run with the NO_FINDINGS line reads clean', () => {
-    const text = `${fs.readFileSync(SF188, 'utf8')}\nNO_FINDINGS\n`;
+  test('the same run with the VERDICT: CLEAN line reads clean', () => {
+    const text = `${fs.readFileSync(SF188, 'utf8')}\nVERDICT: CLEAN\n`;
     const result = classifyOutsideReview({ text, gate: 'structured' });
     expect([result.verdict, result.findings.highest]).toEqual(['clean', null]);
   });

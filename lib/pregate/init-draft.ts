@@ -27,7 +27,7 @@ const LANGUAGES: Array<[string, RegExp]> = [
   ['go', /\.go$/], ['ruby', /\.rb$/], ['rust', /\.rs$/], ['shell', /\.(?:sh|bash|bats)$/],
 ];
 /** Above this many tests a directory's tests are no longer a useful suggestion. */
-const MAX_SUGGESTED = 25;
+export const MAX_SUGGESTED = 25;
 const MAX_TODO_LINES = 50;
 
 export interface InitDraft {
@@ -40,7 +40,7 @@ export interface InitDraft {
 }
 
 /** The tests under the nearest ancestor directory of `file` (not the repo root) that has 1..MAX_SUGGESTED tests. */
-function nearestTests(tests: readonly string[], file: string): string[] {
+export function nearestTests(tests: readonly string[], file: string): string[] {
   for (let dir = path.posix.dirname(file); dir !== '.' && dir !== ''; dir = path.posix.dirname(dir)) {
     const under = tests.filter(t => t.startsWith(`${dir}/`));
     if (under.length > MAX_SUGGESTED) return [];
@@ -79,8 +79,7 @@ export function draftConfig(repoRoot: string): InitDraft {
     const runner = detectRunner({ repoRoot, config: DEFAULT_CONFIG }, list);
     return runner ? `${lang} tests detected at run time: ${runner}` : `no runner detected for ${list.length} ${lang} test file(s); set runner (with {files})`;
   });
-  const mixed = [...groups.keys()].filter(l => l !== 'dart' && l !== 'rust').length > 1 ? '; a selection mixing these languages needs runner set' : '';
-  const runnerNote = notes.length ? notes.join('; ') + mixed : 'no test files found';
+  const runnerNote = notes.length ? notes.join('; ') : 'no test files found';
 
   const selectionTodo = discoverLanes(repoRoot).filter(l => l.runsTests && l.matrixExpression && l.testFiles.length === 0).map(l => l.id);
   const config = { $schema: PREGATE_CONFIG_SCHEMA, runner: null, dependencies, empty_lanes: [], selection: {}, warn: [], strays: { allow: [] } };

@@ -388,7 +388,7 @@ Missing reviewer coverage is non-blocking; approvals and artifact rules still ap
 |---|---|
 | Disabled | Record disabled coverage below, then continue to planning decisions. No prompt, outside process or native replacement. |
 | Ready | Construct the prompt and run the foreground outside invocation. |
-| Other preflight mode, including harness mismatch | Report the probe's diagnosis, construct the same prompt and use Native fallback. |
+| Any other mode (`not_installed`, `under_current_harness`) | Report the probe's diagnosis, construct the same prompt and use Native fallback. |
 | Outside execution or output validation fails | Retain its output and diagnosis, finish termination, then use Native fallback. Auth: name the login repair; timeout: report the five-minute limit; empty response: say no response. |
 | Reviewer completes | Present its full output and go to Integrate reviewer findings. |
 | Native fallback unavailable or fails | Record unavailable coverage and continue to planning decisions. No clean-review credit. |
@@ -443,20 +443,20 @@ took for granted, missing dependencies or sequencing issues, and strategic
 miscalibration (is this the right thing to build at all?). Be direct. Be terse. No
 compliments. Just the problems.
 
-End with Recommendation: <action> because <specific reason>. If there are no findings, say so and explain why the plan is ready.
+Write Recommendation: <action> because <specific reason>; if no findings, explain why the plan is ready. End with exactly `VERDICT: CLEAN` (no findings) or `VERDICT: FINDINGS` as the last line.
 
 
 THE PLAN:
 <plan content>"
 
-**If `CODEX_MODE: ready` (or `unverified`) — run Codex:**
+**If `CODEX_MODE: ready` — run Codex:**
 
-Run this block for `ready` or `unverified`, in the one foreground Bash call described below.
+Run this block for `ready`, in the one foreground Bash call described below.
 Its opening harness guard rechecks the fresh shell: exit 78 uses the same Native
 fallback below, never a replacement provider. Finish termination before fallback and consume only
 completed output. Use private temporary paths, with no background jobs.
 
-Create a private prompt file: run `umask 077; mktemp "${TMPDIR:-/tmp}/gstack-plan-prompt.XXXXXXXX"` in Bash and keep the returned path. Use Write to put the **complete prompt and context**, including actual plan/spec/source, in that file. Substitute its shell-quoted path for `<prepared-prompt-file>`; never interpolate user text into shell source. Request a severity (Critical, High, Medium or Low) per finding and a final Recommendation: <action> because <specific reason> line, including an explicit no-findings rationale.
+Create a private prompt file: run `umask 077; mktemp "${TMPDIR:-/tmp}/gstack-plan-prompt.XXXXXXXX"` in Bash and keep the returned path. Use Write to put the **complete prompt and context**, including actual plan/spec/source, in that file. Substitute its shell-quoted path for `<prepared-prompt-file>`; never interpolate user text into shell source. Request severity (Critical, High, Medium or Low) per finding and the prompt's Recommendation and VERDICT lines.
 
 ```bash
 # GSTACK_ACTIVE_HOST names the harness, never the model.
@@ -475,7 +475,6 @@ _OUTSIDE_TMP=$(mktemp -d "${TMPDIR:-/tmp}/gstack-outside.XXXXXXXX") || exit 1
 trap 'rm -rf "$_OUTSIDE_TMP"' EXIT
 _OUTSIDE_INPUT="$_OUTSIDE_TMP/prompt"
 cat -- '<prepared-prompt-file>' >"$_OUTSIDE_INPUT" || exit 1
-
 _CODEX_PROBE="$HOME/.claude/skills/gstack/bin/gstack-codex-probe"
 export _CODEX_DEADLINE=$(($(date +%s)+300)); _CODEX_OUT=$("$_CODEX_PROBE" role-ready exec) || exit $?
 _CODEX_SEL=$(echo "$_CODEX_OUT" | sed -n 's/^CODEX_SEL: //p')
@@ -752,6 +751,10 @@ List known files only. For unknown files, write "to be determined" and use an
 empty JSONL files array. Each task needs a concrete verification step.
 Always emit the markdown section. Write its JSONL artifact for `/autoplan` only when the Step 0 storage policy permits it; otherwise label the complete task output not persisted and do not claim an aggregation artifact exists.
 
+### Earlier lists on this branch
+
+Before listing tasks, run `~/.claude/skills/gstack/bin/gstack-tasks prior --phase ceo-review` and reconcile what it prints, so a rerun never leaves two lists.
+
 ### Markdown section (always emit)
 
 ```markdown
@@ -774,49 +777,11 @@ Rules:
 
 ### JSONL artifact (write when permitted, including zero tasks)
 
-`/autoplan` reads this file to aggregate across phases. Build each line with
-`jq -nc` so titles and source findings containing quotes, newlines, or
-backslashes serialize cleanly — never use hand-rolled `echo` / `printf`.
+`/autoplan` aggregates this list. With your file-write tool, write one JSON object per line to `.gstack/tmp/tasks-ceo-review-rows.jsonl` at the repo root (no free text in a command; no rows, no file): a task is `{"id":"T1","priority":"P1","component":"","title":"","source_finding":"","effort_human":"~2h","effort_cc":"~15min","files":[]}`, plus `"carried_from":"<run_id>/<id>"` when carried; a closed earlier task is `{"prior":"<run_id>/<id>","disposition":"done|dropped","reason":""}`. Then write the list (empty means "ran, no findings", distinct from "didn't run"):
 
 ```bash
-GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
-SLUG=$(~/.claude/skills/gstack/bin/gstack-slug --get SLUG 2>/dev/null)
-TASKS_DIR="$GSTACK_STATE_ROOT/projects/${SLUG:-unknown}"
-mkdir -p "$TASKS_DIR"
-TASKS_FILE="$TASKS_DIR/tasks-ceo-review-$(date +%Y%m%d-%H%M%S).jsonl"
-COMMIT=$(git rev-parse HEAD 2>/dev/null || echo unknown)
-# The task record keeps the raw git branch; artifact filenames keep gstack-slug's sanitized BRANCH.
-GIT_BRANCH=$(git branch --show-current 2>/dev/null || echo unknown)
-RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
-
-# Repeat ONE jq invocation per task identified during this review.
-# Substitute the placeholders inline with shell variables you set per task:
-#   TASK_ID (T1, T2, ...), PRIORITY (P1/P2/P3), COMPONENT, TITLE,
-#   SOURCE_FINDING, EFFORT_HUMAN, EFFORT_CC, FILES_JSON (a JSON array literal
-#   like '["browse/src/sanitize.ts","browse/src/server.ts"]').
-jq -nc \
-  --arg phase 'ceo-review' \
-  --arg run_id "$RUN_ID" \
-  --arg branch "$GIT_BRANCH" \
-  --arg commit "$COMMIT" \
-  --arg id "$TASK_ID" \
-  --arg priority "$PRIORITY" \
-  --arg component "$COMPONENT" \
-  --arg effort_human "$EFFORT_HUMAN" \
-  --arg effort_cc "$EFFORT_CC" \
-  --arg title "$TITLE" \
-  --arg source_finding "$SOURCE_FINDING" \
-  --argjson files "$FILES_JSON" \
-  '{phase:$phase, run_id:$run_id, branch:$branch, commit:$commit, id:$id, priority:$priority, component:$component, files:$files, effort_human:$effort_human, effort_cc:$effort_cc, title:$title, source_finding:$source_finding}' \
-  >> "$TASKS_FILE"
+~/.claude/skills/gstack/bin/gstack-tasks add --phase ceo-review
 ```
-
-If `jq` is not installed, fall back to skipping the JSONL write and warn
-the user to install jq for autoplan aggregation. Never hand-roll JSONL.
-
-When writes are permitted and zero tasks were identified, touch the JSONL file
-(`: > "$TASKS_FILE"`) so the aggregator sees that the phase produced output
-this run (an empty file means "ran, no findings" — distinct from "didn't run").
 
 
 ### Completion Summary
@@ -932,7 +897,7 @@ Produce this markdown table:
 |--------|---------|-----|------|--------|----------|
 | CEO Review | `/plan-ceo-review` | Scope & strategy | {runs} | {status} | {findings} |
 | Outside Review | {recorded provider and trigger} | Independent 2nd opinion | {runs} | {outside_status} | {findings} |
-| Eng Review | `/plan-eng-review` | Architecture & tests (required) | {runs} | {status} | {findings} |
+| Eng Review | `/autoplan` | Architecture & tests (required) | {runs} | {status} | {findings} |
 | Design Review | `/plan-design-review` | UI/UX gaps | {runs} | {status} | {findings} |
 | DX Review | `/plan-devex-review` | Developer experience gaps | {runs} | {status} | {findings} |
 ```
@@ -1120,14 +1085,14 @@ explicitly, never as CLEAR. Display a fresh `clean` result as CLEAR and
 
 After displaying the Review Readiness Dashboard, recommend the next review(s) based on what this CEO review discovered. Read the dashboard output to see which reviews have already been run and whether they are stale.
 
-**Recommend /plan-eng-review if eng review is not skipped globally** — check the dashboard output for `skip_eng_review`. If it is `true`, eng review is opted out — do not recommend it. Otherwise, eng review is the required shipping gate. If this CEO review expanded scope, changed architectural direction, or accepted scope expansions, emphasize that a fresh eng review is needed. If an eng review already exists in the dashboard but the commit hash shows it predates this CEO review, note that it may be stale and should be re-run.
+**Recommend /autoplan for the eng review if eng review is not skipped globally** — check the dashboard output for `skip_eng_review`. If it is `true`, eng review is opted out — do not recommend it. Otherwise, /autoplan runs the eng review as its last phase. If this CEO review expanded scope, changed architectural direction, or accepted scope expansions, emphasize that a fresh eng review is needed. If an eng review already exists in the dashboard but the commit hash shows it predates this CEO review, note that it may be stale and should be re-run.
 
 **Recommend /plan-design-review if UI scope was detected** — specifically if Section 11 (Design & UX Review) was NOT skipped, or if accepted scope expansions included UI-facing features. If an existing design review is stale (commit hash drift), note that. In SCOPE REDUCTION mode, skip this recommendation — design review is unlikely relevant for scope cuts.
 
-**If both are needed, recommend eng review first** (required gate), then design review.
+**If both are needed, recommend /autoplan**: it also runs the design review when it detects UI scope.
 
 Use AskUserQuestion to present the next step. Include only applicable options:
-- **A)** Run /plan-eng-review next (required gate)
+- **A)** Run /autoplan next (eng review)
 - **B)** Run /plan-design-review next (only if UI scope detected)
 - **C)** Skip — I'll handle reviews manually
 

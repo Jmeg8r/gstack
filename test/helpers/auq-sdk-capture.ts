@@ -112,6 +112,8 @@ export function setupPlanCeoDir(opts: {
   run('git', ['init', '-b', 'main']);
   run('git', ['config', 'user.email', 'test@test.com']);
   run('git', ['config', 'user.name', 'Test']);
+  run('git', ['config', 'maintenance.auto', 'false']);
+  run('git', ['config', 'gc.auto', '0']);
   fs.writeFileSync(
     path.join(dir, 'plan.md'),
     [
@@ -129,7 +131,8 @@ export function setupPlanCeoDir(opts: {
     ].join('\n'),
   );
   fs.mkdirSync(path.join(dir, 'plan-ceo-review'), { recursive: true });
-  fs.writeFileSync(path.join(dir, 'plan-ceo-review', 'SKILL.md'), opts.skillMd);
+  fs.writeFileSync(path.join(dir, 'plan-ceo-review', 'SKILL.md'),
+    opts.skillMd.replaceAll('~/.claude/skills/gstack/plan-ceo-review/sections/', path.join(dir, 'plan-ceo-review', 'sections') + '/'));
   if (opts.sectionsFrom && fs.existsSync(opts.sectionsFrom)) {
     fs.cpSync(opts.sectionsFrom, path.join(dir, 'plan-ceo-review', 'sections'), { recursive: true });
   }
@@ -161,7 +164,8 @@ export function setupSkillDir(opts: {
     fs.writeFileSync(p, content);
   }
   fs.mkdirSync(path.join(dir, opts.skillName), { recursive: true });
-  fs.writeFileSync(path.join(dir, opts.skillName, 'SKILL.md'), opts.skillMd);
+  fs.writeFileSync(path.join(dir, opts.skillName, 'SKILL.md'),
+    opts.skillMd.replaceAll(`~/.claude/skills/gstack/${opts.skillName}/sections/`, path.join(dir, opts.skillName, 'sections') + '/'));
   if (opts.sectionsFrom && fs.existsSync(opts.sectionsFrom)) {
     fs.cpSync(opts.sectionsFrom, path.join(dir, opts.skillName, 'sections'), { recursive: true });
   }
@@ -467,11 +471,11 @@ export async function captureModeSelectionAuq(opts: {
   // which silently invalidates a carved-vs-verbose A/B (both sides end up
   // reading the same global skill). Absolute path + no-wander instruction +
   // Bash disallowed (so `find /` is impossible) locks it to the planted file.
-  const prompt = `Review the plan using ONLY these two files:
+  const prompt = `Review the plan with this skill and plan:
   - The skill to follow: ${skillPath}
   - The plan to review: ${planPath}
 
-Read ${skillPath} for the review workflow. Do NOT search for, Glob, find, or read any OTHER SKILL.md anywhere on the system — especially nothing under ~/.claude or /Users. The ONLY skill file you may read is the absolute path above.
+Read ${skillPath} for the review workflow. Do NOT search for, Glob, find, or read any OTHER SKILL.md anywhere on the system — especially nothing under ~/.claude or /Users. The ONLY SKILL.md you may read is the absolute path above; the files in its sections/ directory that it tells you to Read are part of this skill.
 
 Read ${planPath} — that is the plan to review. It is a standalone plan document, not a codebase. Skip any codebase exploration or system-audit steps.
 

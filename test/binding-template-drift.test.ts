@@ -55,8 +55,9 @@ describe('content-binding template drift', () => {
 
   test('ship Step 5 lanes run wrapped with per-lane labels', () => {
     const tests = rendered('ship/sections/tests.md');
-    expect(tests).toContain('gstack-evidence run --label tests');
-    expect(tests).toContain('gstack-evidence run --label vitest');
+    expect(tests).toContain('gstack-ship-preflight --tests-only --base <base> --lane <label>=<command>');
+    expect(tests).toContain('Each lane runs as `gstack-evidence run --label <label> -- \'<command>\'`');
+    expect(tests).toContain('use the same lane labels and exact commands again in Step 16');
   });
 
   test('land-and-deploy grades staleness content-first (wtree rule) and checks evidence', () => {
@@ -119,11 +120,14 @@ describe('content-binding template drift', () => {
     expect(army).toContain('--finish DESIGN_START');
     const codex = rendered('codex/sections/review-mode.md');
     const starts = [...codex.matchAll(/gstack-review-log --start codex-review/g)];
-    // One review path: the token is captured before the prompt (and its diff) is built.
     expect(starts).toHaveLength(1);
-    const built = codex.indexOf('gstack-codex-review-prompt <scope>');
-    expect(built).toBeGreaterThan(-1);
-    expect(starts[0].index).toBeLessThan(built);
+    const execReview = codex.indexOf(`run-with-timeout --user-invoked --effort high --request-effort '<effort-level>' 330 codex exec`);
+    expect(execReview).toBeGreaterThan(-1);
+    expect(starts[0].index).toBeLessThan(execReview);
+    const diffRead = codex.indexOf('git diff "$DIFF_BASE"');
+    expect(diffRead).toBeGreaterThan(-1);
+    expect(starts[0].index).toBeLessThan(diffRead);
+    expect(codex).not.toMatch(/run-with-timeout[^\n]*\bcodex review\b/);
     expect(codex).toContain('--finish CODEX_REVIEW_START');
     expect(codex).toContain('"completed":COMPLETED,"converged":CONVERGED');
     expectMentions(codex, [['until', 'genuine', 'fixes']], 'codex');
@@ -210,9 +214,9 @@ describe('content-binding template drift', () => {
     }
   });
 
-  test('greptile triage reads bodies through the guard (metadata/body split)', () => {
+  test('review bot triage reads bodies through the guard (metadata/body split)', () => {
     const triage = rendered('review/greptile-triage.md');
-    expect(triage).toContain('gstack-issue-guard --stdin --source greptile-line');
+    expect(triage).toContain('gstack-issue-guard --stdin --source review-bot');
     expect(triage).toContain('gstack-issue-guard --stdin --source greptile-replies');
   });
 });

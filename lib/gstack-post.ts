@@ -6,16 +6,36 @@
  * the agent wrote with its file tool; the helper reads each file once, scans
  * those exact bytes with the shared redaction engine, and sends the same bytes.
  *
+ * `pr-body` merges by `## ` section into the PR's current body (read through
+ * the same runner): a section in the file replaces the same-titled one, the
+ * ship-receipt block is a section of its own, sections the file does not
+ * rewrite are kept, new ones are appended, and a file with a receipt above
+ * its first `## ` section replaces the text between the receipt and the
+ * first heading while the opening text above the receipt is kept;
+ * the Agent notes section (lib/agent-notes.ts) is one section that always
+ * stays last; `--replace` overwrites instead.
+ * `pr-title` and `pr-create` first check the title against the repository's
+ * plain-title policy (lib/plain-title.ts); a refused title posts nothing.
+ * The scan runs on the merged bytes, which are the bytes sent.
+ *
  * Exit codes: 0 posted; 1 HIGH finding (or oversize input) refused;
  * 2 MEDIUM findings need confirmation, printed as `RULE:` lines plus a
  * `TOKEN:` that binds the bytes, destination, operation and findings;
- * 3 `gh`/`glab` failed; 64 usage or invalid input. Nothing is posted on any
+ * 3 `gh`/`glab` failed; 4 the title breaks the plain-title policy, printed as
+ * `PLAIN_TITLE:` lines; 64 usage or invalid input. Nothing is posted on any
  * non-zero exit. bin/gstack-post is the CLI; tests drive `runPost` with a fake
  * runner so the logic is covered on every platform.
  */
 import { createHash } from "crypto";
 import { scan, type Finding, type RepoVisibility } from "./redact-engine";
+import { CI_RUN_WORD_BEFORE } from "./redact-patterns";
+import { agentNotesLines } from "./agent-notes";
+import { checkTitle, loadPlainTitlePolicy, PLAIN_TITLE_POLICY_PATH } from "./plain-title";
+import { RECEIPT_FENCE, RUNS_FENCE, extractReceipt, placeReceipt, renderReceiptBlock, validateReceipt } from "./ship-receipt";
+import type { ShipReceipt } from "./headless-artifacts";
 import { canonicalRemote } from "./remote-identity";
+import { parseChangelog } from "./changelog-check";
+import { versionWidth } from "./version-source";
 
 export const OPS = ["pr-comment", "issue-comment", "reply", "pr-title", "pr-body", "pr-create", "issue-create"] as const;
 export type Op = (typeof OPS)[number];
@@ -30,15 +50,15 @@ export interface PostEnv {
   err(text: string): void;
 }
 
-export const EXIT = { posted: 0, refused: 1, confirm: 2, cliFailed: 3, usage: 64 } as const;
+export const EXIT = { posted: 0, refused: 1, confirm: 2, cliFailed: 3, plainTitle: 4, usage: 64 } as const;
 
 export const USAGE = `usage: gstack-post <op> [<target>] [options]
 
-  gstack-post pr-comment    <pr>    --body-file F
-  gstack-post issue-comment <issue> --body-file F
-  gstack-post reply         <pr>    --to <review-comment-id> --body-file F   (GitHub only)
+  gstack-post pr-comment    <pr>    --body-file F [--attribute "<model> on behalf of <login>"]
+  gstack-post issue-comment <issue> --body-file F [--attribute ...]
+  gstack-post reply         <pr>    --to <review-comment-id> --body-file F [--attribute ...]   (GitHub only)
   gstack-post pr-title      <pr>    --title-file F
-  gstack-post pr-body       <pr>    --body-file F
+  gstack-post pr-body       <pr>    --body-file F [--replace]
   gstack-post pr-create --base <branch> [--head <branch>] [--draft] --title-file F --body-file F
   gstack-post issue-create  --title-file F --body-file F
 
@@ -46,12 +66,21 @@ export const USAGE = `usage: gstack-post <op> [<target>] [options]
   Options: --host github|gitlab (default: detected from the origin remote)
            --repo-visibility public|private|unknown (default: config, then gh/glab)
            --confirm <token>   post bytes whose MEDIUM findings the user confirmed
+           --replace           pr-body: overwrite the whole body instead of merging it by
+                               ## section into the current one (the default keeps every
+                               section the file does not rewrite, the ship receipt included)
+           --attribute <text>  comments only; opens the comment with a "> [!NOTE]"
+                               callout naming who wrote it (one line, off by default)
 
   Write the text files with your file-write tool; never put the text in a
   shell command. The helper scans the exact bytes it sends.
+  pr-title and pr-create check the title against ${PLAIN_TITLE_POLICY_PATH}
+  (gstack-plain-title) first; a repository without that file is not checked.
 
   Exit: 0 posted · 1 HIGH finding refused · 2 MEDIUM findings need
-  confirmation (RULE:/TOKEN: lines on stdout) · 3 gh/glab failed · 64 usage
+  confirmation (RULE:/TOKEN: lines on stdout) · 3 gh/glab failed ·
+  4 the title is not plain words (PLAIN_TITLE: lines on stdout; rewrite the
+  title file and rerun) or the plain-title policy is invalid; nothing posted · 64 usage
 `;
 
 interface Request {
@@ -61,16 +90,32 @@ interface Request {
   base?: string;
   head?: string;
   draft: boolean;
+  replace: boolean;
   titleFile?: string;
   bodyFile?: string;
   host?: HostKind;
   visibility?: RepoVisibility;
   confirm?: string;
+  attribute?: string;
+}
+
+/** Operations that post a comment, the only ones an attribution callout applies to. */
+const COMMENT_OPS: ReadonlySet<Op> = new Set<Op>(["pr-comment", "issue-comment", "reply"]);
+
+/**
+ * The opt-in attribution callout (Garry, 2026-10-26: yes, opt-in, off by
+ * default): a GitHub alert block that opens an agent-posted comment with who
+ * wrote it, so a maintainer reading the thread sees the author before the text.
+ * GitLab renders it as a plain blockquote. Applied to comments and replies only,
+ * never to a PR body, a title or an issue body.
+ */
+export function attributionCallout(attribute: string): string {
+  return `> [!NOTE]\n> 🤖 **${attribute}**\n\n`;
 }
 
 class UsageError extends Error {}
 
-const VALUE_FLAGS = new Set(["--to", "--base", "--head", "--title-file", "--body-file", "--host", "--repo-visibility", "--confirm"]);
+const VALUE_FLAGS = new Set(["--to", "--base", "--head", "--title-file", "--body-file", "--host", "--repo-visibility", "--confirm", "--attribute"]);
 
 function parseArgs(argv: string[]): Request {
   const [op, ...rest] = argv;
@@ -78,9 +123,11 @@ function parseArgs(argv: string[]): Request {
   const flags = new Map<string, string>();
   const positional: string[] = [];
   let draft = false;
+  let replace = false;
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i]!;
     if (a === "--draft") { draft = true; continue; }
+    if (a === "--replace") { replace = true; continue; }
     const eq = a.indexOf("=");
     const name = a.startsWith("--") && eq > 0 ? a.slice(0, eq) : a;
     if (VALUE_FLAGS.has(name)) {
@@ -98,11 +145,17 @@ function parseArgs(argv: string[]): Request {
   const vis = flags.get("--repo-visibility");
   if (vis !== undefined && !["public", "private", "unknown"].includes(vis)) throw new UsageError("--repo-visibility must be public, private or unknown");
   const req: Request = {
-    op: op as Op, draft,
+    op: op as Op, draft, replace,
     target: positional[0], to: flags.get("--to"), base: flags.get("--base"), head: flags.get("--head"),
     titleFile: flags.get("--title-file"), bodyFile: flags.get("--body-file"),
     host: host as HostKind | undefined, visibility: vis as RepoVisibility | undefined, confirm: flags.get("--confirm"),
+    attribute: flags.get("--attribute")?.trim(),
   };
+  if (req.attribute !== undefined) {
+    if (!COMMENT_OPS.has(req.op)) throw new UsageError("--attribute applies to pr-comment, issue-comment and reply only");
+    if (!req.attribute || /[\r\n\u0000-\u001f]/.test(req.attribute)) throw new UsageError("--attribute needs one line of text, like \"<model> on behalf of <login>\"");
+    if (req.attribute.length > 200) throw new UsageError("--attribute must be 200 characters or fewer");
+  }
   const creates = req.op === "pr-create" || req.op === "issue-create";
   if (positional.length > (creates ? 0 : 1)) throw new UsageError(`unexpected argument "${positional[creates ? 0 : 1]}"`);
   if (!creates && !req.target) throw new UsageError(`${req.op} needs a target (a number or a URL)`);
@@ -114,7 +167,193 @@ function parseArgs(argv: string[]): Request {
   if (req.to !== undefined && !/^[1-9][0-9]*$/.test(req.to)) throw new UsageError("--to must be a numeric comment id");
   if ((req.op === "pr-create") !== !!req.base) throw new UsageError(req.op === "pr-create" ? "pr-create needs --base <branch>" : "--base applies to pr-create only");
   if (req.op !== "pr-create" && (req.head || req.draft)) throw new UsageError("--head and --draft apply to pr-create only");
+  if (req.op !== "pr-body" && req.replace) throw new UsageError("--replace applies to pr-body only");
   return req;
+}
+
+/** One piece of a PR body: the leading text, a `## ` section, the ship-receipt block, text after a receipt block, the Agent notes section, or a Capy badge that ends the body. */
+interface Section { key: string; label: string; text: string }
+const NOTES_KEY = "agent-notes";
+
+/**
+ * Split a body into its sections, in order. A `## ` line outside a code
+ * fence opens a section keyed by its title (trimmed, case-insensitive); the
+ * ````gstack-ship-receipt```` block is its own section (lib/ship-receipt.ts
+ * extractReceipt reads it); text before the first heading is the leading
+ * text, and text after a receipt block before the next heading is kept with
+ * a key of its own, so it is never replaced. A fence closes only on a run of
+ * its own character at least as long as the opener with nothing after it
+ * (CommonMark), so a ``` line inside a ```` block and a ```js line close
+ * nothing; a receipt fence that never closes makes the body from that line
+ * on one section the merge never matches (`unclosed-receipt`), so it is kept
+ * byte for byte instead of being read as a receipt or as replaceable text.
+ * A Capy badge (`<!-- capy-badge:start -->` through `<!-- capy-badge:end -->`,
+ * both outside a fence) that ends the body after its first receipt or
+ * heading, with only blank lines after it, is a piece of its own
+ * (`badge:capy-badge`), so it never leaves with the section above it
+ * (GST-1227). A badge anywhere else, an unclosed badge marker and every other
+ * marker block stay inside the section they sit in. The Agent notes section
+ * (its marker line through its closing `</details>`, lib/agent-notes.ts
+ * agentNotesLines) is one piece (`agent-notes`) whatever it holds, the
+ * receipt block included; text after it is trailing text.
+ */
+function splitSections(body: string): Section[] {
+  const out: Section[] = [];
+  const lines = body.split(/(?<=\n)/);
+  const notes = agentNotesLines(lines);
+  let fence: string | null = null;
+  let badgeAt = -1;
+  let inBadge = false;
+  let plain = 0;
+  const open = (key: string, label: string) => { badgeAt = -1; inBadge = false; out.push({ key, label, text: "" }); };
+  const openText = () => out.length === 0 ? open("text:lead", "leading text") : open(`text:${plain++}`, "trailing text");
+  const closes = (run: string) => new RegExp(`^ {0,3}${run[0] === "`" ? "`" : "~"}{${run.length},}\\s*$`).test(bare);
+  let bare = "";
+  for (const [i, line] of lines.entries()) {
+    bare = line.replace(/\r?\n$/, "");
+    if (notes && i >= notes.marker && i <= notes.close) {
+      if (i === notes.marker) { fence = null; open(NOTES_KEY, "Agent notes"); }
+      out.at(-1)!.text += line;
+      if (i === notes.close) openText();
+      continue;
+    }
+    const fenceOpen: RegExpExecArray | null = fence === null ? /^ {0,3}(`{3,}|~{3,})/.exec(bare) : null;
+    const outside = fence === null && !fenceOpen;
+    if (fenceOpen && bare.trim() === "```" + RECEIPT_FENCE) { open("receipt", "ship receipt"); fence = "receipt"; }
+    else if (fence === "receipt") { out.at(-1)!.text += line; if (closes("```")) { fence = null; openText(); } continue; }
+    else if (fenceOpen) fence = fenceOpen[1]!;
+    else if (fence && closes(fence)) fence = null;
+    else if (fence === null && /^ {0,3}## /.test(bare)) { const title = bare.replace(/^ {0,3}## /, "").trim(); open(`h2:${title.toLowerCase()}`, title); }
+    if (out.length === 0) openText();
+    if (outside && /^ {0,3}<!-- capy-badge:start -->/.test(bare)) { badgeAt = out.at(-1)!.text.length; inBadge = true; }
+    else if (inBadge && outside && /<!-- capy-badge:end -->/.test(bare)) inBadge = false;
+    else if (!inBadge && bare.trim() !== "") badgeAt = -1;
+    out.at(-1)!.text += line;
+  }
+  const last = out.at(-1);
+  if (last && badgeAt >= 0 && !inBadge && fence === null && last.key !== "text:lead") {
+    out.push({ key: "badge:capy-badge", label: "capy-badge block", text: last.text.slice(badgeAt) });
+    last.text = last.text.slice(0, badgeAt);
+  }
+  if (fence === "receipt") Object.assign(out.at(-1)!, { key: "unclosed-receipt", label: "unclosed receipt fence" });
+  return out.filter(s => s.text !== "");
+}
+
+/**
+ * The body to send for `pr-body` without `--replace`: each section of the
+ * file replaces the same-keyed section of the current body in place, current
+ * sections the file does not rewrite are kept byte for byte, new `## `
+ * sections are appended after them (above a Capy badge that ends the body;
+ * a badge only the file brings goes last), new leading text goes first, and a new receipt goes right after the
+ * current leading text, or first when there is none (where
+ * lib/ship-receipt.ts puts the receipt). Text outside sections
+ * matches by role (the file's leading text replaces the leading text; text
+ * after a receipt block never replaces an intro), and whitespace-only text in
+ * the file is dropped, so reposting the body /ship composes (receipt, blank
+ * line, sections) yields the same bytes. A blank
+ * line separates the two sides of every seam the merge creates; two kept
+ * neighbours keep their bytes. An empty current body yields the file unchanged.
+ * A file section whose title the current body holds more than once (an old
+ * description pasted under the new one) matches no single section, so the
+ * merge refuses instead of replacing one copy and keeping the stale other.
+ * A full post (a file with a receipt block above its first `## ` section, as
+ * /ship composes it) manages the text under the receipt (GST-412): every
+ * non-blank text section after a receipt block and before the current body's
+ * first heading is dropped, the file's own text after its receipt takes its
+ * place, right after the receipt, and a dropped piece the file brings no text for
+ * is listed in `dropped` with its first line (withheld when the redaction scan
+ * flags it, since the merged bytes no longer hold it). The current leading text
+ * (the opening paragraph and a bot's badge above the first receipt or heading)
+ * is kept byte for byte unless the file brings leading text of its own, which
+ * replaces it as in any merge (GST-1227). A file whose last piece is an Agent
+ * notes section (as /ship composes it since GST-1825) is a full post too: it
+ * drops the text under a legacy top receipt the same way, and when its notes
+ * carry a receipt the legacy receipt block itself goes (reported as replaced).
+ * The Agent notes section, the current one or the file's, always ends the
+ * merged body, above a Capy badge that ends it. Any other file (`## `
+ * sections with no receipt above them, or no `## ` section) merges as
+ * described above, so the text under the receipt is kept too. A receipt the
+ * file brings outside an Agent notes section, posted to a body that has one,
+ * goes into that section through placeReceipt, so it replaces the receipt
+ * there instead of landing beside it while the old one still binds.
+ */
+export function mergeBodySections(current: string, incoming: string): { body: string; replaced: string[]; kept: string[]; added: string[]; dropped: string[] } {
+  const now = splitSections(current);
+  const next = splitSections(incoming).filter(n => !(n.key.startsWith("text:") && n.text.trim() === ""));
+  const lone = next.find(n => n.key === "receipt");
+  const intoNotes = lone && now.some(s => s.key === NOTES_KEY) && !next.some(n => n.key === NOTES_KEY) ? extractReceipt(lone.text).receipt : undefined;
+  if (!intoNotes) return mergeSplit(now, next, incoming);
+  const after = next[next.indexOf(lone!) + 1];
+  const rest = next.filter(n => n !== lone).map(n => n !== after || !n.key.startsWith("text:") ? n : { ...n, key: "text:after-receipt", text: n.text.replace(RUNS_BLOCK_RE, "") });
+  const m = mergeSplit(now, rest.filter(n => !(n.key.startsWith("text:") && n.text.trim() === "")), incoming);
+  return { ...m, body: placeReceipt(m.body, intoNotes), replaced: [...m.replaced, "ship receipt"] };
+}
+
+const RUNS_BLOCK_RE = new RegExp("^```" + RUNS_FENCE + "[ \\t]*\\r?\\n[\\s\\S]*?\\r?\\n```[ \\t]*(?:\\r?\\n|$)", "m");
+
+function mergeSplit(now: Section[], next: Section[], incoming: string): { body: string; replaced: string[]; kept: string[]; added: string[]; dropped: string[] } {
+  const ambiguous = next.filter(n => now.filter(s => s.key === n.key).length > 1).map(n => `"${n.label}"`);
+  if (ambiguous.length) throw new UsageError(`the PR's current body holds ${[...new Set(ambiguous)].join(", ")} more than once, so the file's copy matches no single section; nothing was posted. Rerun with --replace and the whole body`);
+  const preamble = (list: Section[]) => {
+    const end = list.findIndex(s => s.key.startsWith("h2:") || s.key === NOTES_KEY);
+    return list.slice(0, end < 0 ? list.length : end).filter(s => s.key.startsWith("text:") && s.key !== "text:lead" && s.text.trim() !== "");
+  };
+  const firstHeading = next.findIndex(n => n.key.startsWith("h2:"));
+  const isNotes = (s: Section | undefined) => s?.key === NOTES_KEY;
+  const fileNotes = next.filter(n => n.key !== "badge:capy-badge" && n.text.trim() !== "").at(-1);
+  const notesPost = isNotes(fileNotes);
+  const managed = notesPost || (firstHeading > 0 && next.slice(0, firstHeading).some(n => n.key === "receipt"));
+  const movedReceipt = notesPost && extractReceipt(fileNotes!.text).found;
+  const stale = managed ? preamble(now) : [];
+  const ours = managed ? preamble(next) : [];
+  const paired = new Set<Section>([...stale.slice(0, ours.length), ...ours.slice(0, stale.length)]);
+  const used = new Set<Section>(ours);
+  const replaced: string[] = [], kept: string[] = [], added: string[] = [], dropped: string[] = [];
+  const merged: Section[] = [];
+  for (const [i, s] of now.entries()) {
+    if (movedReceipt && s.key === "receipt") { replaced.push(s.label); continue; }
+    if (movedReceipt && now[i - 1]?.key === "receipt" && s.key.startsWith("text:") && !s.text.trim()) continue;
+    if (stale.includes(s)) {
+      const line = s.text.trim().split(/\r?\n/)[0]!;
+      if (paired.has(s)) replaced.push(s.label);
+      else if (scan(line).findings.length) dropped.push(`${s.label} (first line withheld: the redaction scan flagged it)`);
+      else dropped.push(`${s.label} ("${line.length > 60 ? line.slice(0, 59).trimEnd() + "…" : line}")`);
+      continue;
+    }
+    const match = s.key === "unclosed-receipt" ? undefined : next.find(n => !used.has(n) && n.key === s.key);
+    if (!match) { if (s.text.trim()) kept.push(s.label); merged.push(s); continue; }
+    used.add(match); replaced.push(s.label); merged.push(match);
+  }
+  const fresh = next.filter(n => !used.has(n));
+  for (const n of next) if (fresh.includes(n) || (ours.includes(n) && !paired.has(n))) added.push(n.label);
+  const badge = (s: Section) => s.key === "badge:capy-badge";
+  const first = fresh.filter(n => !n.key.startsWith("h2:") && !badge(n) && !isNotes(n));
+  if (now.length === 0) return { body: incoming, replaced, kept, added, dropped };
+  const lead = merged[0]?.key === "text:lead" && merged[0].text.trim() ? 1 : 0;
+  const tail = merged.length && badge(merged.at(-1)!) ? merged.length - 1 : merged.length;
+  const all = [...merged.slice(0, lead), ...first, ...merged.slice(lead, tail), ...fresh.filter(n => n.key.startsWith("h2:")), ...merged.slice(tail), ...fresh.filter(badge)];
+  for (const t of [...ours].reverse()) all.splice(all.indexOf(next[next.indexOf(t) - 1]!) + 1, 0, t);
+  const sectionNotes = [...all, ...fresh.filter(isNotes)].filter((s, i, list) => isNotes(s) || (s.key.startsWith("text:") && !s.text.trim() && isNotes(list[i - 1])));
+  const rest = all.filter(s => !sectionNotes.includes(s));
+  const badges = rest.length && badge(rest.at(-1)!) ? rest.splice(rest.findLastIndex(s => !badge(s)) + 1) : [];
+  all.splice(0, all.length, ...rest, ...sectionNotes, ...badges);
+  const fromFile = (s: Section) => next.includes(s);
+  const body = all.map((s, i) => {
+    const after = all[i + 1];
+    if (!after) return s.text;
+    const seam = (fromFile(s) || fromFile(after)) && s.text.trim() !== "" && !/^\r?\n/.test(after.text);
+    return seam ? s.text.replace(/\n*$/, "\n\n") : s.text.endsWith("\n") ? s.text : s.text + "\n";
+  }).join("");
+  return { body, replaced, kept, added, dropped };
+}
+
+/** The PR's current body for a merge; GitHub's `--jq .body` prints it raw, GitLab's JSON carries `description`. */
+function currentBody(env: PostEnv, kind: HostKind, n: string): { body: string } | { error: string } {
+  const r = kind === "github" ? env.run("gh", ["pr", "view", n, "--json", "body", "--jq", ".body"]) : env.run("glab", ["mr", "view", n, "--output", "json"]);
+  if (r.status !== 0) return { error: r.stderr.trim() || `exit ${r.status}` };
+  if (kind === "github") return { body: r.stdout.replace(/\r?\n$/, "") };
+  if (!r.stdout.trim()) return { body: "" };
+  try { return { body: String(JSON.parse(r.stdout).description ?? "") }; } catch { return { error: "glab returned no JSON" }; }
 }
 
 interface Remote { host: string; segments: string[]; kind: HostKind }
@@ -198,13 +437,131 @@ function visibility(env: PostEnv, req: Request, kind: HostKind, configBin: strin
 type Part = "title" | "body";
 interface Located { part: Part; finding: Finding }
 
-function scanParts(parts: Array<[Part, string]>, vis: RepoVisibility, selfEmail: string | undefined) {
+/**
+ * The repository's own four-part release versions: the root VERSION file's
+ * value and every version in a root CHANGELOG.md release heading, read with
+ * the same parser gstack-restamp uses (`## [1.2.3.4]`, `## v1.2.3.4`, an
+ * optional `- date`; a heading that only mentions a quad is not one). A
+ * four-part version is byte-for-byte a dotted quad, and `1.91.191.0` is a
+ * public address, so "(1.91.191.0)" in a PR body raised pii.ip_public
+ * (MEDIUM), which an unattended /ship cannot confirm. The engine's own version
+ * exemption reads only the declaration right before the span, so prose that
+ * merely names a release gets no help from it. These exact strings are
+ * allowlisted for the scan wherever they appear (the allowlist is exact-string
+ * and context-free, so `host: <released quad>` is exempt too, a trade the
+ * repo's own release set is small enough to carry); any other dotted quad
+ * (8.8.8.8, 203.0.113.7, a version this repo never released) still reports.
+ * The files are read from the checked-out tree, so a branch that adds a
+ * four-part heading widens the set for posts made from that checkout.
+ */
+function repoReleaseVersions(env: PostEnv): string[] {
+  const top = env.run("git", ["rev-parse", "--show-toplevel"]);
+  const root = top.status === 0 ? top.stdout.trim() : "";
+  if (!root) return [];
+  const read = (name: string) => { try { return env.readFile(`${root}/${name}`); } catch { return ""; } };
+  const versions = new Set<string>();
+  const current = read("VERSION").trim();
+  if (versionWidth(current) === 4) versions.add(current);
+  for (const s of parseChangelog(read("CHANGELOG.md")).sections) if (s.version && versionWidth(s.version) === 4) versions.add(s.version);
+  return [...versions];
+}
+
+/** Between two 11-digit tokens of one list: `, `, ` and `, ` & `, ` or `, ` / `, with an optional `(#1234)` after the first. */
+const RUN_ID_CHAIN = /^(?:\s*\(#\d+\))?\s*(?:,|and|&|or|\/)\s*$/i;
+
+/**
+ * All-digit identifiers a ship receipt or a CI report names, which
+ * pii.phone.e164 reads as phone numbers: a 12-hex receipt sha that happens to
+ * be all digits (`tree=704992822996`, `tree 704992822996`, and the receipt's
+ * `head=`, `gated_tree=` and `predecessor=` keys), an 11-digit GitHub Actions
+ * run id inside an /actions/runs/ URL (the engine already exempts the URL
+ * itself; this covers its link text), and an 11-digit run id right after a run
+ * word on the same line (run, runs, screen, screens, gate, gates, backstop,
+ * bisect, rerun, dispatched, dispatch, failed, passed, with an optional ':'
+ * '#' '=' between: `failed 40269992077`, `gate 40323989742`,
+ * `run #19368712345`; the engine's isCiRunIdentifier exempts that position on
+ * its own since the run-id fix for approval records, and the same regex drives
+ * the chain below; generic words such as id, job, attempt and workflow
+ * exempt nothing, since `customer id 14155551234` is a number), plus every 11-digit id chained
+ * after an allowlisted one through ", ", " and ", " & ", " or " or " / ",
+ * optionally with a "(#1234)" between (`screen 40269992077 (#3434) and
+ * 40275443393 (#3453)`). Only the exact tokens found in those positions are
+ * allowlisted, so a bare 11-digit number, a 10-digit national number and an
+ * E.164 `+14155551234` still report.
+ */
+function receiptDigitTokens(texts: string[]): string[] {
+  const tokens = new Set<string>();
+  for (const text of texts) {
+    for (const m of text.matchAll(/(?:^|[^\w])(?:tree|gated_tree|head|predecessor)[= ](\d{12})\b/g)) tokens.add(m[1]!);
+    for (const m of text.matchAll(/\/actions\/runs\/(\d{11})\b/g)) tokens.add(m[1]!);
+    for (const line of text.split("\n")) {
+      let chainFrom = -1;
+      for (const m of line.matchAll(/(?<![\d+])\d{11}(?!\d)/g)) {
+        const at = m.index!;
+        const listed = CI_RUN_WORD_BEFORE.test(line.slice(0, at)) || (chainFrom >= 0 && RUN_ID_CHAIN.test(line.slice(chainFrom, at)));
+        if (listed) tokens.add(m[0]);
+        chainFrom = listed ? at + m[0].length : -1;
+      }
+    }
+  }
+  return [...tokens];
+}
+
+/**
+ * Where a ship receipt's run-id fields hold GitHub Actions run ids, which pii.phone.e164 reads as phone numbers
+ * (GST-2047): the 1-based line and column span of each ci_carried[].run, flaky_exception[].runs[] and
+ * issues.flakes[].run value that is a run id (11 to 20 digits, with an optional /attempt), bounded to that value, in
+ * every closed ```gstack-ship-receipt``` block whose JSON passes the receipt schema and is byte-identical to
+ * renderReceiptBlock's rendering of it. Only the receipt writer's own output qualifies, so a
+ * hand-written, schema-invalid, malformed or unclosed block exempts nothing, and the same number in prose, beside the
+ * block or under any other key still reports.
+ */
+function receiptRunIdSpans(text: string): Array<{ line: number; from: number; to: number }> {
+  const lines = text.split("\n");
+  const rows = (v: unknown): number => v !== null && typeof v === "object" && Object.keys(v).length ? 2 + Object.values(v).reduce((n: number, c) => n + rows(c), 0) : 1;
+  const spans: Array<{ line: number; from: number; to: number }> = [];
+  for (let open = 0; open < lines.length; open++) {
+    if (lines[open] !== "```" + RECEIPT_FENCE) continue;
+    const close = lines.indexOf("```", open + 1);
+    if (close < 0) break;
+    const raw = lines.slice(open + 1, close).join("\n");
+    let receipt: ShipReceipt;
+    try { receipt = JSON.parse(raw); } catch { continue; }
+    if (validateReceipt(receipt).length || renderReceiptBlock(receipt) !== "```" + RECEIPT_FENCE + "\n" + raw + "\n```\n") continue;
+    const span = (path: Array<string | number>) => {
+      let at = open + 1;
+      let v: any = receipt;
+      for (const key of path) {
+        at++;
+        for (const [k, c] of Object.entries(v)) { if (k === String(key)) break; at += rows(c); }
+        v = v[key];
+      }
+      if (!/^\d{11,20}(?:\/\d{1,4})?$/.test(typeof v === "number" ? String(v) : typeof v === "string" ? v : "")) return;
+      const t = lines[at]!;
+      const key = path.at(-1);
+      const from = t.length - t.trimStart().length + (typeof key === "string" ? JSON.stringify(key).length + 2 : 0) + 1;
+      spans.push({ line: at + 1, from, to: from + JSON.stringify(v).length - 1 });
+    };
+    receipt.ci_carried?.forEach((_, i) => span(["ci_carried", i, "run"]));
+    receipt.flaky_exception?.forEach((e, i) => e.runs.forEach((_, j) => span(["flaky_exception", i, "runs", j])));
+    receipt.issues?.flakes?.forEach((_, i) => span(["issues", "flakes", i, "run"]));
+    open = close;
+  }
+  return spans;
+}
+
+function scanParts(parts: Array<[Part, string]>, vis: RepoVisibility, selfEmail: string | undefined, releaseVersions: string[]) {
   const found: Located[] = [];
   let oversize = false;
+  const allowlist = [...releaseVersions, ...receiptDigitTokens(parts.map(([, text]) => text))];
   for (const [part, text] of parts) {
-    const result = scan(text, { repoVisibility: vis, ...(selfEmail ? { selfEmail } : {}) });
+    const result = scan(text, { repoVisibility: vis, allowlist, ...(selfEmail ? { selfEmail } : {}) });
     oversize ||= result.oversize;
-    for (const finding of result.findings) found.push({ part, finding });
+    const runIds = result.findings.some(f => f.id === "pii.phone.e164") ? receiptRunIdSpans(text) : [];
+    for (const finding of result.findings) {
+      if (finding.id === "pii.phone.e164" && runIds.some(s => s.line === finding.line && s.from <= finding.col && finding.col <= s.to)) continue;
+      found.push({ part, finding });
+    }
   }
   return { found, oversize };
 }
@@ -281,8 +638,30 @@ function send(env: PostEnv, kind: HostKind, req: Request, n: string | undefined,
     }
   }
   if (r.stdout.trim()) env.out(r.stdout.endsWith("\n") ? r.stdout : r.stdout + "\n");
-  env.out(`POSTED: ${req.op}${n ? ` ${n}` : ""}\n`);
+  env.out(`POSTED: ${req.op}${n ? ` ${n}` : ""}${req.attribute ? ` (attributed: ${req.attribute})` : ""}\n`);
   return EXIT.posted;
+}
+
+/**
+ * The plain-title check (R76, lib/plain-title.ts) against the checkout's `.gstack/plain-titles.json`: true when the
+ * title passes or the repository has no policy. A finding prints one `PLAIN_TITLE:` line each, in gstack-plain-title's
+ * format, then `PLAIN_TITLE: refused=<n>`; an invalid policy refuses too, so nothing is posted until it is fixed.
+ */
+function plainTitle(env: PostEnv, title: string): boolean {
+  const top = env.run("git", ["rev-parse", "--show-toplevel"]);
+  const root = top.status === 0 ? top.stdout.trim() : "";
+  if (!root) return true;
+  let findings;
+  try { findings = checkTitle(title, loadPlainTitlePolicy(root)); } catch (e) {
+    env.err(`gstack-post: ${e instanceof Error ? e.message : String(e)} (PLAIN_POLICY_INVALID); nothing was posted. Fix the policy (gstack-plain-title validate), then rerun.\n`);
+    return false;
+  }
+  if (!findings.length) return true;
+  const clean = (s: string) => s.replace(/[\u0000-\u001f\u007f"]/g, " ").slice(0, 80);
+  for (const f of findings) env.out(`PLAIN_TITLE: ${f.code} ${f.kind} "${clean(f.match)}" — ${f.hint}\n`);
+  env.out(`PLAIN_TITLE: refused=${findings.length}\n`);
+  env.err("gstack-post: the title is not in plain words; nothing was posted. Rewrite the title file so its front says what changed for a gstack user (one trailing issue code like (GST-1713) is fine), then rerun.\n");
+  return false;
 }
 
 export function runPost(argv: string[], env: PostEnv, configBin = "gstack-config"): number {
@@ -296,16 +675,34 @@ export function runPost(argv: string[], env: PostEnv, configBin = "gstack-config
     if (req.op === "reply" && remote.kind !== "github") throw new UsageError("reply is supported on GitHub only");
     const n = req.target === undefined ? undefined : targetNumber(req.target, req.op, remote);
     const title = req.titleFile ? readText(env, req.titleFile, "title") : undefined;
-    const body = req.bodyFile ? readText(env, req.bodyFile, "body") : undefined;
+    if (title !== undefined && (req.op === "pr-title" || req.op === "pr-create") && !plainTitle(env, title)) return EXIT.plainTitle;
+    let body = req.bodyFile ? readText(env, req.bodyFile, "body") : undefined;
+    if (req.op === "pr-body" && !req.replace) {
+      const current = currentBody(env, remote.kind, n!);
+      if ("error" in current) {
+        env.err(`gstack-post: cannot read PR ${n}'s current body to merge into (${current.error}); nothing was posted. Rerun with --replace to overwrite the whole body.\n`);
+        return EXIT.cliFailed;
+      }
+      const m = mergeBodySections(current.body, body!);
+      body = m.body;
+      const list = (names: string[]) => (names.length ? names.join(", ") : "none");
+      env.err(`gstack-post: pr-body merged by section: replaced ${list(m.replaced)}; kept ${list(m.kept)}; added ${list(m.added)}${m.dropped.length ? `; dropped ${m.dropped.join(", ")}` : ""}\n`);
+    }
+    if (body !== undefined && req.attribute) body = attributionCallout(req.attribute) + body;
     const parts: Array<[Part, string]> = [];
     if (title !== undefined) parts.push(["title", title]);
     if (body !== undefined) parts.push(["body", body]);
 
     const vis = visibility(env, req, remote.kind, configBin);
     const email = env.run("git", ["config", "user.email"]);
-    const { found, oversize } = scanParts(parts, vis, email.status === 0 ? email.stdout.trim() || undefined : undefined);
+    const hasQuad = parts.some(([, text]) => /\b\d{1,3}(?:\.\d{1,3}){3}\b/.test(text));
+    const { found, oversize } = scanParts(parts, vis, email.status === 0 ? email.stdout.trim() || undefined : undefined, hasQuad ? repoReleaseVersions(env) : []);
     env.out(`REPO_VISIBILITY: ${vis}\n`);
-    const line = (m: Located) => `RULE: ${m.finding.id} LINE: ${m.finding.line} PART: ${m.part}\n`;
+    const calloutLines = req.attribute ? attributionCallout(req.attribute).split("\n").length - 1 : 0;
+    const line = (m: Located) => {
+      if (m.part === "body" && m.finding.line <= calloutLines) return `RULE: ${m.finding.id} LINE: 1 PART: attribute\n`;
+      return `RULE: ${m.finding.id} LINE: ${m.part === "body" ? m.finding.line - calloutLines : m.finding.line} PART: ${m.part}\n`;
+    };
     const high = found.filter(m => m.finding.severity === "HIGH");
     if (oversize || high.length) {
       for (const m of high) env.out(`HIGH ${line(m)}`);
@@ -318,7 +715,7 @@ export function runPost(argv: string[], env: PostEnv, configBin = "gstack-config
     const medium = found.filter(m => m.finding.severity === "MEDIUM");
     if (medium.length) {
       const token = confirmationToken(
-        { op: req.op, host: remote.kind, repo: [remote.host, ...remote.segments].join("/"), target: n ?? null, to: req.to ?? null, base: req.base ?? null, head: req.head ?? null, draft: req.draft },
+        { op: req.op, host: remote.kind, repo: [remote.host, ...remote.segments].join("/"), target: n ?? null, to: req.to ?? null, base: req.base ?? null, head: req.head ?? null, draft: req.draft, attribute: req.attribute ?? null },
         parts, medium);
       if (req.confirm !== token) {
         for (const m of medium) env.out(line(m));

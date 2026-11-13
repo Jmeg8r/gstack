@@ -61,6 +61,8 @@ export interface SkillTestResult {
   tokenUsage?: CodexTokenUsage;
   /** Codex host: false when the session completed no turn or its model has no price row. */
   costKnown?: boolean;
+  /** runSkillTest's testName: the registered case id the session ledger names, which recordE2E binds the record's cost to. */
+  testName?: string;
 }
 
 /** Local default startup grace: 90s covers observed API queue latency
@@ -88,6 +90,47 @@ export function scanBrowseErrors(text: string): string[] {
     const match = text.match(pattern);
     return match ? [match[0].slice(0, 200)] : [];
   });
+}
+
+/**
+ * True when a Bash `goto` reached exactly this URL: it printed browse's success line for the URL with a 2xx status, or
+ * it sent its stdout to /dev/null (`$B goto "<url>" >/dev/null && $B html`) and the call proves it exited 0. That proof
+ * is a call that did not fail (no leading `Exit code N` or tool error, no `Error` or `net::ERR_` line) where no `||`
+ * directly before the goto's pipeline could skip it and every command after the goto is joined by `&&`, so none of them ran
+ * unless it succeeded. Only a file:// URL qualifies: goto exits 0 on any HTTP status, so exit 0 proves no 2xx load of
+ * an http URL. The goto's target must be the URL
+ * itself, or `$PWD`/`${PWD}` under a known working directory (`cwd`, followed through literal `cd <path>` commands in
+ * call order; any other `cd` makes it unknown). The goto must be the segment's own browse command (`$B goto`,
+ * `${B} goto` or `<path>/browse goto`), not text inside another command.
+ */
+export function browseNavigatedTo(toolCalls: Array<{ tool: string; input: any; output: string }>, url: string, cwd?: string): boolean {
+  let pwd = cwd;
+  for (const call of toolCalls) {
+    if (call.tool !== 'Bash') continue;
+    const command = String(call.input?.command ?? '');
+    const output = String(call.output ?? '');
+    if (/\bgoto\b/.test(command) && output.split('\n').some(line => {
+      const match = line.trim().match(/^Navigated to (\S+) \((\d+)\)$/);
+      return match?.[1] === url && match[2]!.startsWith('2');
+    })) return true;
+    const failed = /^\s*(?:Exit code [1-9]|<tool_use_error>)/.test(output) || /^\s*Error\b|net::ERR_/m.test(output);
+    const parts = command.replace(/\\\n/g, ' ').replace(/(&&|\|\|)\s*\n/g, '$1 ').trim().split(/(&&|\|\||(?<![>&])&(?![>&])|[;|\n])/);
+    for (let i = 0; i < parts.length; i += 2) {
+      const segment = parts[i]!.trim();
+      const cd = segment.match(/^cd\s+(\S+)$/);
+      if (cd) pwd = /^\/[^$`'"]*$/.test(cd[1]!) ? cd[1] : undefined;
+      const goto = segment.match(/^(?:\w+=\S*\s+)*(?:"?\$\{?B\}?"?|\S*\bbrowse)\s+goto\s+("[^"]*"|'[^']*'|[^\s'"]+)(.*)$/);
+      if (failed || !goto || !url.startsWith('file://') || !/(?:^|\s)(?:1?>|&>)\s*\/dev\/null(?:\s|$)/.test(goto[2]!)) continue;
+      if (parts.slice(i + 1).some((separator, j) => j % 2 === 0 && separator !== '&&')) continue;
+      const before = parts.slice(0, i).filter((_, j) => j % 2 === 1);
+      if (before[before.findLastIndex(separator => separator !== '|')] === '||') continue;
+      const raw = goto[1]!;
+      const target = raw.startsWith("'") ? raw.slice(1, -1)
+        : (raw.startsWith('"') ? raw.slice(1, -1) : raw).replace(/\$\{PWD\}|\$PWD\b/g, () => pwd ?? '\u0000');
+      if (target === url) return true;
+    }
+  }
+  return false;
 }
 
 // --- Testable NDJSON parser ---
@@ -741,5 +784,5 @@ Before source Reads, use Bash to run exactly \`date -u +%Y-%m-%dT%H:%M:%SZ\`. Af
     turnsUsed,
   };
 
-  return { toolCalls, browseErrors, exitReason, duration, output: resultLine?.result || '', costEstimate, transcript, model, firstResponseMs, maxInterTurnMs };
+  return { toolCalls, browseErrors, exitReason, duration, output: resultLine?.result || '', costEstimate, transcript, model, firstResponseMs, maxInterTurnMs, ...(testName ? { testName } : {}) };
 }

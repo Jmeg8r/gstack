@@ -195,9 +195,29 @@ fallback; unknown files get 99th-percentile pessimism, and both full-suite and
 the long pole. Packed
 shards get duration-aware walls (`max(base, predicted × 3, files × 5s)`). The
 legacy `--shards N --shard i` path keeps stable hash indices. Required CI uses
-one duration-packed `--ci-plan`, 20 ordinary `--ci-run` shards plus a separate
+one duration-packed `--ci-plan`, 10 ordinary `--ci-run` shards plus a separate
 exclusive-fixture shard, and a `--ci-verify` aggregate. CI shards still run on
-independent machines without ordering unrelated jobs. The public
+independent machines without ordering unrelated jobs. Three workflow-level
+constants in `free-tests.yml` set that size for every event: `FREE_SUITE_RUNNER`
+(`ubicloud-standard-8`), `FREE_SUITE_SHARDS` (`'10'`) and `FREE_SUITE_JOBS`
+(`'4'`, the [sub-shards](#sub-shards-inside-one-ci-job) each shard runs side by
+side), which `free-plan` resolves into the shards' runner, shard count and plan.
+GSTA-203 chose them by a 3-run A/B against 20 × `ubicloud-standard-4` at k = 1
+(the PR that set them has the table). A `workflow_dispatch` run may
+override them with `free_runner` (`ubicloud-standard-2`, `-4` or `-8`),
+`free_shards` (1–40) and `free_jobs` (1–8) for runner-sizing experiments only;
+its job summary says so, and it is never cited as a PR or train Free Tests result.
+Each `free-suite` job's GitHub timeout comes from the plan, not a fixed number
+(#3850): `--ci-plan --job-setup-seconds $FREE_SUITE_SETUP_SECONDS` emits every
+shard's `timeout_minutes` as the shard's runner wall (the packed wall above),
+plus the flaky-retry pass's wall (at most 5 files, so the 6-minute base), plus
+the job's setup and teardown (`ciShardJobTimeoutMinutes`). So GitHub never kills
+a hung file before the runner names it and retries it. A shard that would need
+more than 90 minutes fails the plan with `FREE_JOB_TIMEOUT_OVER_CAP`; plan more
+shards or a higher k instead. The plan step prints the emitted timeouts and adds
+them to its job summary. Each shard prints
+`RESOURCES: peak_used_mib=… min_free_disk_mib=… samples=…` from a memory and
+disk sample every 2 seconds, even when the suite fails. The public
 `TREE_MUTATING` map now classifies exclusive host-state fixtures; its sole
 entry is `test/bootstrap-retention.test.ts`, whose same-UID nondumpable actors
 affect host-wide procfs permission checks. Locally, this file runs only after
@@ -303,14 +323,10 @@ changes are explicitly deferred, not counted as PR passes. Weekly/manual runs of
 `evals-periodic.yml` execute both complete censuses fresh; manual `evals.yml`
 runs the broad gate. This deliberately moves some defect detection later.
 
-`scripts/eval-input-cache.ts` accepts only complete, clean, first-attempt passes
-with matching before/after inputs. The audited workflow-judge adapter hashes the
-actual expanded prompt, source/fixture/rubric/runner closure, installed SDK,
-model parameters and runtime. Missing/unknown inputs force execution. Receipts
+`crew/scripts/eval-input-cache.ts` accepts only complete, clean, first-attempt passes
+with matching before/after inputs. Missing/unknown inputs force execution. Receipts
 are scoped to the same repository and PR, expire after 24 hours, and contain
-public scores and provenance rather than prompts or secrets. Of the 17 cases
-using `runWorkflowJudge`, 16 are eligible; the cookie workflow's custom input
-does not match the cache adapter and stays fresh, as do the other 11 quality cases.
+public scores and provenance rather than prompts or secrets.
 CI supplies the scoped cache/runtime configuration; local runs are fresh by
 default. Cached scores must
 pass current assertions; reused records retain their original source and time
@@ -435,7 +451,7 @@ and the kind fixes its trials before the run:
   non-JSON, a malformed field) fails the panel and is never resampled; a
   refusal counts as an unscored panel only when every sample refused.
   `callJudge`'s 429 backoff happens before any model output and is transport,
-  not a verdict retry. The workflow-judge cache stores whole panels only.
+  not a verdict retry.
   The `rule` case auq-matrix uses the same panel inside its one execution: each
   skill's single native capture has its recommendation substance scored by 3
   judge samples, gated on their median against the unchanged minimum of 4, and a
@@ -510,7 +526,7 @@ still reruns a case only once. A flaky GREEN binds as GREEN with its
 `flaky_cases` and is reusable by R2a and R2 (`reused_flaky`); a run still red
 after its rerun binds RED and is never reused. Train runs take the same
 `rerun-plan` path; a bisect reruns a VERDICT FAIL once on its prefix inside
-`scripts/train-gate.ts`, and a pass there is a flaky PASS naming both runs.
+`crew/scripts/train-gate.ts`, and a pass there is a flaky PASS naming both runs.
 
 ### Ship measure
 
@@ -640,11 +656,41 @@ this checkout to read it)`.
 samples, rationale}` entry per failing dimension (since EVAL_POLICY v3 `mean`
 holds the panel's gating median), each part capped at 200
 characters. `sessions[]` (at most 32) summarizes the trial's session-ledger
-rows. `cost_known: false` marks a record or trial whose harness captured no
-billing: PTY and Codex sessions never bill, and an SDK session bills only with a
-terminal `total_cost_usd`. An absent field means known. Census and marathon
-cost lines print the known sum and `N of M trial(s) cost unknown`, never a bare
-total over unknowns.
+rows. `cost_known: false` marks a record or trial whose cost is not fully
+known; an absent field means known. A record carries it when its harness
+captured no billing (a Codex session that completed no turn or whose model has
+no price row). A rule case's trial in the JUnit census (`caseCost` in
+`scripts/lib/paid-report.ts`) costs its records' sum plus what no record
+carries: each ledger session without a terminal result (`billed: false`) adds
+its `streamed_cost_usd`, and a trial with no record adds each billed session's
+own `cost_usd` (Codex). The trial is cost-unknown when any record says
+`cost_known: false`, when any of those sessions has no priced cost (a PTY
+session whose transcript does not price, a `claude -p` session that ended
+without a result, an aborted Agent SDK session with no usage or an unpriced
+model), or when it has neither records
+nor sessions. A case in `MODEL_FREE_CASES` (`timeline-event-flow`, which runs
+no model) with neither is a known $0. A panel trial (`behavior`, `judge`) from
+an isolated trial shard keeps the older rule (`trialCostKnown` in
+`test/helpers/eval-store.ts`): known only with at least one record and every
+session billed, and streamed cost is not added.
+
+Records are attributed to a case this way: a record named by the case id or
+carrying `case_id` is that case's, and a record named by a display label
+(`/qa fix loop`) is the shard's only case's when the shard ran one case. In a
+multi-case shard, a display-label record whose `runSkillTest` test name is a
+registered case id carries `cost_case_id` (`recordE2E`), and the census adds
+its cost to that case only: the failed record, failure class and model still
+come from the records named by case id, so no verdict changes. A display-label
+record without `cost_case_id` in a multi-case shard is not attributed rather
+than guessed, and its case is cost-unknown when nothing else prices it
+(`junitCensus`). The report's headline `cost $<x>` adds the streamed session
+cost no collector record carries, so a newly priced trial counts once.
+
+Census and marathon cost lines print the known sum and
+`N of M trial(s) cost unknown`, and a train verdict's `ATTEMPT:` line prints
+`cost=$<known> known + <n> of <m> case(s) cost unknown` when some but not
+every case in the train record has a cost (a record with no priced case prints
+no cost at all), never a bare total over unknowns.
 
 <a id="session-ledger"></a>
 **Session ledger.** Every runner (session-runner, the Agent SDK runner
@@ -652,13 +698,33 @@ including `runSharedInteractive`, the PTY session and `runRecordedCodexEval`)
 appends one best-effort line per armed session to
 `$GSTACK_EVAL_DIR/session-ledger.jsonl` (`test/helpers/session-ledger.ts`):
 a stable key `<runner>:<label>#n`, the exact `budget_ms` it armed, monotonic
-`elapsed_ms`, the `end` reason, sanitized evidence, `billed`, and a compact
+`elapsed_ms`, the `end` reason, sanitized evidence, `billed`, the billed
+`model`, `cost_usd` and token classes of a Codex session, and a compact
 liveness summary (longest in-request silence, the last event kind, any tool open
 at the end). `claude -p` sessions stream partial messages for this summary;
 transcripts keep their shape and size (full stream diagnostics only with
 `publicStreamDiagnostics`). A failed ledger write never fails a trial; a trial
 without ledger rows has no `sessions` and its headroom is `unknown`, never
-scored. The ledger rides in each slice artifact beside the shard results.
+scored. An Agent SDK session that ends without a terminal result (aborted,
+thrown) also records `streamed_cost_usd`: its streamed assistant usage priced
+by `streamedUsageCostUsd` (`lib/pricing.ts`), each message id once at its
+largest output, subagent turns included, `<synthetic>` messages skipped,
+5-minute cache writes at 1.25x and 1-hour writes at 2x the input rate. The
+field is absent when no message carries usage or any message's model has no
+price row, so an unpriced session stays cost-unknown, never $0. A PTY session
+records `streamed_cost_usd` from its transcript the same way. Both PTY ledger
+writers price `<CLAUDE_CONFIG_DIR>/projects/*/<id>.jsonl` plus
+`<id>/subagents/*.jsonl` (`test/helpers/pty/transcript-cost.ts`), where the
+id is the caller's `--session-id`, else the one transcript that appeared
+during this launch for its cwd. The launcher adds no argument. Pricing never
+takes the whole directory, because concurrent PTY tests in one process share
+one hermetic config dir; two new transcripts for one cwd are ambiguous and stay
+unknown. A non-hermetic or resumed launch, a caller that opts out
+(`priceTranscript: false`, the native AskUserQuestion capture, which never
+reads model transcripts), a missing transcript, no usage, an unpriced model or
+a read error leaves the field absent (cost-unknown), and a pricing failure
+never fails the test. The row keeps `billed: false`. The ledger rides in each slice
+artifact beside the shard results.
 
 **Quarantine** (`CASE_QUARANTINE`, same file). An entry needs: a per-trial rate
 below 95% over at least 10 post-policy trials of the case's current input
@@ -770,11 +836,16 @@ cleanup. No per-case budget grows. Overlay wrappers
 have a 1,830-second minimum shard wall and run without Bun retries; see the
 [overlay contract](OVERLAY_BENCHMARK_CONTRACT.md) for their unchanged work budget.
 
-The quality file reserves its whole-file wall (3,170 seconds) for every case run
-once, plus cleanup. Each still has 120 seconds of model work. Its 17 workflow
-judges own their deadline and abort signal, with five seconds for terminal
-recording inside a ten-second Bun grace; the other 11 retain their existing
-120-second Bun timeout. Late responses cannot create records or cache passes.
+When a judge's abort signal cancels its request, `callJudge`
+(`test/helpers/llm-judge.ts`) prints one `llm-judge-aborted` JSON line to
+stderr: elapsed time, wrapper `attempts` and `retryWaitsMs` (429 waits),
+`httpRequests` and `httpStatuses` (so SDK retries show), `connectedMs`,
+`firstEventMs` and `lastEventMs`, `bytesReceived` and `lastByteMs` (every body
+byte, pings included, so a silent socket differs from a model thinking on a live
+connection), the open `block` type, `thinkingChars` and
+`textChars`, `messageId`, `requestId` and the `reason` (at most 200
+characters). It holds counts and ids only, never content, and changes no
+request, score or verdict.
 
 The ship documentation file reserves 4,920 seconds for four 600-second cases and
 eight 300-second fault cases, run once, plus cleanup; in CI each case runs as its
@@ -921,8 +992,10 @@ paid test file, its fixtures and its skills' prompt files, including the
 generated SKILL.md) plus `HARNESS_VERSION`, keyed with model, Claude CLI version
 and policy version (`scripts/eval-trial-series.ts`). Each trial also records the
 full consumed-input fingerprint as provenance. `scripts/harness-version.json`
-pins every shared-harness file (`GLOBAL_TOUCHFILES` plus the session runners, the
-PTY harness, the e2e gate and the LLM judge) by blob hash. When
+holds the version and the harness patterns, and `scripts/harness-pins/<path>.json`
+pins each shared-harness file (`GLOBAL_TOUCHFILES` plus the session runners, the
+PTY harness, the e2e gate and the LLM judge) by blob hash, one file per pin, so
+two PRs that record decisions for different harness files never conflict. When
 `test/harness-version.test.ts` fails, run one of:
 
 ```bash
@@ -930,8 +1003,8 @@ bun run scripts/bump-harness-version.ts --non-behavioral "<why no verdict can ch
 bun run scripts/bump-harness-version.ts --bump "<what behavior changed>"                # new series for every case
 ```
 
-On a merge conflict in the manifest, take the higher version, then rerun the
-script.
+On a merge conflict in the manifest or a pin file, take the higher version, then
+rerun the script.
 
 ## Ubicloud VMs (`bun run test:ubicloud`)
 
@@ -959,23 +1032,74 @@ with `GSTACK_FREE_RETRY_FLAKY=0`.
 A stock Ubuntu 24.04 VM differs from a GitHub-hosted runner in three ways that
 the scripts correct: the login umask is `002` (group-writable directories fail
 the CSO private-state checks), AppArmor blocks the unprivileged user
-namespaces Chromium's sandbox needs, and `clang` and `python3-venv` are absent
-(required by the Dia readiness and Python runner tests).
+namespaces Chromium's sandbox needs, and `python3-venv` is absent (required by
+the Python runner tests).
 
-VMs are named `ubirun-<owner>-<epoch>-<hex>`; `<owner>` is `UBI_OWNER` (set it
-to the thread id on a Capy machine), else a stable per-machine id. Every exit
+VMs are named `ubirun-<owner>-<epoch>-<hex>`, plus a `-t<hours>` TTL suffix
+(below); `<owner>` is `UBI_OWNER` (the thread id on a Capy machine; lowercase
+letters and digits, at most 12), which `up`, `run` and `verify` require. Every exit
 path destroys the client's own VM (`trap` on EXIT, INT, TERM, HUP and QUIT), and
 `down` fails loudly (`FAILED to destroy <location>/<name> (HTTP <code>)`) unless
 the VM is confirmed gone. `list --mine` shows this owner's VMs, `usage` the
 project's, and `records` the VM-id scratch file (`UBI_VM_RECORD`, default
 `~/.capy/work/ubi-runner/vms.tsv`, else `<state root>/vms.tsv`): every VM is
 recorded there before the create call and forgotten only after a confirmed
-destroy, so a killed runner leaves a name to clean up. Nothing sweeps stale VMs
-by default, because the project quota is shared with other agents' runners; set
+destroy, so a killed runner leaves a name to clean up. `run` and `verify` end
+with `UBICLOUD: left=<0|1|unknown> owner=<o> vm=<name> others=<n>`, checked
+against the project's VM list after teardown; anything but `left=0` turns a
+passing command into exit 1. pregate-remote.sh reads that line from the file
+named by `UBI_LEFT_FILE`, never from the command's output. No owner-age sweep runs by default (the TTL reaper
+below covers this owner's expired VMs); set
 `UBI_GC_HOURS` to a positive number (or run `gc HOURS`; `gc 0` is a no-op) to
 sweep only this owner's VMs older than that. For other commands, use the runner
 directly: `scripts/ubicloud/ubi-runner.sh run --setup <script> -- '<command>'`,
 or its `up` / `ssh` / `sync` / `pull` / `down` steps (`--help` lists them).
+
+The runner is also the `/ubicloud` skill's engine (`bin/gstack-ubi` execs it).
+A generated name ends in `-t<hours>` (`UBI_TTL_HOURS`, 1-999, default 3; pregate-remote.sh
+uses its stop deadline plus 15 minutes, rounded up: `-t1` today), the creator's own statement of how long the VM may live: `reap`
+destroys only the caller's own VMs: its `ubirun-<UBI_OWNER>-*` names whose TTL
+ended more than ten minutes ago, and those without a TTL (older runner copies)
+once they are `UBI_LEGACY_HOURS` old (default 4). Another owner's VM and an
+untagged one are never reaped, even after their TTL ends; reap only counts them
+in its log, because cloud deletes stay with the owner that created the VM
+(GST-573). Every `up` runs it first (`UBI_REAP=0` skips it). Names outside the `ubirun-` prefix are never reaped. The
+quota preflight adds the size's vCPUs to the project's running VMs and refuses
+before the create request when that exceeds the known ceiling
+(`UBI_QUOTA_VCPUS`, or the maximum the last refusal printed, remembered in the
+state root; `UBI_QUOTA_WAIT=<seconds>` waits for room instead). When the usage read fails (`usage` exits 1 on an
+unreadable VM list or size and skips a VM that 404s), the preflight retries
+within `UBI_QUOTA_WAIT`, then logs and leaves the decision to the API. `run`, `verify`
+and `ssh NAME COMMAND` stream the remote output through a watchdog: a heartbeat
+line every `UBI_HEARTBEAT` seconds (300), and a command silent for
+`UBI_IDLE_TIMEOUT` seconds (1800) or older than `UBI_RUN_TIMEOUT` (0, unlimited)
+is killed with exit 124 and its last 40 lines on stderr, so a hung verify fails
+fast instead of holding the VM until its TTL. `verify` runs a repository's
+committed `.gstack/ubicloud.json` (setup, command, size, location, storage,
+image, env, pass, pull; flags and a trailing `-- COMMAND` override it) and
+refuses without the file, so every lane runs one definition. The file is
+repository content: its setup script and pull destinations must resolve inside
+`--src`, and a name it lists under `pass` is forwarded only when the command
+line grants it (`--pass NAME`, or all of them with `--trust-config`); `--pass`
+never forwards `UBICLOUD_*`. All of this is pinned offline in
+`test/ubicloud-runner*.test.ts` against a fake API and a fake `ssh`, including
+a fixture whose fake API creates, so `run` and `verify` execute end to end.
+
+`run` and `verify` start their setup, command and tier phases detached on the
+VM (output, leader pid and exit status in `~/.ubirun-<phase>.*`) and key each
+run locally before any VM exists (content tree, command, setup content, env,
+pass-value hashes, size, location, image, storage, origin/HEAD, the runner's
+own sha256). A rerun of the same command after the runner died reattaches to
+the live VM and continues from the first phase without an exit file
+(`UBI_ATTACH_BUSY` while another runner owns it, exit 125 `UBI_ATTACH_LOST`
+when the session left no status); HUP detaches (`UBI_DETACHED`, exit 129), INT
+and TERM still tear down. A `.gstack/ubicloud.json` with `tiers` records
+start/pass/fail per tier under `UBI_CHECKPOINT_DIR/<run key>/`, so a resume on
+a fresh VM reruns setup and only the tiers without a pass; `pregate-remote.sh`
+adds its tree and planned-set digest to the key, so a rerun of
+`gstack-pregate --stage tests --remote` reattaches and bills from the original
+`created_at`. The fake VM in `test/helpers/ubi-runner-fake-vm.ts` runs these phases
+for real in a directory.
 
 Under 8 cores (`gstack-doctor`'s `cores` row says so), run the full unit and
 E2E tiers on a remote gate: `gstack-config set test_backend ubicloud` records
@@ -985,6 +1109,12 @@ machine swap, in this order:
 1. `scripts/ubicloud/ubi-runner.sh records` and `list --mine`: a VM listed in
    the record but absent from the project is already gone (forget it); a VM
    in the project but not in the record belongs to another owner, leave it.
+   After a machine swap, `scripts/ubicloud/ubi-runner.sh recover` rebuilds the
+   state of every VM that `up` wrote a bundle for (`UBI_RECOVERY_DIR`; `--owner
+   OLD` adopts another owner's), so `pull` and `down NAME` work again. Run it
+   only once the creating machine is dead: it cannot tell a paused one. A VM
+   started with `--sink` pushes its own results, so they land even if no
+   controller survives.
 2. Watched background operations: a runner started under `gstack-detach` keeps
    its `### gstack-detach EXIT=<code> ###` sentinel in its log; a log without
    the sentinel after the VM is gone is an interrupted run, not a pass.
@@ -992,9 +1122,10 @@ machine swap, in this order:
    on the base and on the candidate from the same VM size and location, never
    one side local and the other remote.
 4. Profiling very large imports (a whole-repo ingest, the full free suite under
-   a profiler) is warned about before it starts: it holds the VM past
-   `UBI_GC_HOURS` and the sentinel arrives hours later; name the expected
-   duration in the thread before launching.
+   a profiler) is warned about before it starts: it holds the VM for hours, and
+   the same owner's next `up` or `reap` destroys it once its TTL (`UBI_TTL_HOURS`, default 3)
+   plus ten minutes has passed, so set `UBI_TTL_HOURS` above the expected
+   duration and name that duration in the thread before launching.
 
 ## Cloud sandboxes (Vercel / Conductor cloud workspaces)
 
@@ -1061,13 +1192,17 @@ PR selection (`scripts/test-pr-profile.ts`) classifies every changed file. A fil
 mapped by a paid case's touchfiles selects that case. These files are exempt and
 select nothing: docs, any non-paid `*.test.ts(x)`, `FREE_ONLY_PR_FILES` (the
 free and paid duration seeds, `scripts/ubicloud/**`, every workflow that runs no
-paid evals, and free-only tools), and the fixtures in `FREE_FIXTURES`
-(`test/helpers/free-fixtures-data.ts`, each fixture with its free consumers).
+paid evals, `captain/templates/**`, and free-only tools), the release metadata
+in `RELEASE_METADATA_FILES` (`NOTICE.md`, `LICENSE`, `licenses/**`), and the
+fixtures in `FREE_FIXTURES` (`test/helpers/free-fixtures-data.ts`, each fixture
+with its free consumers).
 Unmapped files under `DERIVABLE_PREFIXES` (bin/, lib/, scripts/, browse/,
 design/, make-pdf/, hosts/, extension/, model-overlays/, agents/, test/helpers/,
 capy/) are not unknown: `scripts/pr-dependencies.ts` derives the cases whose
 reference closure reaches them (`prCoverage.mode = dependents`), or reports that
-no paid case reaches them. The derivation scans the imports of every code file,
+no paid case reaches them. References to `modules/` data count too, so
+`modules/loadouts.json` takes the cases that reach its reader,
+`scripts/modules.ts`. The derivation scans the imports of every code file,
 including `#!`-shebang `.ts` files and extensionless Bun or Node scripts; if any
 import scan fails, every unmapped file restores the full gate (label **import
 scan failed**). `PR_FULL_GATE_FILES`, `PAID_WORKFLOW_FILES` (`evals.yml`,
@@ -1086,6 +1221,17 @@ list each unmapped file that caused a fallback with one of these labels:
 - **real unknown dependency**: a file outside the derivable directories that no
   list classifies (for example `ETHOS.md`); map it, exempt it, or derive its
   directory.
+
+Narrow screens (`gstack-ship-queue ready --screen` without `--broad`) and
+`eval:bg:pr` (`test:pr` defaults `EVALS_SCREEN_POLICY=narrow`) leave out a
+derived file whose closure reaches every gate case; the plan lists it as left to
+the train gate's full census, and that census runs those cases.
+`pull_request` runs, broad screens, `EVALS_SCREEN_POLICY=broad` and
+`--profile full` keep every derived dependent. Full-gate inputs and unknown files
+still restore the full gate on a narrow screen, except `setup`: no paid run
+executes it, so a narrow screen derives it like any other file
+(`NARROW_DERIVED_FULL_GATE_FILES`); every other policy keeps its full gate. The policy is in
+[ship-policy.md](ship-policy.md#run-a-merge-train).
 
 The fallback rate is a label, not the bill: a dependents run whose derived
 closure reaches every gate case costs about what a full-fallback run does.
@@ -1140,9 +1286,11 @@ observation never removes a command and a missing or empty artifact never erases
 one; removing a command is a reviewed edit. While the map is in shadow mode it
 changes no selection, so a PR that changes only the map selects no paid case.
 
-Dollar figures are lower bounds. Known cost excludes PTY trials, whose cost is
-unknown: about 39% of observed case runs in the committed map. The shadow block
-and `test:health` both say so.
+Dollar figures are lower bounds. Known cost excludes trials whose cost is
+unknown: about 39% of observed case runs in the committed map, mostly PTY
+trials recorded before PTY sessions were priced from their transcripts
+([Failure causes and details](#failure-causes)). The shadow block and
+`test:health` both say so.
 
 - **Shadow block:** `prCoverage.shadow` in the paid-plan manifest lists the gate
   cases the map would select, would drop and would add, a provenance line per
@@ -1184,7 +1332,7 @@ and `test:health` both say so.
 
 Passes and failures of single-trial shards are written as receipts at the
 execution boundary, so a cancelled run's finished work survives. The
-`recover-receipts` job runs `scripts/recover-receipts.ts` from the base ref with
+`recover-receipts` job runs `crew/scripts/recover-receipts.ts` from the base ref with
 `actions: read`: it merges the receipts of at most 5 completed, cancelled
 `evals.yml` runs of the same PR (oldest first, negatives before passes, so a newer
 FAIL blocks an older PASS) and hands the store to `plan-slices`, which keeps
@@ -1200,7 +1348,12 @@ GitHub-hosted restore never sees (until GSTA-48 every restore missed).
 **Readiness (R1).** Paid slices for a PR head start only when the PR has been
 quiet for the window (repository variable `EVALS_QUIET_MINUTES`, default 10,
 measured from the run's creation) and Free Tests has concluded success on the
-same head SHA. The `readiness` job (`scripts/eval-readiness.ts`) sleeps out the
+same head SHA, as GitHub's `pull_request` run or, for a head with none, as a
+`workflow_dispatch` run on the branch (the dispatch route of docs/ship-policy.md
+for a head whose only conflict with the base is the CHANGELOG, which gets no
+`pull_request` CI; the `pull_request` run built the merge ref, so it decides
+whenever it exists, a dispatched run decides only without one, and a red
+dispatched run blocks like any other, #3508). The `readiness` job (`scripts/eval-readiness.ts`) sleeps out the
 window with no API calls, since a newer push cancels the run anyway, then polls
 Free Tests every minute for up to 80 minutes. Free Tests red on the head fails
 the run without paid work; re-run Free Tests, then re-run this workflow (a
@@ -1208,7 +1361,10 @@ re-run keeps the creation time, so it does not wait out the window again). A
 head that is no longer the PR's head reports "superseded by <sha>" and plans
 nothing. Selection, trials and verdict rules do not change. Version Gate is not
 an input, so a stamp push waits only for its own Free Tests and always gets a
-gate. Dispatches (`eval:bg`, the census) never wait.
+gate. Dispatches (`eval:bg`, the census) never wait. Neither does a
+`pr-summary` run (a repository whose policy declares a train): it plans no paid
+slices, so `readiness` is skipped, the run ends with the screening summary, and
+a red Free Tests shows on Free Tests alone.
 
 **Verdict reuse (R2a restamp-only, R2 main moved; a gate edit).** A PR head
 reuses the verdict of the newest executed gate of the same PR instead of
@@ -1238,7 +1394,7 @@ reuse names its flaky cases. Then either:
 Finally this head's own plan must have the same selection fingerprint (cases,
 statuses, trial plans, profile), so a main move that changes what the PR gate
 selects runs the full gate. `recover-receipts` proposes the candidate from
-base-ref code (`scripts/gate-reuse.ts find`), `plan-slices` confirms the
+base-ref code (`crew/scripts/gate-reuse.ts find`), `plan-slices` confirms the
 selection, `eval-slices` is skipped, and the report and PR comment say
 `PASS (reused: restamp-only, R2a)` or `PASS (reused: main moved, R2)` with
 the reused run, its head, why, and the receipt digest or own-diff signature.
@@ -1257,7 +1413,7 @@ apply from the next push, because adding a label does not start `evals.yml`.
 
 ### Replay gate cost
 
-`bun run scripts/gate-cost-replay.ts --runs <id,...> [--since YYYY-MM-DD --until YYYY-MM-DD | --prs 3201,3202] [--json]`
+`bun run crew/scripts/gate-cost-replay.ts --runs <id,...> [--since YYYY-MM-DD --until YYYY-MM-DD | --prs 3201,3202] [--json]`
 measures the paid PR gate's bill from recorded artifacts, for free. `--runs`
 names complete full-gate runs; their `paid-slice-*` and `trial-outcomes`
 artifacts are downloaded read-only with `gh` into `.context/gate-cost-cache`
@@ -1283,10 +1439,10 @@ once and reused from there. It prints:
 Screening figures are labelled `screen-provisional`: the rule's preamble
 detector is a line-commonality heuristic, not T2's hunk classifier, so they
 stay heuristic until T2 lands. A `package.json` change that only moves the
-version is neither selected nor a canary trigger, and all 24 judges always run.
+version is neither selected nor a canary trigger.
 The selectors are this checkout's, so an old merge is replayed against today's
 maps. A shallow checkout says which `git fetch --shallow-since` to run. Logic:
-`lib/gate-cost.ts`; tests: `test/gate-cost.test.ts`.
+`crew/lib/gate-cost.ts`; tests: `crew/test/gate-cost.test.ts`.
 
 ## Free suite runner, judge reuse and engine skips
 
@@ -1309,11 +1465,9 @@ integration tests, the Aside contract pins, and the render-wrapper pins.
 `bun run test:pr` runs the selected short live behaviors and quality judges.
 It reports deferred broad coverage; unknown dependencies restore the full gate,
 and an unmapped prompt without registered coverage blocks planning. Full free
-acceptance and required PR checks must pass before publishing. CI can reuse the
-16 workflow-judge passes for 24 hours when their complete consumed inputs and
-runtime match; records preserve original provenance. The cookie workflow's custom
-input, the other 11 judge cases, dynamic agent tests, and local runs without
-scoped cache configuration stay fresh.
+acceptance and required PR checks must pass before publishing. The quality
+judges, dynamic agent tests, and local runs without scoped cache configuration
+stay fresh.
 Scheduled/manual full coverage and `test:release` always run fresh.
 See [testing policy](../CONTRIBUTING.md#test-tiers) for commands and measured targets.
 Anything that needs Aside
@@ -1331,10 +1485,13 @@ No free test may write the developer's real home. `scripts/lib/free-home-guard.t
 snapshots `~/.gstack`, `~/.claude`, `~/.codex`, `~/.agents` and `~/.config/gstack`
 (live session logs excluded) and fails the run when an entry changes.
 
-- A shard that runs alone (`--shard`, CI, the exclusive host-state shard, the
-  flaky retry) owns its window, so the failure names its files.
-- Full-suite shards run concurrently on one HOME and cannot tell whose write a
-  change was. The runner guards that whole phase once and names no shard.
+- A shard that runs alone (`--shard`, a CI shard at `--jobs 1` or its trailing
+  serial sub-shard, the exclusive host-state shard, the flaky retry) owns its
+  window, so the failure names its files.
+- Full-suite shards, and the parallel sub-shards of a CI shard at `--jobs k > 1`
+  ([sub-shards](#sub-shards-inside-one-ci-job)), run concurrently on one HOME and
+  cannot tell whose write a change was. The runner guards that whole phase once
+  and names no shard.
 - `bun run scripts/test-free-shards.ts --attribute-home` names the writer: it
   runs every file alone with a private HOME (browser cache and git identity
   still come from the real home) and reports each file that wrote a watched
@@ -1353,10 +1510,23 @@ Monday "Weekly test health" workflow (`bun run test:health --enforce`) reads
 main's ledgers through `scripts/lib/ci-history.ts` and fails when a file flakes
 in more than 5% of main free-tests runs over a window of at least 20 runs; a
 window thinner than 20 runs in the last 7 days widens to the newest 20 runs, and
-fewer than 20 runs is report-only. `bun run test:health flake-summary <dir>`
+fewer than 20 runs is report-only. A main push that reused its pull request's
+run ([CI reuse](pregate.md#ci-reuse)) ran no shards, so it stays out of the
+window and its denominator, and older runs take its place. Such a run has no
+artifacts and a green `reuse` job; checking that costs one job listing per
+run with no artifacts, at most 40 per read. Past that cap, or when a listing
+fails, the run counts as before and the report says so.
+`bun run test:health flake-summary <dir>`
 prints a run's ledgers as a table. A flaky file is fixed at source; the retry
 never masks it. `bun run eval:pass-rates` lists only the local ledger
 (`flakeLedgerPath()`, overridden by `GSTACK_FLAKE_LEDGER`).
+
+Other repositories get the same rule per test with `bin/gstack-flaky run`
+([docs/flaky.md](flaky.md)): it reads a JUnit report from any runner, reruns
+the command once when tests failed (counting only the runner's full green
+verdict), and writes `flaky-pass` and `rerun-fail` lines to its
+own ledger (`flake-ledger-junit.jsonl`, or `GSTACK_FLAKE_LEDGER_JUNIT`), kept apart
+from this file-level ledger.
 
 The aggregate job of `free-tests.yml` downloads every `flake-ledger-*` artifact
 of the run and appends `bun run scripts/test-health-report.ts flake-summary <dir>`
@@ -1384,7 +1554,16 @@ Free-suite flake rules:
   every shard child's `GIT_CONFIG_*` pairs as a backstop, so it covers fixtures
   that inherit the environment, and `bun run scripts/ship-measure.ts free
   --backend local` measures with that environment; a fixture with its own
-  replacement env never sees the backstop.
+  replacement env never sees the backstop. Neither does the receiving side of
+  a push to a local path: git's local transport drops `GIT_CONFIG_*` from the
+  `receive-pack` it starts, so every push into a fixture's bare origin still
+  leaves a detached maintenance run in that origin unless the origin's own
+  config turns it off (`maintenance.auto=false` and `gc.auto=0` on the bare
+  origin, as `test/helpers/pregate-fixture.ts` and
+  `test/helpers/restamp-fixture.ts` do). A fixture that clones such
+  an origin passes `--no-local` (`coordinatorClone` in
+  `test/helpers/ship-queue-fixture.ts`), so the clone reads it through git's
+  transport instead of copying `objects/` entry by entry.
 
 To reproduce a ledger entry, take the shard's exact file list from the CI run's
 `free-plan` artifact, then rerun it with the flaky retry off on a CI-mirrored VM:
@@ -1415,7 +1594,9 @@ refresh to a maintainer.
 
 - `--ci-plan` warns in the job summary, with the refresh command, when more than 5
   files are unseeded; it never fails a PR. `--ci-verify` lists shards that ran
-  longer than 1.5× their prediction and at least 30 seconds over.
+  longer than 1.5× their prediction and at least 30 seconds over. A shard split
+  by `--shard-jobs k` runs its k sub-shards in parallel, so its prediction is the
+  serial seed sum divided by k.
 - The weekly test-health run fails its enforced `unseeded-free-files` check
   ("stale seed: N unseeded file(s) > 5") when more than 5 free test files are
   missing from the seed, so contributors without Ubicloud access learn within a
@@ -1432,10 +1613,12 @@ refresh to a maintainer.
 - `free-durations-record.yml` (Mondays 04:00 UTC, before test-health, and on
   dispatch) records the Linux seed on `ubicloud-standard-8` with
   `scripts/ubicloud/setup-free-suite.sh` and the Windows seed through
-  `windows-free-tests.yml`'s `record_durations` path. When either recording adds
+  `windows-free-tests.yml`'s `record_durations` path. The recorder stays on
+  `ubicloud-standard-8` while the free-suite shards run on `FREE_SUITE_RUNNER`
+  (`ubicloud-standard-8`); both are Ubicloud standard runners. When either recording adds
   or drops a test file, it force-updates the `bot/free-duration-seeds` branch,
   opens or refreshes one seed PR whose body states the ratchet result, and
-  dispatches Free Tests, Windows Free Tests and Quality gate on it. Those
+  dispatches Free Tests, Windows Smoke and Quality gate on it. Those
   dispatched runs are the seed PR's checks, and Free Tests supplies the required
   `free-tests` check. GitHub holds the pull_request runs of a token-opened PR as
   "action required" until someone approves them. A file that fails while recording turns its
@@ -1447,10 +1630,187 @@ refresh to a maintainer.
   besides the bot's one refresh commit, later runs leave it alone. Only runs on
   `main` push the branch; a dispatch from another ref reports only.
 
+### Sub-shards inside one CI job
+
+`--ci-run <plan> --shard i --result <file> --jobs k` runs one planned CI shard as
+k sub-shards side by side on the same machine (`scripts/lib/shard-jobs.ts`). Each
+sub-shard is an ordinary free shard child: one `bun test` process, serial
+inside, with its own sandbox, process-group kill and log. Bun's worker
+`--parallel` mode is still not used (decision V3/D6 in
+`scripts/test-free-shards.ts`). Without `--jobs`, a shard runs at the plan's
+per-shard k (below); a shard with no planned k runs one child (`k = 1`).
+
+- Workflows set k in the plan, per shard: `--ci-plan <plan> --shards N
+  --shard-jobs k` stores `jobs = min(k, the shard's files that may run in
+  parallel)` on each shard, and only when that is above 1. The exclusive
+  host-state shard holds only `TREE_MUTATING` files, so it stays one child, and
+  a plan made at k = 1 is byte-identical to one made without `--shard-jobs`.
+  `--ci-run` runs the shard at the plan's k, and `--ci-verify` rejects any
+  shard result that ran at a different k. `free-tests.yml` reads k from
+  `FREE_SUITE_JOBS` and `windows-free-tests.yml` from `WINDOWS_FREE_JOBS`; the
+  `free_jobs` and `windows_jobs` dispatch inputs override them for experiments
+  only.
+- `--jobs` applies only to `--ci-run` and overrides the plan's k, for local
+  reproduction. It takes a positive whole number up to the shard's file count
+  (an empty shard takes 1); anything else stops with `FREE_JOBS_INVALID`, as
+  does a bad `--shard-jobs` or one without `--ci-plan`. `GSTACK_FREE_JOBS` sets
+  the local full-suite process count and never changes `--ci-run`.
+- Files are split into disjoint sub-shards packed by the duration seed. Each
+  sub-shard has an id (`<plan id prefix>:<shard>.<n>`) bound to its file list.
+  Files in `TREE_MUTATING` or `SLOW_UNDER_LOAD` run after the parallel
+  sub-shards settle, serially, in one trailing sub-shard.
+- The parallel phase uses the concurrent-phase real-home guard, the same one
+  full-suite mode uses; the serial sub-shard guards itself and names its files.
+- The CI shard keeps its k = 1 wall deadline: the parallel sub-shards get it,
+  and the serial sub-shard gets whatever is left of it, so k never extends a
+  deadline. The parent waits for every child to settle.
+- The parent merges every sub-shard result into the shard's one `outcome`
+  before the single flaky-retry pass, so the five-file retry cap stays per CI
+  shard. A missing, duplicate or incomplete sub-shard result fails the shard
+  with `FREE_SUBSHARD_REJECTED` and vetoes the retry. `--ci-verify` re-checks
+  the `jobs` and `subShards` records a `k > 1` result carries.
+- Sub-shard runs never write `scripts/free-test-durations.json`; only
+  `--record-durations` does, and only from one-file children.
+
+`FREE_SUBSHARD_TIMEOUT` means a sub-shard hit its wall at `k > 1`. The message
+names the file in flight, k, the runner and the CI run id, and prints a serial
+reproduce command. If the file passes serially, add it to `SLOW_UNDER_LOAD` in
+`scripts/lib/shard-jobs.ts` with that run id and a reason. Never raise the
+timeout. `SLOW_UNDER_LOAD` is empty today.
+
+The nightly Windows lane stays at `WINDOWS_FREE_JOBS: '1'`. In GSTA-203's A/B, k = 2
+made the slowest Windows shard faster, but two of three runs needed the flaky
+retry for file-lock cleanup errors (`EBUSY` in
+`browse/test/stealth-webdriver.test.ts` and a native fixture cleanup in
+`browse/test/cookie-import-native-job.test.ts`), which k = 1 never showed. Fix
+those cleanups before raising it.
+
+Every `--ci-run` result, at any k, records per-file test and `expect()` counts
+in `outcome.counts` (`tests`, `pass`, `fail`, `skip`, `todo`, `expects` per
+file, plus shard totals). They come from bun's JUnit reporter, which the runner
+writes into the shard sandbox; on the pinned Bun 1.4.2 it attributes both counts
+per file inside a multi-file child and leaves the console stream unchanged.
+`complete: false` (with a `problem`) means the report was missing or did not add
+up to bun's own test count. Counts are evidence for comparing k values; they
+never decide a verdict.
+
+### Trunk Dynamic CI (learning only)
+
+Since GST-1400, free-tests.yml has a `trunk-dynamic-ci` job ("Trunk Dynamic CI
+(learning only)") that runs Trunk's `trunk-io/dynamic-ci` action on every
+pull request from a branch in this repository. For each run, Trunk records
+whether it would have run or skipped `free-suite` and
+`macos-named-regressions`, and why. It is one verdict per job, so the ten
+free-suite shards share one verdict. The verdicts show up in the job summary,
+on the pull request's Dynamic CI tab and at app.trunk.io/dynamic-ci.
+
+Trunk keys verdicts by workflow file, so it answers only for jobs in the
+workflow that ran the action. So since GST-1847, the other costly pull-request
+workflows carry the same observer job, each named "Trunk Dynamic CI (learning
+only, <workflow>)":
+
+| Workflow | Observed jobs |
+|---|---|
+| `free-tests.yml` | `free-suite`, `macos-named-regressions` |
+| `windows-smoke.yml` | `windows-smoke` |
+| `windows-scoped-tests.yml` | `windows-scoped-shard` |
+| `windows-setup-e2e.yml` | `windows-setup`, `held-install-journey` |
+| `quality-gate.yml` | `quality` |
+| `evals.yml` | `build-image`, `eval-slices` |
+
+Everything below holds for every observer.
+
+It never skips anything. No job needs the observer, no condition reads its
+verdicts, and it exports no outputs. Switching Trunk to enforcement in its
+dashboard would still skip nothing, because nothing in its workflow reads
+the verdicts. Every test runs, and every required check keeps its name and
+its result. Merge evidence never reads Trunk: the `free-tests` aggregate,
+the CI reuse profile, `gstack-ci-carry`, the pregate, the train gate
+(evals.yml), the main backstop, the release gate and windows-smoke are
+unchanged.
+
+A Trunk problem never turns the run or any required check red. The action
+never fails its own step. The step also continues on error and has a 3-minute
+timeout, and the job continues on error, so the run's conclusion and the
+`free-tests` aggregate keep their own results. One case still shows red: if
+GitHub can't fetch the pinned action at "Set up job" (the action's repository
+or commit disappears), the observer's own check reports failure, and
+`gstack-ship-queue ready` counts every check at the head. Rerun it once;
+if it fails again, delete the job. Fork pull requests, pushes and dispatches
+skip the job. A missing token skips only its step, so the job still fetches
+the action. Its only secret is `TRUNK_API_TOKEN` (in free-tests.yml only it
+and the trunk-flaky-tests uploader, with `TRUNK_ORG_API_TOKEN`, see a secret;
+evals.yml's other jobs hold their own), so
+it checks out nothing and runs none of the pull request's code. It holds no GITHUB_TOKEN scopes (`permissions: {}`). At the
+pinned commit (`src/config.ts`, `src/changed-files.ts`), the action makes one
+network call: a request for verdicts to
+`api.trunk.io/v2/dynamic-ci/generate-plan`, at most 3 attempts with a
+30-second budget each. Telemetry is off. With no checkout and an empty
+`github-token`, the action sends no file list, and Trunk reads the diff itself
+through its GitHub App.
+`test/free-tests-workflow-wiring.test.ts`,
+`test/ci-reuse-workflow-wiring.test.ts` and
+`test/trunk-dynamic-ci-observers.test.ts` lock that shape in place.
+
+**Review date: one week after it merges (2026-11-12 if it merges on
+2026-11-05).** Compare Trunk's would-skip verdicts with what the jobs it
+would have skipped actually found, and look hardest at any would-skip on a run
+where that job failed. Leave out runs where the workflow itself skipped the
+observed job, because Trunk still records a verdict there but there is no
+result to compare it with: `reuse` skipping the Free Tests suite,
+`windows-scope` skipping the scoped-test and setup Windows jobs on a pull
+request that touches no Windows path (`windows-smoke` always runs), and `eval-slices` on pull-request pushes, which run evals.yml
+in its screening-summary mode and plan no slices.
+In free-tests.yml, Trunk's `required-check` vote treats both observed jobs as
+not required, because branch protection names the `free-tests` aggregate and
+not the jobs under it. But `free-tests` needs both jobs and every shard
+receipt, so discount that vote when you judge their would-skip rate. Any skip
+added there later also has to pass the aggregate's receipt check. Turning on
+skipping is a separate decision for Garry, made after that review.
+
+### Trunk Flaky Tests (detection only)
+
+Since GST-1859, every free-suite shard keeps bun's JUnit report from each of
+its children, the flaky retry included (`--junit-dir`), and the
+`trunk-flaky-tests` job uploads them, failures included, to the Trunk test
+collection `7yDVXXE3` ("gstack free suite") on same-repository pull requests
+and main pushes. Trunk flags a test as flaky when it fails and then passes on
+the same code, or keeps failing on main, and lists it under Flaky Tests at
+app.trunk.io/garry-tan. That job is detection only: quarantine is off in the
+uploader and in the collection, nothing skips a test, no job needs or reads it,
+and an upload failure can't turn a check red. A child killed at its wall
+timeout, or one that crashes, writes no report, so Trunk sees none of that
+child's results, its passing files included. Such a child also skips the
+flaky retry, so the flake ledger has no entry for it; the red shard result is
+the only record. The uploader job is the only one that sees
+`TRUNK_ORG_API_TOKEN` (Trunk's v1 organization token, which the uploader
+needs), and it checks out and runs nothing of the pull request's. The [flake
+ledger](#flake-ledger), its one-rerun rule and the daily flaky pass are
+unchanged and stay the source of record.
+`test/free-tests-workflow-wiring.test.ts` locks the job's shape.
+
 ### Windows free lane
 
-`windows-free-tests.yml` plans on Linux (`--windows-only --ci-plan --shards 6`),
-runs one strict serial shard per `windows-latest` job
+Windows has minimal support ([support tiers](support-tiers.md)). The required
+PR check is `windows-smoke.yml`: one `windows-latest` job runs `./setup`, starts
+the core skills, drives `/browse` on gstack's own browser, and runs the short
+test list in its last step, where each file's reason sits beside it.
+`test/windows-native-workflows.test.ts` keeps that list Windows-safe and fast.
+
+Windows checks run by path. `windows-scoped-tests.yml` (Windows Scoped Tests)
+runs on every PR, and when the diff touches path, file-name or process code (the
+filter is described at the top of the workflow), one `windows-latest` job runs
+the PR's changed test files that are in the curated subset below. Its
+`windows-scoped-tests` check passes when nothing is in scope, and a red run
+blocks its PR. `windows-setup-e2e.yml` skips its Windows jobs when the only
+install change is `package.json`'s version line. Both filters are pinned by
+`test/windows-path-scope-workflow.test.ts`. To rerun chosen Windows-safe files on
+a branch, dispatch `windows-scoped-tests.yml` with `-f files='<file> <file>'`.
+
+The full curated suite below runs nightly on main and on dispatch, never on a PR.
+`windows-free-tests.yml` plans on Linux (`--windows-only --ci-plan --shards 6
+--shard-jobs $WINDOWS_FREE_JOBS`), runs one strict serial shard per
+`windows-latest` job
 (`bun run test:windows --ci-run`), and verifies every shard receipt on Linux
 (`--windows-only --ci-verify`). Packing uses Windows-measured durations from
 `scripts/free-test-durations-windows.json`; the weekly
@@ -1465,11 +1825,25 @@ summary). Files a probe proved safe despite a `/tmp` literal are force-included
 `WINDOWS_CURATED_FLOOR`; when Windows-safe tests are deleted on purpose, lower it
 in the same PR with a reason.
 
-Native qualification campaigns (Windows cookie extraction, Windows launch
-diagnostics, Dia on macOS) run only on dispatch of `native-qualification.yml`:
+To see whether one test is in the subset, and why not when it is excluded:
 
 ```bash
-gh workflow run native-qualification.yml --ref <branch> -f mode=<cookie-native|windows-native-diagnostics|dia-native|dia-launch-comparison|dia-gui-readiness>
+bun run scripts/test-free-shards.ts --windows-only --list | grep test/<name>.test.ts
+```
+
+A test a content pattern excludes wrongly joins the subset through
+`KNOWN_WINDOWS_SAFE` (with its reason) or, for a `/tmp` literal a probe proved
+safe, `WINDOWS_PROBE_SAFE`. A test that fails on `windows-latest` for a reason
+the patterns cannot see (it expects the Linux-host lanes verdict, skips itself
+on win32, drives a POSIX signal path) leaves it through a
+`KNOWN_WINDOWS_INCOMPATIBLE` entry naming the reason; rerun `--list` to confirm
+the file moved.
+
+Native qualification campaigns (Windows cookie extraction, Windows launch
+diagnostics) run only on dispatch of `native-qualification.yml`:
+
+```bash
+gh workflow run native-qualification.yml --ref <branch> -f mode=<cookie-native|windows-native-diagnostics>
 ```
 
 ### Real-setup install fixture
@@ -1490,6 +1864,230 @@ Defaults are the product's; tests shrink them instead of waiting real time:
 the `recordGraceMs` option of `test/helpers/office-hours-attempt.ts` (default
 5000) and the `timeoutMs` argument of `clearCookieTargetStorage(page, origin,
 timeoutMs)` (default 15000).
+
+## Candidate-side blinding
+
+A paid case has two readers that must not know what the other knows: the
+candidate (the agent under test) must not know it is being graded, and the
+judge must not know which arm it is grading. `/eval-plan` Step 1c states the
+three rules a preregistration carries; this is what they mean for gstack's own
+fixtures.
+
+- **The candidate's view carries no eval word.** Nothing the candidate can read
+  (its working directory, file names, the task prompt, commit messages, the
+  environment) says `eval`, `test`, `judge`, `experiment`, `rubric`, `score`,
+  `compare`, `benchmark`, `candidate` or `arena`. The project's own `test/`
+  directory is exempt when the task is about those tests, and so is the skill
+  text an arm loads as its own instructions (a gstack SKILL.md and the ETHOS.md it
+  points at use these words freely); the rule governs what the case builds. The
+  hermetic home a case builds (`test/helpers/hermetic-env.ts`) is the boundary:
+  what is copied in is visible, what stays in the runner is not.
+- **Fixture roots are project-shaped.** A fixture the candidate works in is
+  named like the project it imitates, with the files that project would hold.
+  Runner-side fixtures (captured transcripts, judge calibration sets, census
+  reports) are never shown to a candidate and may keep descriptive names.
+- **The judge grades labels and reads, not claims.** A judge prompt names arms
+  `A` and `B`, never the model or run, and a chain-following dimension is scored
+  from the files the transcript shows the candidate opened, not from what the
+  candidate says it read.
+
+An audit on 2026-10-26 (GSTA-124) found these fixture directory names on the
+word list: `test/fixtures/arm-benchmark/` and its four children, `browse-judge/`,
+`cso-eval/`, `eval-history/`, `judge-calibration/` and its children, two shard
+names under `paid-report-census/` and the `test/` subdirectories of
+`state-matrix-6792/`. All of these are runner-side: no candidate's working
+directory is one of them. Candidate-visible gaps are in the temporary roots
+the harnesses create: `test/helpers/arm-benchmark-harness.ts` copied each fixture
+into `os.tmpdir()/arm-<fixture>-<arm>-*`, so the candidate's working directory was
+named after the arm rather than after a project (since GST-469 it is named after
+the task's project: `hike-booking-*`, `notes-api-*`, `receipts-*`);
+`test/skill-e2e-deploy.test.ts`
+runs the /benchmark case in `skill-e2e-benchmark-*`, a root that carries a listed
+word; `test/skill-e2e-test-value.test.ts` creates `skill-e2e-<id>-*` roots as the
+candidate's working directory, and two of its ids (`review-test-value`,
+`test-audit-report-only`) carry the word `test`; and `test/skill-e2e-health.test.ts`
+creates `gstack-health-eval-*`. That list comes from a scan of the `mkdtemp`
+prefixes in the e2e tests, not from a proof that no other root carries a listed
+word. The audit matched whole
+lower-case words in path components under `test/fixtures/`; a substring match
+(`factory-scorecard/`, `ios-qa/FixtureApp/Tests/`) was not counted. Renaming is a
+separate change with its own touchfile updates; the list is here so that change
+can be scoped.
+
+## Agent SDK system prompt
+
+An Agent SDK caller that leaves out `systemPrompt` doesn't get Claude Code's
+prompt. It gets the SDK's bare stub, and the stub drops the line that tells the
+model to run `/skill` through the Skill tool. A skill arm then never loads its
+skill, so a "no difference" result says nothing about the skill (FOUN-32 found
+this in another crew's null result).
+
+**Every caller says which prompt it uses.** `runAgentSdkTest` and every direct
+SDK `query()` call pass the Claude Code preset,
+`{ type: 'preset', preset: 'claude_code' }` (also exported as
+`CLAUDE_CODE_PRESET` from `test/helpers/sdk-system-prompt.ts`; an overlay arm
+adds `append`), or name why not: `{ type: 'sdk-default', reason }` for a stub
+provider or a connectivity probe, `{ type: 'custom', text, reason }` for an arm
+that replaces the prompt. The runner refuses a missing, empty, bare-string or
+unnamed prompt before it starts, and
+`test/sdk-system-prompt-tripwire.test.ts` scans test/ and scripts/ for the same
+mistake in free CI. Arms that compare loadouts, the no-gstack arm included,
+keep the same preset and differ only in what the arm loads.
+
+**Record it, and treat a null on the stub as a method bug.** Every eval report
+and results table names the prompt each arm ran under (`claude_code`,
+`claude_code + append`, or the named reason). A null or negative result from an
+arm that ran on the SDK default is FIX-METHOD under R48 ("Why null?"): fix the
+prompt and rerun before reading it as KEEP or CUT-CANDIDATE.
+
+## No-gstack arm
+
+Garry, 2026-10-31: "all of our head to head tests have to test no gstack from
+here so that that case is tested obviously Do it for science". A variant that
+beats another variant can still lose to the plain model, and only a no-gstack
+arm shows that.
+
+**Scope.** Every preregistered comparison where any arm loads gstack or another
+skill stack: review variants, preamble loadouts, skill diets scored by behavior
+evals, and model panels run under gstack or under another stack. The
+preregistration says which kind it is in `## Comparison`: `stack: loaded`, or
+`stack: none` with a `why:` line (a scorer calibration, for example, where no
+arm loads any skill text). `gstack-eval-plan prereg --check` refuses a loaded
+comparison without the arm (`PREREG_NO_GSTACK_ARM`).
+
+**How the arm is built.** One arm per model in the comparison, named
+`<model>#no-gstack` in the Arms section and listed on the `arms:` line of
+`## No-gstack arm`. Arm identities are `<model>[#<loadout>]` and are priced by
+the model, so the pilot reserves the no-gstack arm beside its variants under its
+own attempts. The arm gets:
+
+- the same model, settings, inputs, fixture and tools as the variants;
+- a plain prompt: the task text only, with no SKILL.md, preamble, hooks,
+  installed skills or routing lines from gstack or any other stack;
+- the same panel: the same `E2E_KINDS` kind and trial count, the same judge and
+  rubric, and the same blinding labels (the judge reads it as `A` or `B` like
+  any other arm, per [Candidate-side blinding](#candidate-side-blinding));
+- the same budget treatment: it is priced and reserved in the pilot like every
+  other arm.
+
+**Masking.** On Capy, the owner's user-scope instructions tell every session to
+load the user-drive gstack skill, and eval run agents inherit them: in one
+checkpoint (24 runs, 3 arms) every run in every arm tried to read that skill in
+its first minute. So `## No-gstack arm` also needs three lines, and `prereg
+--check` refuses a missing, blank or `none` one (`PREREG_NO_GSTACK_ARM`):
+
+- `masking:` an empty directory bind-mounted over `~/.capy/drive/user-garry-tan`
+  and `~/.capy/drive/org-gstack-gbrain` before the run agent starts, or a
+  container that sees no Capy drive;
+- `install:` no gstack on the arm's machine (`~/.local/share/gstack`,
+  `~/.claude/skills`), checked before the run;
+- `audit:` a per-arm audit of drive and skill reads.
+
+An arm that read a gstack skill file is contaminated and gets zero credit. A
+no-gstack result that ran before this rule without a mask is not evidence for
+an R48 verdict until it is re-checked; the evidence ledger records it under
+`prior` with `unmasked` ([docs/inventory.md](inventory.md)).
+
+**Reporting.** The no-gstack result is one row beside the variants in every
+results table and every verdict, including when it wins. A comparison that
+drops the row has not reported its result. `gstack-eval-plan results --check
+<prereg> <results.md>` enforces it: one table in the results file must hold a
+filled row for every Arms identity (`EVAL_REPORT_NO_GSTACK_ROW` otherwise), and
+no number is published before it passes.
+
+**Writing it up.** A results file, findings file or investigation write-up
+opens with two or three plain takeaways ("We learned X. You should do X."),
+what works first and what didn't right after, with its number; a null becomes
+the lesson its data supports. Run ids, ledgers and gate details go last. Cost
+appears only when it is part of the lesson, and datasets or tools are opened
+only with a stated reason. The rules and their honesty bars are in
+[ETHOS.md, Explain the Number](../ETHOS.md#8-explain-the-number).
+
+**Safety-rule and router evals: a descriptive third arm.** The W1 safety-rule
+evals compare `GSTACK_SAFETY_ARM=rule` (the shipped rule) with `removed` (the
+rule paragraph deleted), and the router failure-routing evals compare
+`GSTACK_ROUTER_ARM=current` with `before` (the base branch's router). Both
+variables also take `none` (GST-470): the same fixture, tools and user request,
+with no skill excerpt, rule text, step file or installed skill. Any other value
+throws, so a typo cannot run one arm under another's label. The `rule`,
+`removed`, `current` and `before` prompts are byte for byte what they were
+before `none` existed (`test/safety-none-arm.test.ts`,
+`test/failure-routing-arm.test.ts`). To run the three arms as a comparison, run
+the same case once per arm, each as its CI panel:
+
+```bash
+for arm in rule removed none; do
+  GSTACK_SAFETY_ARM=$arm bun run scripts/test-paid-shards.ts --tier gate --case safety-ship-stale-evidence
+done
+for arm in current before none; do
+  GSTACK_ROUTER_ARM=$arm bun run scripts/test-paid-shards.ts --tier gate --case router-failure-verified-cause
+done
+```
+
+The arm variable is part of the shard-reuse environment, so one arm's result is
+never reused for another. Report the three rows side by side in one results
+table and pass `gstack-eval-plan results --check` on it.
+
+**The descriptive exception.** Under `none` every behavioral check, the plain
+`expect`s on model actions included, is recorded as an observation in
+`none-arm-observations.jsonl` in the eval directory and on stderr
+(`test/helpers/none-arm.ts`). It never fails the case and never writes
+`contract-violations.jsonl`; harness preconditions (the fixture built, the CLI
+ran, the session ended normally) still assert. This departs from "the same
+panel" above because these contracts are gstack's own rules: a plain model was
+never asked to keep them, so a failing `none` trial is the measurement, not a
+regression, and a red verdict would block the gate on behavior nobody
+specified. The router's `none` arm has no repro-first metric,
+since it never sees the router's rules; it records plain metrics instead:
+whether the suite is green, whether an edit came before the first read, and
+how many read-only calls came before the first edit. The first paid comparison
+with these arms gets its own preregistration.
+
+**Cases without a `none` arm.** `safety-pair-agent-block` and
+`safety-ios-demo-ui-only` refuse `GSTACK_SAFETY_ARM=none` with the reason
+(`NO_NONE_ARM` in `test/helpers/safety-rules.ts`). Their task exists only in
+the skill: relaying /pair-agent's remote instruction block, and /ios-qa's demo
+mode with its device routes. A plain prompt has nothing to relay and no device
+interface to drive, so the arm would measure the prompt, not gstack.
+
+**Precedent.** `test/skill-e2e-arm-benchmark.test.ts` runs a `with-skill` and a
+`without-skill` arm (named `<model>#no-gstack` in its preregistration) as 3
+pairs per task under a spend ledger and cap. A paired judge reads both diffs as
+`A` and `B` in both orders, counts a win only when the orders agree, and
+decides only after it passes calibration; the per-diff `armJudge` stays beside
+it as the diagnostic. Candidate folders and git identity name a project, never
+the arm. The model panel (`test/skill-e2e-model-panel.test.ts`) runs a
+`<model>#no-gstack` arm beside each model (GST-468, GST-469).
+
+## Frontier models under test
+
+Garry, 2026-11-01 (R54): "I think you are spending too much time with Haiku and
+Sonnet, whereas GBrain and GStack are really designed to be used with frontier
+models like Opus and 6.1 Sol... just transfer from Haiku to Sonnet, who gives a
+shit about that, man?"
+
+**Models under test are frontier models.** Today that's `claude-opus-5-5` and
+`gpt-6.1-sol`, plus at most one low-cost primary the preregistration names. Haiku
+and Sonnet are not models under test. They aren't stand-ins for a frontier model,
+and an eval has no tier-transfer arms (Haiku against Sonnet, say) unless its
+preregistration says it is asking about that tier.
+
+**Verdicts need a frontier result.** A result measured only on Haiku or Sonnet
+can't carry a KEEP, FIX-METHOD or CUT-CANDIDATE verdict under R48. Rerun it on a
+frontier model first.
+
+**What the rule leaves alone.** Judges, cross-family review voices and a
+harness's shipped housekeeping model aren't models under test, so they keep the
+model they already use.
+
+**The check.** `gstack-eval-plan dry-run` prints `CHECK: frontier` whenever an arm
+is Haiku or Sonnet. When every arm is one, the dry run fails unless
+`--tier-question "<what the preregistration asks about that tier>"` is passed.
+When only some arms are, it warns. Either way it prints the whole plan's price
+on `claude-opus-5-5` and `gpt-6.1-sol`. The dry run doesn't enforce that number:
+compare it with the brief cap before any arm is swapped. `pilot start` refuses a
+pilot whose every arm is Haiku or Sonnet unless its dry run recorded a tier
+question.
 
 ## Running evals as an agent: detach
 

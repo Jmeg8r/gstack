@@ -82,6 +82,8 @@ const SELECTED_MODEL = '${_CODEX_SEL:?}';
 export const CODEX_SANDBOX_REF = '${_CODEX_SANDBOX_MODE:?}';
 /** Requires codexSelect('exec') earlier in the same block. */
 export const CODEX_MODEL_CONFIG_FLAG = `-c "model=\\"${SELECTED_MODEL}\\"" ${CODEX_SKILLS_ISOLATION_FLAG}`;
+/** Requires codexSelect('review'); native review prefers review_model, so both carry the selection. */
+export const CODEX_REVIEW_MODEL_CONFIG_FLAG = `-c "review_model=\\"${SELECTED_MODEL}\\"" ${CODEX_MODEL_CONFIG_FLAG}`;
 /** The executed probe; pathRewrites map the Claude path per host. */
 export const CODEX_PROBE_PATH = '~/.claude/skills/gstack/bin/gstack-codex-probe';
 
@@ -153,13 +155,13 @@ On any error: continue — ${feature} is informational, not a gate.`;
  *   - `codex-only` (diff adversarial): disabled gates only the Codex passes; the
  *     free Claude adversarial subagent still runs.
  */
-export function codexPreflight(opts: { modeVar?: string; disabledBehavior: 'skip-all' | 'codex-only'; nativeReview?: boolean; role?: boolean }): string {
+export function codexPreflight(opts: { modeVar?: string; disabledBehavior: 'skip-all' | 'codex-only'; nativeReview?: boolean; role?: boolean; nativeDispatched?: boolean }): string {
   const m = opts.modeVar ?? '_CODEX_MODE';
   const disabledLine = opts.disabledBehavior === 'codex-only'
-    ? 'Skip the Codex passes only; the Claude adversarial subagent below STILL runs (it is free and fast). Print: "Codex passes skipped (codex_reviews disabled) — running Claude adversarial only."'
+    ? (opts.nativeDispatched ? 'Skip the Codex passes only; the Claude adversarial subagent below still follows its DISPATCH line. Print: "Codex passes skipped (codex_reviews disabled)."' : 'Skip the Codex passes only; the Claude adversarial subagent below STILL runs (it is free and fast). Print: "Codex passes skipped (codex_reviews disabled) — running Claude adversarial only."')
     : 'Skip this section entirely; do NOT fall back to a Claude subagent — disabled means no extra review step. Print: "Codex review skipped (codex_reviews disabled). Re-enable: `gstack-config set codex_reviews enabled`."';
   const nativeRoute = opts.disabledBehavior === 'codex-only'
-    ? 'Keep the required Claude adversarial pass; do not dispatch a duplicate.'
+    ? (opts.nativeDispatched ? 'The Claude adversarial pass follows its own DISPATCH line.' : 'Keep the required Claude adversarial pass; do not dispatch a duplicate.')
     : 'Fall back to the Claude subagent path.';
   return `\`\`\`bash
 # Codex preflight: the probe runs as a command, so any shell works.

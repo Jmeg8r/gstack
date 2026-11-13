@@ -265,12 +265,12 @@ describe('plan report persistence precedes completion logging', () => {
           || artifact.relativePath.endsWith(`/gstack-${skill}/sections/review-sections.md`));
       const carved = new Set(generated.artifacts.filter(isSection).map(a => `${a.host}:${a.relativePath.replace(/\/sections\/review-sections\.md$/, '')}`));
       const carriers = generated.artifacts.filter(artifact => isSection(artifact)
-        || (artifact.kind === 'skill' && plans.some(skill => artifact.relativePath.endsWith(`/gstack-${skill}/SKILL.md`))
+        || (artifact.kind === 'skill' && plans.some(skill => artifact.relativePath.endsWith(`/gstack-${skill}/SKILL.md`) || artifact.relativePath.endsWith(`/gstack-autoplan/${skill}.md`))
           && !carved.has(`${artifact.host}:${artifact.relativePath.replace(/\/SKILL\.md$/, '')}`)));
       expect(carriers).toHaveLength(plans.length * ALL_HOST_CONFIGS.length);
       for (const carrier of carriers) {
         const content = readFileSync(join(outputRoot, carrier.relativePath), 'utf8');
-        if (carrier.relativePath.includes('plan-eng-review/')) {
+        if (carrier.relativePath.includes('plan-eng-review')) {
           const dispatch = compactProse(content.slice(content.indexOf('**Pending-record checkpoint.**'), content.indexOf('## Scope Challenge')));
           ordered(dispatch, ['AskUserQuestion({ questions: [currentDecision] })', /stop until the actual answer arrives/i, '### Record the answer', 'For the next choice']);
         }
@@ -280,7 +280,7 @@ describe('plan report persistence precedes completion logging', () => {
         const dashboard = content.indexOf('\n## Review Readiness Dashboard\n');
         expect({ carrier: carrier.relativePath, ordered: 0 < report && report < readback && readback < log && log < dashboard }).toMatchObject({ ordered: true });
         expect(content.slice(report, readback)).toContain('current Completion Summary');
-        expect(content.slice(readback, log)).toMatch(carrier.relativePath.includes('plan-eng-review/')
+        expect(content.slice(readback, log)).toMatch(carrier.relativePath.includes('plan-eng-review')
           ? /follow \*\*Blocked outcome\*\* before Review Log or decision logging/i
           : /stop before Review Log or decision logging/i);
       }
@@ -654,7 +654,7 @@ describe('outside-voice commitment queue', () => {
       const routing = eng.slice(eng.indexOf('**Outcome routing:**'), eng.indexOf('**Disabled is a terminal branch'));
       const preflight = eng.match(/```bash\n([\s\S]*?)\n```/)![1];
       expect(preflight).toContain(mismatch);
-      expectAll(routing, [/other preflight mode, including harness mismatch/i, /outside execution or output validation fails/i, /then use Native fallback/i]);
+      expectAll(routing, [/any other mode \(`not_installed`, `under_current_harness`\)/i, /outside execution or output validation fails/i, /then use Native fallback/i]);
       const bounded = eng.slice(eng.indexOf('**Bounded outside-voice wait'), eng.indexOf('**Cross-model tension:**'));
       expectMentions(bounded, [['never', 'supplies', 'coverage']], 'bounded');
       expect(eng).toMatch(/SOURCE=in-host, OUTSIDE_STATUS=unavailable, and STATUS=clean or issues_found/);
