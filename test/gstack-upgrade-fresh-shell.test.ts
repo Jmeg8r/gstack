@@ -273,8 +273,21 @@ describe.skipIf(IS_WINDOWS)('DX-7: Step 2 finds the registered source checkout f
 
 describe.skipIf(IS_WINDOWS)('Step 2 recognises a git checkout by asking git, not by a .git directory', () => {
   const step2 = () => fence(hostRenders.find(r => r.host === 'claude')!.upgrade, 'Install type: $INSTALL_TYPE at $INSTALL_DIR');
-  const run = (home: string, cwd: string) =>
-    spawnSync('env', ['-i', `HOME=${home}`, `PATH=${process.env.PATH}`, 'bash', '-c', step2()], { cwd, encoding: 'utf8', timeout: 20_000 });
+  const run = (home: string, cwd: string, extraEnv: string[] = []) =>
+    spawnSync('env', ['-i', `HOME=${home}`, `PATH=${process.env.PATH}`, ...extraEnv, 'bash', '-c', step2()], { cwd, encoding: 'utf8', timeout: 20_000 });
+
+  test('a checkout git refuses to read stops the upgrade instead of passing for vendored', () => {
+    const w = mkdtempSync(join(root, 'owner-'));
+    const home = join(w, 'home');
+    const live = join(home, '.claude', 'skills', 'gstack');
+    makeGstackLike(live, true);
+    // Git's own test switch for a safe.directory ownership mismatch.
+    const r = run(home, mkdtempSync(join(w, 'cwd-')), ['GIT_TEST_ASSUME_DIFFERENT_OWNER=1']);
+    expect(r.status).not.toBe(0);
+    expect(r.stdout).not.toContain('Install type:');
+    expect(r.stderr).toContain('git cannot read it');
+    expect(r.stderr).toContain('safe.directory');
+  });
 
   test('a linked worktree (where .git is a file) is a global-git install, not vendored', () => {
     const w = mkdtempSync(join(root, 'wt-'));
