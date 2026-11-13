@@ -85,16 +85,19 @@ Continue with the current skill.
 ### Step 2: Detect install type
 
 ```bash
-if [ -d "$HOME/.claude/skills/gstack/.git" ]; then
+# A checkout's .git is a directory in a clone but a file in a linked worktree, so ask git.
+# The .git test keeps a vendored copy inside some other repository from counting as one.
+_gstack_is_checkout() { [ -e "$1/.git" ] && [ "$(git -C "$1" rev-parse --is-inside-work-tree 2>/dev/null)" = true ]; }
+if _gstack_is_checkout "$HOME/.claude/skills/gstack"; then
   INSTALL_TYPE="global-git"
   INSTALL_DIR="$HOME/.claude/skills/gstack"
-elif [ -d "$HOME/.gstack/repos/gstack/.git" ]; then
+elif _gstack_is_checkout "$HOME/.gstack/repos/gstack"; then
   INSTALL_TYPE="global-git"
   INSTALL_DIR="$HOME/.gstack/repos/gstack"
-elif [ -d ".claude/skills/gstack/.git" ]; then
+elif _gstack_is_checkout ".claude/skills/gstack"; then
   INSTALL_TYPE="local-git"
   INSTALL_DIR=".claude/skills/gstack"
-elif [ -d ".agents/skills/gstack/.git" ]; then
+elif _gstack_is_checkout ".agents/skills/gstack"; then
   INSTALL_TYPE="local-git"
   INSTALL_DIR=".agents/skills/gstack"
 elif [ -d ".claude/skills/gstack" ]; then
@@ -103,7 +106,7 @@ elif [ -d ".claude/skills/gstack" ]; then
 elif [ -d "$HOME/.claude/skills/gstack" ]; then
   INSTALL_TYPE="vendored-global"
   INSTALL_DIR="$HOME/.claude/skills/gstack"
-elif _SRC=$({{BIN_DIR}}/gstack-paths --get GSTACK_STATE_ROOT 2>/dev/null) && _SRC=$(awk -F '\t' '$(1) == "{{HOST_ID}}" && $(6) != "-" { print $(6); exit }' "$_SRC/installs.tsv" 2>/dev/null) && [ -d "$_SRC/.git" ]; then
+elif _SRC=$({{BIN_DIR}}/gstack-paths --get GSTACK_STATE_ROOT 2>/dev/null) && _SRC=$(awk -F '\t' '$(1) == "{{HOST_ID}}" && $(6) != "-" { print $(6); exit }' "$_SRC/installs.tsv" 2>/dev/null) && _gstack_is_checkout "$_SRC"; then
   # The install registry names the checkout setup activated for this host (e.g. a ~/gstack clone).
   INSTALL_TYPE="global-git"
   INSTALL_DIR="$_SRC"
