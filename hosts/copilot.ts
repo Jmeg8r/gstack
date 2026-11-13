@@ -30,7 +30,7 @@ const copilot = defineHost({
   // root is not a checkout, so /gstack-upgrade finds the source through
   // .source-path (written by setup).
   pathRewrites: [
-    { from: 'if [ -d "$HOME/.claude/skills/gstack/.git" ]', to: 'if [ -d "$(cat "$HOME/.copilot/skills/gstack/.source-path" 2>/dev/null)/.git" ]' },
+    { from: 'if _C="$HOME/.claude/skills/gstack" && _gstack_is_checkout', to: 'if _C="$(cat "$HOME/.copilot/skills/gstack/.source-path" 2>/dev/null)" && _gstack_is_checkout' },
     { from: 'INSTALL_DIR="$HOME/.claude/skills/gstack"', to: 'INSTALL_DIR="$(cat "$HOME/.copilot/skills/gstack/.source-path")"' },
     { from: '$HOME/.claude/skills/gstack', to: '$HOME/.copilot/skills/gstack' },
     { from: '~/.claude/skills/gstack', to: '~/.copilot/skills/gstack' },

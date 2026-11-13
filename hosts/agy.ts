@@ -39,7 +39,7 @@ const agy = defineHost({
   // without the preamble still resolve; .source-path (written by setup) lets
   // /gstack-upgrade find the checkout behind the runtime root.
   pathRewrites: [
-    { from: 'if [ -d "$HOME/.claude/skills/gstack/.git" ]', to: 'if [ -d "$(cat "$HOME/.gemini/antigravity-cli/skills/gstack/.source-path" 2>/dev/null)/.git" ]' },
+    { from: 'if _C="$HOME/.claude/skills/gstack" && _gstack_is_checkout', to: 'if _C="$(cat "$HOME/.gemini/antigravity-cli/skills/gstack/.source-path" 2>/dev/null)" && _gstack_is_checkout' },
     { from: 'INSTALL_DIR="$HOME/.claude/skills/gstack"', to: 'INSTALL_DIR="$(cat "$HOME/.gemini/antigravity-cli/skills/gstack/.source-path")"' },
     { from: '$HOME/.claude/skills/gstack', to: '$HOME/.gemini/antigravity-cli/skills/gstack' },
     { from: '~/.claude/skills/gstack', to: '~/.gemini/antigravity-cli/skills/gstack' },

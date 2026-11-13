@@ -90,6 +90,7 @@ Continue with the current skill.
 # A .git that git refuses to read (e.g. safe.directory) stops here: treating it as vendored
 # would replace a checkout that may hold local commits.
 # It reads the path from _C, not a positional parameter: Claude Code rewrites $N tokens in skill bodies.
+_C=""
 _gstack_is_checkout() {
   [ -e "$_C/.git" ] || return 1
   _GIT_ERR=$(git -C "$_C" rev-parse --is-inside-work-tree 2>&1) && [ "$_GIT_ERR" = true ] && return 0
