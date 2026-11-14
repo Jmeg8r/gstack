@@ -85,16 +85,29 @@ Continue with the current skill.
 ### Step 2: Detect install type
 
 ```bash
-if [ -d "$HOME/.claude/skills/gstack/.git" ]; then
+# A checkout's .git is a directory in a clone but a file in a linked worktree, so ask git.
+# The .git test keeps a vendored copy inside some other repository from counting as one.
+# A .git that git refuses to read (e.g. safe.directory) stops here: treating it as vendored
+# would replace a checkout that may hold local commits.
+# It reads the path from _C, not a positional parameter: Claude Code rewrites $N tokens in skill bodies.
+_C=""
+_gstack_is_checkout() {
+  [ -e "$_C/.git" ] || return 1
+  _GIT_ERR=$(git -C "$_C" rev-parse --is-inside-work-tree 2>&1) && [ "$_GIT_ERR" = true ] && return 0
+  echo "ERROR: $_C has a .git but git cannot read it; nothing was changed. Fix this, then re-run the upgrade:" >&2
+  echo "$_GIT_ERR" >&2
+  exit 1
+}
+if _C="$HOME/.claude/skills/gstack" && _gstack_is_checkout; then
   INSTALL_TYPE="global-git"
   INSTALL_DIR="$HOME/.claude/skills/gstack"
-elif [ -d "$HOME/.gstack/repos/gstack/.git" ]; then
+elif _C="$HOME/.gstack/repos/gstack" && _gstack_is_checkout; then
   INSTALL_TYPE="global-git"
   INSTALL_DIR="$HOME/.gstack/repos/gstack"
-elif [ -d ".claude/skills/gstack/.git" ]; then
+elif _C=".claude/skills/gstack" && _gstack_is_checkout; then
   INSTALL_TYPE="local-git"
   INSTALL_DIR=".claude/skills/gstack"
-elif [ -d ".agents/skills/gstack/.git" ]; then
+elif _C=".agents/skills/gstack" && _gstack_is_checkout; then
   INSTALL_TYPE="local-git"
   INSTALL_DIR=".agents/skills/gstack"
 elif [ -d ".claude/skills/gstack" ]; then
@@ -103,7 +116,7 @@ elif [ -d ".claude/skills/gstack" ]; then
 elif [ -d "$HOME/.claude/skills/gstack" ]; then
   INSTALL_TYPE="vendored-global"
   INSTALL_DIR="$HOME/.claude/skills/gstack"
-elif _SRC=$({{BIN_DIR}}/gstack-paths --get GSTACK_STATE_ROOT 2>/dev/null) && _SRC=$(awk -F '\t' '$(1) == "{{HOST_ID}}" && $(6) != "-" { print $(6); exit }' "$_SRC/installs.tsv" 2>/dev/null) && [ -d "$_SRC/.git" ]; then
+elif _SRC=$({{BIN_DIR}}/gstack-paths --get GSTACK_STATE_ROOT 2>/dev/null) && _SRC=$(awk -F '\t' '$(1) == "{{HOST_ID}}" && $(6) != "-" { print $(6); exit }' "$_SRC/installs.tsv" 2>/dev/null) && _C="$_SRC" && _gstack_is_checkout; then
   # The install registry names the checkout setup activated for this host (e.g. a ~/gstack clone).
   INSTALL_TYPE="global-git"
   INSTALL_DIR="$_SRC"

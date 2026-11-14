@@ -13,7 +13,7 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { execFile, spawnSync } from 'child_process';
 import { promisify } from 'util';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { dirname, join } from 'path';
 import { createHash } from 'crypto';
@@ -268,5 +268,68 @@ describe.skipIf(IS_WINDOWS)('DX-7: Step 2 finds the registered source checkout f
     expect(r.stdout.trim(), r.stderr).toBe(`Install type: global-git at ${clone}`);
     rmSync(join(state, 'installs.tsv'));
     expect(run().stdout).toContain('ERROR: gstack not found');
+  });
+});
+
+describe.skipIf(IS_WINDOWS)('Step 2 recognises a git checkout by asking git, not by a .git directory', () => {
+  const step2 = () => fence(hostRenders.find(r => r.host === 'claude')!.upgrade, 'Install type: $INSTALL_TYPE at $INSTALL_DIR');
+  const run = (home: string, cwd: string, extraEnv: string[] = []) =>
+    spawnSync('env', ['-i', `HOME=${home}`, `PATH=${process.env.PATH}`, ...extraEnv, 'bash', '-c', step2()], { cwd, encoding: 'utf8', timeout: 20_000 });
+
+  // These hosts' setup builds a runtime root with no .git and records the source checkout in
+  // .source-path; their pathRewrites retarget Step 2's first condition at that file.
+  test.each([
+    ['copilot', '.copilot/skills/gstack'],
+    ['gemini', '.gemini/skills/gstack'],
+    ['agy', '.gemini/antigravity-cli/skills/gstack'],
+  ])('%s: the checkout named in .source-path is a global-git install', (host, runtimeRel) => {
+    const w = mkdtempSync(join(root, `src-${host}-`));
+    const home = join(w, 'home');
+    const clone = join(home, 'gstack');
+    makeGstackLike(clone, true);
+    const runtime = join(home, runtimeRel);
+    mkdirSync(join(runtime, 'bin'), { recursive: true });
+    writeFileSync(join(runtime, '.source-path'), `${clone}\n`);
+    const fenceFor = fence(hostRenders.find(r => r.host === host)!.upgrade, 'Install type: $INSTALL_TYPE at $INSTALL_DIR');
+    const r = spawnSync('env', ['-i', `HOME=${home}`, `PATH=${process.env.PATH}`, 'bash', '-c', fenceFor], { cwd: mkdtempSync(join(w, 'cwd-')), encoding: 'utf8', timeout: 20_000 });
+    expect(r.stdout.trim(), r.stderr).toBe(`Install type: global-git at ${realpathSync(clone)}`);
+  });
+
+  test('a checkout git refuses to read stops the upgrade instead of passing for vendored', () => {
+    const w = mkdtempSync(join(root, 'owner-'));
+    const home = join(w, 'home');
+    const live = join(home, '.claude', 'skills', 'gstack');
+    makeGstackLike(live, true);
+    // Git's own test switch for a safe.directory ownership mismatch.
+    const r = run(home, mkdtempSync(join(w, 'cwd-')), ['GIT_TEST_ASSUME_DIFFERENT_OWNER=1']);
+    expect(r.status).not.toBe(0);
+    expect(r.stdout).not.toContain('Install type:');
+    expect(r.stderr).toContain('git cannot read it');
+    expect(r.stderr).toContain('safe.directory');
+  });
+
+  test('a linked worktree (where .git is a file) is a global-git install, not vendored', () => {
+    const w = mkdtempSync(join(root, 'wt-'));
+    const home = join(w, 'home');
+    const main = join(w, 'fork');
+    makeGstackLike(main, true);
+    const live = join(home, '.claude', 'skills', 'gstack');
+    mkdirSync(dirname(live), { recursive: true });
+    mustSh(main, `git worktree add -q --detach ${JSON.stringify(live)}`);
+    expect(statSync(join(live, '.git')).isFile()).toBe(true);
+    const r = run(home, mkdtempSync(join(w, 'cwd-')));
+    expect(r.stdout.trim(), r.stderr).toBe(`Install type: global-git at ${realpathSync(live)}`);
+  });
+
+  test('a vendored copy inside a project repository is still vendored', () => {
+    const w = mkdtempSync(join(root, 'vend-'));
+    const home = join(w, 'home');
+    mkdirSync(home, { recursive: true });
+    const project = join(w, 'project');
+    mkdirSync(project, { recursive: true });
+    makeGstackLike(join(project, '.claude', 'skills', 'gstack'), false);
+    mustSh(project, 'git init -q -b main && git add -A && git commit -q -m init');
+    const r = run(home, project);
+    expect(r.stdout.trim(), r.stderr).toBe(`Install type: vendored at ${realpathSync(join(project, '.claude', 'skills', 'gstack'))}`);
   });
 });
