@@ -34,6 +34,8 @@ lib/cso/images/gstack-cso-preparation
 .claude/gstack-rendered/
 .claude/scheduled_tasks.lock
 .claude/*.lock
+# Serena MCP writes per-checkout editor state here; it names the checkout, so it is never shared.
+.serena/
 .agents/
 .factory/
 .kiro/
