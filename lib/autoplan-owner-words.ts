@@ -9,7 +9,10 @@
  * answer at the same gate replaced), the words a carried gate reused, each
  * quote in a `### Owner's words` section of any plan text the run kept (plan-active.md, plan-source*.md,
  * plan-at-gate.r*.md, plan-file.*.md; lib/autoplan-owner-text.ts), so a quote a revision removed stays redacted,
- * and a reason a human gave for `close --deferred <reason> --by human`. A reply that
+ * and a reason a human gave for `close --deferred <reason> --by human`. A plan quote of any length, and a
+ * quote's `leave out: <reason>`, are also redacted wherever gstack renders them: the quote between quote marks
+ * (padding inside them, entities, JSON escapes and invisible characters decoded as the token scan decodes them),
+ * the reason after `leave out:`, `leave it out for now:` or `reason to leave it out:` in any case (GST-3646). A reply that
  * parsed as gate grammar (`owner_reply_parsed`) is the decision code and is
  * not scanned for; `reply` and the agent's own `answer_words` stay.
  *
@@ -64,7 +67,7 @@ export const WINDOW = 8;
 export type Span = [number, number];
 export interface OwnerSource { text: string; parsed?: boolean; prior?: string[] }
 interface Indexed { keys: string[]; set: Set<string>; prior: string }
-export interface OwnerWords { replies: Indexed[]; placements: RegExp[] }
+export interface OwnerWords { replies: Indexed[]; placements: RegExp[]; decoded: RegExp[] }
 
 /** A normalized string with, per UTF-16 unit, the original [from, to) range it came from. */
 interface Mapped { s: string; from: number[]; to: number[] }
@@ -133,11 +136,15 @@ const SUFFIXES: Array<[string, string]> = [["n't", 'not'], ["'re", 'are'], ["'ve
 const IS_BASES = new Set(['it', 'that', 'there', 'here', 'what', 'who', 'where', 'he', 'she']);
 
 interface Token { key: string; start: number; end: number }
+/** A word: one character of a script written without spaces (Han, kana, Thai), or a run of other letters and digits. */
+const UNSPACED = String.raw`\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}`;
+const LETTER = String.raw`(?:(?![${UNSPACED}])[\p{L}\p{M}\p{N}])`;
+const WORD = new RegExp(String.raw`[${UNSPACED}]|${LETTER}+(?:['\u2019\u02bc]${LETTER}+)*`, 'gu');
 /** Words of `text` in the rendered (default) or raw view, with their original [start, end) offsets. */
 export function tokens(text: string, rendered = true): Token[] {
   const m = normalize(text, rendered);
   const out: Token[] = [];
-  for (const w of m.s.matchAll(/[\p{L}\p{M}\p{N}]+(?:['\u2019\u02bc][\p{L}\p{M}\p{N}]+)*/gu)) {
+  for (const w of m.s.matchAll(WORD)) {
     const start = m.from[w.index!]!, end = m.to[w.index! + w[0].length - 1]!;
     const key = w[0].normalize('NFKC').replace(/[\u2019\u02bc]/g, "'").toLowerCase();
     const suffix = SUFFIXES.find(([s]) => key.endsWith(s) && key.length > s.length);
@@ -148,6 +155,8 @@ export function tokens(text: string, rendered = true): Token[] {
 }
 
 const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+/** A plan quote between quote marks, with any whitespace just inside them. */
+const quoteMarks = (q: string) => `["“]\\s*(${escape(q)})\\s*["”]`;
 /** Where gstack renders a human's deferral reason (R): the voice detail, the consensus head, the gate title, a blocker's why, the run log. */
 const DEFERRAL_RENDERINGS = (r: string) => [`^deferred: (${r})$`, `\\((${r}); by human\\)`, `accepted-with-findings at round \\d+ \\((${r})\\): `, `closed deferred \\((${r})\\) with this finding open`, `, by human\\): (${r}); \\d+ open finding`];
 
@@ -155,7 +164,7 @@ const DEFERRAL_RENDERINGS = (r: string) => [`^deferred: (${r})$`, `\\((${r}); by
  * The scan index: each owner reply and deferral reason of MIN_TOKENS+ words (grammar skipped), each run of MIN_TOKENS+
  * of its words between echoed windows, and the placements of deferral reasons and carried words.
  */
-export function ownerIndex(replies: OwnerSource[], o: { deferred?: OwnerSource[]; carried?: string[] } = {}): OwnerWords {
+export function ownerIndex(replies: OwnerSource[], o: { deferred?: OwnerSource[]; carried?: string[]; quoted?: string[]; reasons?: string[] } = {}): OwnerWords {
   const keysOf = (texts: string[]) => ` ${texts.flatMap(t => [tokens(t, false), tokens(t)].map(ts => ts.map(k => k.key).join(' '))).join(' \u0001 ')} `;
   const seen = new Set<string>();
   const indexed: Indexed[] = [];
@@ -184,14 +193,22 @@ export function ownerIndex(replies: OwnerSource[], o: { deferred?: OwnerSource[]
   const placements = [
     ...(o.deferred ?? []).flatMap(d => DEFERRAL_RENDERINGS(escape(d.text))),
     ...(o.carried ?? []).map(w => `words=(${escape(JSON.stringify(w))})(?= by=|$)`),
-  ].map(p => new RegExp(p, 'gd'));
-  return { replies: indexed, placements };
+    ...(o.quoted ?? []).map(quoteMarks),
+  ].map(p => new RegExp(p, 'gd')).concat((o.reasons ?? []).map(r => new RegExp(`(?:leave out|leave it out for now|reason to leave it out)\\s*:\\s*(${escape(r)})`, 'gdi')));
+  const decoded = [...new Set((o.quoted ?? []).map(q => normalize(q, false).s.trim()).filter(Boolean))].map(q => new RegExp(quoteMarks(q).replace(/\s+/g, '\\s+'), 'gd'));
+  return { replies: indexed, placements, decoded };
 }
 
 /** Every owner-words span in `text` (placements, then quotes less echoes, in both views), merged, as original [start, end) offsets. */
 export function ownerSpans(text: string, owner: OwnerWords): Span[] {
   const spans: Span[] = [];
   for (const re of owner.placements) for (const m of text.matchAll(re)) spans.push([m.indices![1]![0], m.indices![1]![1]]);
+  for (const view of owner.decoded.length ? [normalize(text, false), normalize(text, true)] : []) {
+    for (const re of owner.decoded) for (const m of view.s.matchAll(re)) {
+      const [a, b] = m.indices![1]!;
+      if (b > a) spans.push([view.from[a]!, view.to[b - 1]!]);
+    }
+  }
   for (const ts of owner.replies.length ? [tokens(text, false), tokens(text)] : []) {
     const keys = ts.map(t => t.key);
     for (const r of owner.replies) {
@@ -275,7 +292,8 @@ export function ownerWords(state: Pick<RunState, 'out' | 'phases' | 'gate' | 'ca
   note(state.carry?.words, undefined, false);
   let names: string[] = [];
   try { names = fs.readdirSync(out).filter(f => f === FILES.active || /^plan-source.*\.md$/.test(f) || /^plan-at-gate\.r\d+\.md$/.test(f) || /^plan-file\..+\.md$/.test(f)).sort(); } catch { /* no run directory */ }
-  for (const text of new Set(names.flatMap(f => parseOwnerWords(read(f) ?? '').quotes.map(q => q.text)))) note(text, undefined, false);
+  const planQuotes = names.flatMap(f => parseOwnerWords(read(f) ?? '').quotes);
+  for (const text of new Set(planQuotes.map(q => q.text))) note(text, undefined, false);
 
   const deferred = new Map<string, string | undefined>();
   for (const r of journal) if (r.event === 'phase_deferred' && r.by === 'human' && typeof r.reason === 'string') deferred.set(r.reason, deferred.get(r.reason) ?? String(r.ts));
@@ -284,5 +302,7 @@ export function ownerWords(state: Pick<RunState, 'out' | 'phases' | 'gate' | 'ca
   return ownerIndex([...byText].map(([text, r]) => ({ text, parsed: r.parsed, prior: prior(r.at) })), {
     deferred: [...deferred].map(([text, at]) => ({ text, prior: prior(at) })),
     carried: state.carry?.words ? [state.carry.words] : [],
+    quoted: [...new Set(planQuotes.map(q => q.text))],
+    reasons: [...new Set(planQuotes.flatMap(q => (q.line?.kind === 'choice' && q.line.leave_out ? [q.line.leave_out] : [])))],
   });
 }

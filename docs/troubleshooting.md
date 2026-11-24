@@ -733,9 +733,9 @@ cannot repair it.
 **Fix.** Keep the checkout frozen (no edits, commits, merges or pushes) from a pass's start
 until every reviewer in it has returned and its row is logged. If the mid-pass change was
 your own fix to that pass's findings, log the pass with `"converged":false` and the fix
-as `"action":"fixed"`. `gstack-review-plan` then picks the repeat: one fix-check reading
-the touched hunks when every fix is below the blocking floor, and 11.5 accepts that
-fix-check record as Step 9's. Rerun Step 11's native pass on the same frozen tree.
+as `"action":"fixed"`. `gstack-review-plan` then picks the repeat, never a fix-check since GST-3562: a fix
+after round 1 gets a full round 2 on the range, and a fix in the last round gets the
+read-only final review. Step 11.5 binds that pass's record. Rerun Step 11's native pass on the same frozen tree.
 
 **Expected result.** `gstack-review-read` shows both records at one tree with
 `review_freshness` `CURRENT`, and Step 11.5 continues to Step 12.
@@ -2547,12 +2547,12 @@ whose Plan line differs from the PR body's current line.
 <a id="first-use-plan-unready"></a>
 ### `gstack-first-use start: ... (FIRST_USE_PLAN_UNREADY)`
 
-**Meaning.** `start` could not freeze the day-one actions: the plan has no `### Day one` table, the table is missing a column or has fewer than five rows, one of its first five rows has an empty cell, or one of them is still marked `assumed`. Exit 3; nothing is written. **Fix.** Give the plan the pinned table ([first-use-check.md](first-use-check.md#the-day-one-table)) and confirm every assumed row with the owner, then rerun `start`.
+**Meaning.** `start` could not freeze the steps: the plan has no `### Day one` table, the table is missing a column or has fewer than five rows, one of its first five rows has an empty cell, is still marked `assumed` or cites none of the owner's quotes (`owner words <n>`), or the plan has no `### Owner's words` section, or a quote there has no time or no line (`does it` or `choice`). Exit 3; nothing is written. **Fix.** Quote the owner's messages that state the job and cite them from the table ([first-use-check.md](first-use-check.md#the-owners-words-and-the-day-one-table)); a row the owner confirmed at the gate cites his answer, added to Owner's words. Then rerun `start`.
 
 <a id="first-use-play-spec-incomplete"></a>
 ### `gstack-first-use start: ... (FIRST_USE_PLAY_SPEC_INCOMPLETE)`
 
-**Meaning.** The play spec JSON misses one of the ten parts every ask to play or try a build carries (links, device and setup, what it is, how to start, controls, how long, what we want to learn, how to report back, known quirks, reply word). The line names each missing part and field. Exit 3. **Fix.** Fill them in ([first-use-check.md](first-use-check.md#play-spec)); "none" is a fine value for known quirks.
+**Meaning.** The play spec JSON misses one of the ten parts every ask to play or try a build carries (links, device and setup with its `target`, what it is, how to start with its numbered `steps`, controls, how long, what we want to learn, how to report back, known quirks, reply word), or a step writes on the owner's real setup with no `approved_write` naming his approval. The line names each missing part and field. Exit 3. **Fix.** Fill them in ([first-use-check.md](first-use-check.md#play-spec)); "none" is a fine value for known quirks and for a step's writes. Run a step that writes on a realistic copy, or get the owner's lettered approval for that write first.
 
 <a id="first-use-same-family"></a>
 ### `gstack-first-use start|record|predict: ... (FIRST_USE_SAME_FAMILY)`
@@ -2567,12 +2567,12 @@ whose Plan line differs from the PR body's current line.
 <a id="first-use-record-invalid"></a>
 ### `gstack-first-use: ... (FIRST_USE_RECORD_INVALID)`
 
-**Meaning.** A value or file is invalid: a bad `--commit`, `--action`, `--verdict` or score, an `--account` or `--device-class` that isn't the run's owner-equivalent audience, a run directory outside the record root, evidence that is not a screenshot or short video (or is empty, a link, or over 100 MB), an unreadable manifest, or a second prediction on a run. Exit 1. **Fix.** Correct the value. Run files are written once; to redo a check, start a new run.
+**Meaning.** A value or file is invalid: a bad `--commit`, `--platform`, `--step`, `--verdict`, `--line` or score, missing `--holding` or `--holding-defects`, an ios or android `start` without `--phone-build <id>` (the 26-character id of Capy's mobile build of `--commit`, which is what the cloud phone installs; a TestFlight or store number can't be installed there), an `--account`, `--target` or `--device-class` that isn't the run's owner-equivalent audience and target, a run directory outside the record root, evidence that is not a screenshot, short video or terminal capture (or is empty, a link, or over 100 MB), an unreadable manifest, a schema-1 run from before the try-it steps were checked, an ios or android run started before `--phone-build` existed, or a second prediction on a run. Exit 1. **Fix.** Correct the value. Run files are written once; to redo a check, or to continue from a schema-1 run or an older phone run, start a new run (with `--phone-build` for a phone).
 
 <a id="first-use-refused"></a>
 ### `gstack-first-use check|message: ... (FIRST_USE_REFUSED)`
 
-**Meaning.** The build has not cleared its first-use check, so `message` prints no "try this build" text and `check` prints no `FIRST_USE: pass` line. The detail lists every reason: `build_mismatch`, `source_changed`, `source_missing`, `action_<n>_not_played`, `action_<n>_failed`, `action_<n>_evidence_stale`, `link_unchecked`, `link_down`, `link_stale` (over 15 minutes old), `no_predicted_score`, `record_unreadable`. Exit 3. **Fix.** Fix the build and replay failed actions, rerun `links` right before sending, or start a new run for a new build or changed day-one rows.
+**Meaning.** The build has not cleared its first-use check, so `message` prints no try-it message and `check` prints no `FIRST_USE: pass` line. The detail lists every reason: `build_mismatch`, `source_changed` (the day-one rows or the owner's quotes changed), `source_missing`, `try_text_changed`, `step_<n>_not_played`, `step_<n>_broken`, `step_<n>_wrong`, `step_<n>_needs_lookup` (the step asks the owner for something an agent could look up or do), `step_<n>_thin` (only for a day-one action, which comes from the owner's words), `step_<n>_evidence_stale`, `link_unchecked`, `link_down`, `link_stale` (over 15 minutes old), `no_predicted_score`, `record_unreadable`. Exit 3. **Fix.** Fix the build or the step and replay it, rerun `links` right before sending, or start a new run for a new build, changed day-one rows or changed quotes.
 
 ## /ship token budget and fresh-context handoffs (gstack-ship-budget)
 
@@ -6075,7 +6075,10 @@ is a quote wherever it appears whole, and from 8 words any 8 consecutive words
 are one, compared across punctuation, line breaks, JSON escapes, entities, HTML and
 Markdown markup, invisible format characters, contractions and case; replies
 of 1 or 2 words are not scanned for, and words the owner echoed from earlier
-text he didn't write are not his (the words a reply adds to an echo still are). See
+text he didn't write are not his (the words a reply adds to an echo still are).
+A plan quote of any length is also one wherever it appears inside quote
+marks, padding just inside them and encoded characters included, and so is its `leave out:` reason after `leave out:`, `leave it out for
+now:` or `reason to leave it out:`, in any case. See
 [the public copy](unattended.md#the-public-copy). `gstack-artifact validate --public <dir> --private
 <run>/run.json` reports each quote with file:line, and `gstack-autoplan export
 --public` runs that check on a staging copy and writes nothing when it fails.
@@ -7811,7 +7814,9 @@ prints each `RULED_NOTE:`, and the PR body and receipt list every `Ruled
 note:` line ([ship-policy.md](ship-policy.md#ruled-notes)). A ruling at a head
 outside the range is listed as `not applied`, and a path edited after the
 fix-check still routes by the post-review rules. When the owner wants the
-findings fixed instead, fix them and ask for a grant for one more fix-check.
+findings fixed instead, fix them and run /ship again: fix-check grants are
+deprecated (GST-3562 A), so ask for none, and a PR past its two rounds whose code
+changed gets one read-only full review of its final head.
 A stopped final review or native reader row works the same way: its
 `gstack-review-read` reason lists each finding still waiting for a ruling, a
 `noted` CRITICAL included, so rule each listed fingerprint at the head it names.
@@ -7831,8 +7836,8 @@ counted here.
 
 **Fix.** Fix the finding, commit, and run /ship again on the new head; that
 run's Step 9 row records it `fixed`. If it should ship unfixed, take the stop
-to the owner: their ruled note (`gstack-approvals rule`) closes it, or their
-grant buys one fix-check. Never edit the review-log row or the loop file to
+to the owner: their ruled note (`gstack-approvals rule`) closes it. Ask for no
+fix-check grant: those are deprecated (GST-3562 A). Never edit the review-log row or the loop file to
 drop the finding, and never write the receipt by hand
 ([ship-policy.md](ship-policy.md#ship-receipt)).
 
@@ -7842,7 +7847,7 @@ drop the finding, and never write the receipt by hand
 **Meaning.** `gstack-ship-receipt write --review-loop-exception` refused the
 record and wrote nothing: it is not `{ accepted_by, date, via, reason }` with
 exactly one of `fix_check: { head, findings[, files] }` (a stop after a
-fix-check) or `second_pass: { head, deferred: [<finding id>] }` (a stop after
+fix-check; deprecated with fix-check grants and removed next release) or `second_pass: { head, deferred: [<finding id>] }` (a stop after
 the second full pass left a finding open, TRUT-7), `--review-loop` is missing
 or does not show that stop (no fix-check counted, or fewer than two passes or
 no deferred finding), the head is neither the receipt head nor its ancestor, or
@@ -7933,34 +7938,38 @@ landed on the base, a stamp on the branch's own rows in a stamp file it also
 changed as product (every changed line at a branch-added position, the mode
 unchanged, the base not touching the file), a stamp file the branch changes by
 no more than a stamp against each head's base (a changelog-fragment conversion
-that puts `package.json` back at the base's content), or base context next to unchanged
-hunks after a clean scoped review ([`RECEIPT_CARRY_SCOPED_REVIEW`](#receipt-carry-scoped-review)), which the
+that puts `package.json` back at the base's content), base context next to unchanged
+hunks, or hunks the base merge spliced after a clean scoped review ([`RECEIPT_CARRY_SCOPED_REVIEW`](#receipt-carry-scoped-review)), which the
 `carry` object in the carried receipt records with the product patch-id and
 the range-diff evidence ([unattended.md](unattended.md#the-terminal-line)).
 
 <a id="receipt-carry-scoped-review"></a>
 ### `RECEIPT_CARRY_SCOPED_REVIEW`
 
-**Meaning.** Every product path the branch touches has the reviewed +/- lines
-in the same places, but the base edited context lines next to some of them, so
-the 3-line patches differ (GST-384: main reworded the line above the PR's
-hunk). A hunk whose added lines are unchanged but whose removed lines changed with
-the base (the base took `SAVE_VERSION := 83` under the branch's `:= 84`) doesn't
-count: the PR's own removed lines changed, so it's `RECEIPT_CARRY_PRODUCT_CHANGED`
-and a full review (GST-2706). The merge may have spliced the two, as in a JSON entry where the branch
-changed one key and the base the next, so the receipt does not carry silently.
+**Meaning.** The base replaced the very lines one of the branch's hunks
+replaces, and the merge kept both: each current line is the base's new line
+plus exactly the tokens the branch added, as when both sides appended an entry
+to one expected-value list (GST-2975). The branch's own lines are not the
+reviewed bytes, so the receipt does not carry silently. Base context that only
+moved next to the branch's unchanged hunks (GST-384: main reworded the line
+above the PR's hunk) no longer stops here: when the branch's +/- lines, file
+modes and symlink targets are the reviewed ones, the carry passes and CI on the
+merged head is the check (GST-3562). A hunk whose added lines are unchanged but
+whose removed lines changed with the base (the base took `SAVE_VERSION := 83`
+under the branch's `:= 84`) is `RECEIPT_CARRY_PRODUCT_CHANGED` and a full
+review (GST-2706).
 The refusal names the paths and a packet file with the hunks that differ and
 the base's own change. The same lines moved somewhere else are
 `RECEIPT_CARRY_PRODUCT_CHANGED`, not this code. A packet section with over
 200 of the branch's own +/- lines takes the full loop instead. Nothing else
 counts toward that limit: the context lines and headers of the branch's hunks,
 which a base merge can move (GST-2229), and the base's own change, already
-merged at base (GST-1226), are shown and not counted, so a large base edit next
-to the branch's hunks still gets the scoped read. A base change over 2,000 lines
+merged at base (GST-1226), are shown and not counted. A base change over 2,000 lines
 in one file counts in full again and takes the full loop.
 
-**Fix.** Dispatch one fix-check reviewer
-([review-policy.md](review-policy.md)) on the packet. When it comes back clean,
+**Fix.** Dispatch one scoped reader
+([review-policy.md](review-policy.md)) on the packet, without asking: it is not a
+review round. When it comes back clean,
 write `{"head":"<HEAD>","paths":[...],"reviewer":"<model>","verdict":"clean"}`
 and rerun `gstack-ship-receipt carry ... --scoped-review <record.json>`; the
 carry reason records the reviewer and the paths. A blocking finding means /ship
@@ -8035,9 +8044,11 @@ final head; this stop then means that review found a blocker or a gate-class edi
 notes; a fix applied after it, even below the floor, stops for the lane's
 Captain (GST-3562 A).
 
-**Fix.** The lane's Captain decides. Ship with the open notes listed, park, or,
-when a finding above the floor is open in this PR's own change, buy the stopped
-review's fix round:
+**Fix.** The lane's Captain decides: ship with the open notes listed, park, or
+keep the fix and run /ship again for one more read-only full review of the final
+head. Round grants are deprecated (GST-3562 A) and the next release removes them,
+so record no new one. The steps below serve only a grant recorded before
+GST-3562, which still buys the stopped review's fix round:
 
 1. Record the stop: `gstack-ship-receipt stop --pr <n> --run <the /ship run>
    --since <REVIEW_SINCE>` (`/ship` runs it on `NEXT: stop`). It prints
@@ -8052,7 +8063,8 @@ review's fix round:
    since that head, with no new full review. The run claims the grant first
    (`gstack-ship-receipt claim`).
 
-A head no review has stopped at takes an `--kind extra-round` grant instead:
+A head no review has stopped at takes an `--kind extra-round` grant instead
+(deprecated the same way):
 one full round with its fix round. Each grant is spent by the one run that
 claims it. When `PR_REVIEW_GRANT: not applied (...)` prints, the reason names
 what doesn't match (another stop or head, a stale stop, a claimed grant). This
@@ -8069,8 +8081,10 @@ gstack can tie to one commit: the newest `via:ship` reading row since
 or its commit isn't HEAD or under it. It recorded no stop record, so
 no fix-check grant can buy that review's fix round.
 
-**Fix.** The lane's Captain ships with the open notes listed, parks, or rules
-the fix round with a grant that needs no stop record: `gstack-approvals
+**Fix.** The lane's Captain ships with the open notes listed, or parks. Fix-check
+grants are deprecated (GST-3562 A) and go in the next release, so record no new
+one. Before GST-3562 the Captain could rule the fix round with a grant that needs
+no stop record, and one recorded then still works for one release: `gstack-approvals
 round-grant --pr <n> --head <the reviewed head> --kind fix-check --reason <why>
 --by <lane or Captain>` (add `--owner-ref` and `--words` inside an open run).
 The run then claims it, commits the fix, runs the one scoped fix-check
@@ -8129,8 +8143,9 @@ fix-check row that doesn't count (`converged:false`, partial hunks) spends
 nothing: log a correct row in the same run instead of asking for a new grant
 ([review-policy.md](review-policy.md#one-grant-path)).
 
-**Fix.** Record a new grant for the stop the PR is at now; `gstack-ship-receipt
-stop` prints the command ([troubleshooting](#pr-round-cap)).
+**Fix.** Record no new grant: fix-check and round grants are deprecated
+(GST-3562 A). The lane's Captain decides the stop as
+[`PR_ROUND_CAP`](#pr-round-cap) says.
 
 <a id="grant-unknown"></a>
 ### `GRANT_UNKNOWN`
