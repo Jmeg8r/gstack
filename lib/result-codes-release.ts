@@ -415,10 +415,25 @@ export const RELEASE_RESULT_CODES = {
     summary: 'the prose /ship is about to publish (a CHANGELOG entry or a PR body) carries an AI tell a regular expression can decide',
     fix: 'rewrite each PROSE: line in the draft the way its hint says, then rerun gstack-prose-lint on the same file',
   },
+  RECEIPT_BLOCKER_OPEN: {
+    anchor: 'receipt-blocker-open',
+    summary: 'the review loop stopped at this head with a blocking finding still open (a Step 9 or Step 11 finding, the second-model review included, whose newest review-log action is still open and no owner ruling closed), so no receipt is written',
+    fix: 'fix the finding and run /ship again on the new head, or take the stop to the owner, whose ruled note or grant closes it; never write the receipt by hand or drop the finding from the review-log row',
+  },
   REVIEW_LOOP_EXCEPTION_INVALID: {
     anchor: 'review-loop-exception-invalid',
     summary: 'write --review-loop-exception got an exception that is malformed, accepts a stop the review loop does not show (a fix_check with review_loop.fix_checks 0 or missing, or a second_pass with fewer than two passes or no deferred finding), names a head that is not the receipt head or its ancestor, or is missing from the PR body',
     fix: 'pass { accepted_by, date, via, reason } plus fix_check: { head, findings } or second_pass: { head, deferred: [<finding id>] } with the owner’s words, the --review-loop summary that shows that stop, and the printed "Review-loop exception: …" line in the body',
+  },
+  CI_CARRY_TREE_LOG_UNBOUND: {
+    anchor: 'ci-carry-tree-log-unbound',
+    summary: 'a CI run with no tree.json artifact (artifact storage full) has one GSTACK_TREE_JSON line in its job log, but the runner did not stamp it inside the step the run profile names in tree_log_step, at least a second after every earlier step ended and a second before every later one started, or that step is missing, repeated or did not succeed; a line printed anywhere else (a test, for one) is never evidence',
+    fix: 'print the line only from the step tree_log_step names, after the test step, with sleep 1 before it and sleep 5 after it (docs/pregate.md#tree-log-step); then dispatch a fresh run at the same head and rerun gstack-ci-carry wait',
+  },
+  CI_CARRY_RERUN_MALFORMED: {
+    anchor: 'ci-carry-rerun-malformed',
+    summary: 'a CI run\'s tree.json carries rerun_files or attempts in a shape gstack cannot read (rerun_files not a list of paths, attempts not a list of attempt numbers), so the run is not evidence and no lane carries from it',
+    fix: 'fix the workflow step that writes tree.json (rerun_files: ["test/a.test.ts", …], attempts: [1, 2]), dispatch a fresh run at the same head, then rerun gstack-ci-carry wait',
   },
   RECEIPT_CARRY_TREE_MISMATCH: {
     anchor: 'receipt-carry-tree-mismatch',
@@ -430,10 +445,40 @@ export const RELEASE_RESULT_CODES = {
     summary: 'the product diff against the base changed between the receipt\'s head and HEAD (a product file differs beyond a base merge, a test-only fix, release metadata or a regenerated output), so the reviewed verdict does not cover HEAD',
     fix: 'run /ship on the new head; the receipt carries only when every changed path is a test, release metadata, a registered output the pregate regen check proved, or the base merge, and the product patch-id is unchanged; base context next to unchanged reviewed hunks is RECEIPT_CARRY_SCOPED_REVIEW instead (one scoped fix-check, no /ship)',
   },
+  STOP_UNBOUND: {
+    anchor: 'stop-unbound',
+    summary: 'gstack-ship-receipt stop found no review of this run bound to one committed tree, so it recorded no stop record',
+    fix: 'nothing for a grant to answer: the lane or its Captain ships with the open notes listed or parks; a fresh /ship run gives the head its review',
+  },
+  GRANT_SPENT: {
+    anchor: 'grant-spent',
+    summary: 'another /ship run already claimed this round grant, and a grant buys one round',
+    fix: 'the lane or its Captain records a new grant for the stop the PR is at now (gstack-ship-receipt stop prints the command)',
+  },
+  SHIP_RUN_ABANDON_REFUSED: {
+    anchor: 'ship-run-abandon-refused',
+    summary: 'gstack-ship-run abandon left the /ship run record as it was: the run beat in the last 60 minutes, the record names another run or already ended, or an unreadable record\'s digest did not match',
+    fix: 'read gstack-ship-run status: wait until the earliest abandon time it prints if the run may still be working, pass the run it names (an unreadable record: --run unknown --sha256 <its digest>), and leave an ended run alone',
+  },
+  SHIP_RUN_RECORD_UNREADABLE: {
+    anchor: 'ship-run-record-unreadable',
+    summary: 'this checkout\'s /ship run record (git dir gstack-ship-run) is neither a run record nor a run id, so every guard reads it as an open run',
+    fix: 'if no /ship run is working on this checkout, end it with the gstack-ship-run abandon --run unknown --sha256 <digest> command status prints, once',
+  },
+  GRANT_UNKNOWN: {
+    anchor: 'grant-unknown',
+    summary: 'the branch approval record holds no approved review_round_grant row with this id',
+    fix: 'pass the id gstack-approvals round-grant printed, from a checkout that sees the record or its mirror',
+  },
   RECEIPT_CARRY_SCOPED_REVIEW: {
     anchor: 'receipt-carry-scoped-review',
     summary: 'the branch\'s own +/- lines are the reviewed ones, but the base edited context next to them, so the merge may have spliced the two (GST-384); the receipt carries only after a scoped review of those hunks',
     fix: 'dispatch one fix-check reviewer on the packet the refusal names, write its clean verdict as { head, paths, reviewer, verdict } and rerun carry with --scoped-review <record.json>; a blocking finding means /ship on the new head',
+  },
+  RECEIPT_DOCS_AUDIT_READ: {
+    anchor: 'receipt-docs-audit-read',
+    summary: 'the Step 14.5 docs audit edited a doc the review read for its own content (a gate path, gate tags, agent prose or a secret line) after the review, so the receipt binds only after one scoped reader reads that change (GST-3532); it is not a review round',
+    fix: 'dispatch one reader on the packet the refusal names, write its clean verdict as { head, paths, reviewer, verdict, packet_sha256 } and rerun write with --docs-audit-read <record.json>; a finding goes to the lane\'s Captain',
   },
   DOCS_AUDIT_BLOCKED: {
     anchor: 'docs-audit-blocked',
@@ -569,7 +614,52 @@ export const RELEASE_RESULT_CODES = {
   REVIEW_DIFF_TOO_LARGE: {
     anchor: 'review-diff-too-large',
     summary: 'one reviewer\'s diff is over the 2,000,000-byte review ceiling, so /ship stopped before writing a manifest or a brief instead of handing a reader more than it can read',
-    fix: 'follow the fix the line prints for where the base policy stands: land the printed review_exclude_paths JSON on the base as its own PR, then bring the base into the branch and rerun once; or narrow a pattern the kept-file bound skipped; or split the PR',
+    fix: 'follow the fix the line prints for where the base policy stands: land the printed review_exclude_paths JSON on the base as its own PR, then bring the base into the branch and rerun once; or split the PR',
+  },
+  REVIEW_EXCLUDE_KEEP_TOO_LARGE: {
+    anchor: 'review-exclude-keep-too-large',
+    summary: 'a review_exclude_paths pattern keeps so many matched files in review that the command readers run to read them would pass 24,000 argument bytes, so gstack-review-plan stopped instead of silently dropping the pattern; the line names the pattern, the kept count, the reasons they are kept and the bytes',
+    fix: 'when the kept files are published data (reason code on .patch, MANIFEST.sha256 or extension-less files), land a review_content_patterns entry over them beside the pattern on the base as its own PR, then bring the base into the branch and rerun once; otherwise narrow the pattern or split the PR',
+  },
+  VENDORED_MISMATCH: {
+    anchor: 'vendored-mismatch',
+    summary: 'a file a vendored manifest pins is not byte-for-byte the upstream file at the pinned commit (its git blob id differs), so it is not treated as vendored and stays in review',
+    fix: 'restore the upstream bytes (rebuild it from the pinned commit), or remove the entry from the manifest so the edited file is reviewed as the repo\'s own code',
+  },
+  VENDORED_ABSENT_UPSTREAM: {
+    anchor: 'vendored-absent-upstream',
+    summary: 'the upstream path a vendored manifest entry names does not exist at the pinned commit',
+    fix: 'correct the entry\'s upstream_prefix, file path or commit in the manifest so it names a file that exists upstream at that commit',
+  },
+  VENDORED_ABSENT_LOCAL: {
+    anchor: 'vendored-absent-local',
+    summary: 'a vendored manifest lists a file that is not in the commit being checked',
+    fix: 'add the file, or remove its entry from the manifest (the repo\'s build writes both, so rebuild them together)',
+  },
+  VENDORED_MODE: {
+    anchor: 'vendored-mode',
+    summary: 'a vendored file is an executable, a symlink or a submodule, here or upstream; only plain files (mode 100644 on both sides) count as vendored',
+    fix: 'clear the executable bit if the upstream file is a plain file, or remove the entry so the file is reviewed',
+  },
+  VENDORED_UNREACHABLE: {
+    anchor: 'vendored-unreachable',
+    summary: 'the pinned commit is not reachable from the upstream\'s default branch, its tags or a branch the base policy names for it (a fork\'s commit, a pull request head, a merge-queue branch or a force-pushed commit), so its files stay in review',
+    fix: 'pin a commit on the upstream\'s default branch or a release tag; if the upstream ships from another branch, add it to that upstream\'s branches in review_vendored on the base branch as its own PR',
+  },
+  VENDORED_NOT_ALLOWLISTED: {
+    anchor: 'vendored-not-allowlisted',
+    summary: 'a vendored manifest pins files to an upstream that the base branch\'s review_vendored.upstreams does not list; a branch cannot trust a new upstream for itself',
+    fix: 'add the upstream URL to review_vendored.upstreams on the base branch as its own PR, then bring the base into the branch and rerun',
+  },
+  VENDORED_FETCH_FAILED: {
+    anchor: 'vendored-fetch-failed',
+    summary: 'the upstream could not be fetched anonymously over https (deleted, renamed, private, redirected, or the network failed or timed out), so its files could not be checked and stay in review',
+    fix: 'rerun once (a fetch has no side effects); if it fails again, check the URL opens without signing in and does not redirect, and update review_vendored.upstreams on the base if the repository moved',
+  },
+  VENDORED_MANIFEST_INVALID: {
+    anchor: 'vendored-manifest-invalid',
+    summary: 'a manifest the base policy lists is missing at the commit being checked or does not follow gstack-vendored/v1 (the line names the field), so none of its files count as vendored',
+    fix: 'fix the field the line names (docs/vendored-code.md#the-manifest), usually by rerunning the repo\'s build that writes the manifest',
   },
   REVIEW_DIFF_UNREADABLE: {
     anchor: 'review-diff-unreadable',
@@ -578,8 +668,8 @@ export const RELEASE_RESULT_CODES = {
   },
   REVIEW_PLAN_STOPPED: {
     anchor: 'review-plan-stopped',
-    summary: 'gstack-review-plan did not finish inside the pass (reason=timeout after timeout_ms, reason=signal when something killed it, reason=spawn when it could not start), so the review stopped before any reader ran: gstack-review-dispatch pass writes no manifest, and a plan run by itself prints no plan',
-    fix: 'rerun once unchanged; if it stops again, report this line and the repository\'s file count (git ls-files | wc -l) to your Captain; reason=signal: check the machine\'s free memory first',
+    summary: 'gstack-review-plan did not finish inside its limit (reason=timeout after timeout_ms, reason=signal when something killed it, reason=spawn when it could not start), so the review stopped before any reader ran: gstack-review-dispatch pass writes no manifest, render writes no brief, and a plan run by itself prints no plan',
+    fix: 'rerun once unchanged; if reason=timeout again on a large repository (git ls-files | wc -l in the hundreds of thousands), set GSTACK_REVIEW_PLAN_TIMEOUT_MS (milliseconds, default 180000) to about twice the plan\'s time and rerun; otherwise report this line and the file count to your Captain; reason=signal: check the machine\'s free memory first',
   },
   REVIEW_EXCLUDE_REFERENCE: {
     anchor: 'review-exclude-reference',
@@ -601,5 +691,26 @@ export const RELEASE_RESULT_CODES = {
     anchor: 'fetch-rerun-spent',
     summary: 'the stage\'s one rerun fetched too, so the pass stopped with its readers quarantined, resuming it starts no later stage and returns no reader output, and verify refuses',
     fix: 'deal with the printed paths, find out why readers keep fetching, then start a fresh pass under a new --pass and --out; a third attempt is never automatic',
+  },
+  // GST-3053: gstack-ship-release push's last line, `PUSH: failed reason=<code>` (docs/unattended.md#push-line).
+  PUSH_REFUSED: {
+    anchor: 'push-refused',
+    summary: 'gstack-ship-release push stopped before git push ran (a usage error, the wrong branch, the unanswered pre-push offer, open gate findings on a ready PR, sealed output, the secrets scan, the pre-push guards or a branch name that is not plain words), so nothing was pushed',
+    fix: 'follow the STOP: line above it, then rerun gstack-ship-release push',
+  },
+  PUSH_REJECTED: {
+    anchor: 'push-rejected',
+    summary: 'git push was rejected: the remote branch has commits this branch lacks (non-fast-forward) or the remote refused the update, so nothing was pushed',
+    fix: 'for a non-fast-forward, fetch and merge the remote under Step 3\'s conflict rules, run Steps 5-16 again, then rerun push; when the remote refused the update (GH007 email privacy, a protected branch), change what the STOP: line names instead (for GH007, the noreply email on every commit); never force-push',
+  },
+  PUSH_GIT_FAILED: {
+    anchor: 'push-git-failed',
+    summary: 'git could not read the remote branch or git push failed for another reason (authentication, a pre-push hook or the network), so nothing was pushed',
+    fix: 'repair the cause git printed in the STOP: line, repeat Step 16, then rerun push; never bypass a guard',
+  },
+  SPAWN_OUTPUT_INCOMPLETE: {
+    anchor: 'spawn-output-incomplete',
+    summary: 'a child process reported an error (ENOBUFS when its output passed maxBuffer) even though its exit status may be 0, so its output may be cut off and was not used',
+    fix: 'rerun once; if the output really is that large (a huge diff or file list), narrow the range or paths, and report a repeat to the gstack maintainers with the command named here',
   },
 } as const satisfies Record<string, ResultCode>;

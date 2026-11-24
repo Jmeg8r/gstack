@@ -13,7 +13,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { ResultCodeName } from './result-codes';
 import { matchesAny } from './ship-policy';
-import { decodeCharRefs, DOC_SECRET_LINE, matchRisk, RISK_CLASSES, RISK_RULES, SECRET_PATH, secretPath, SVG_PATH, svgActive, TOKEN_PATH, type RiskClass } from './review-risk';
+import { decodeCharRefs, DOC_SECRET_LINE, matchRisk, RESULTS_TREE, RISK_CLASSES, RISK_RULES, SECRET_PATH, secretPath, SVG_PATH, svgActive, TOKEN_PATH, type RiskClass } from './review-risk';
 
 export type DiffClass = 'docs' | 'tests' | 'code' | 'gate';
 export type PathClass = 'docs' | 'tests' | 'code';
@@ -69,6 +69,10 @@ export const isDataConfig = (p: string) => DATA_CONFIG.some(r => r.test(p));
 export const BINARY_DATA_PATH = /\.(sqlite3?|db|duckdb|parquet|arrow|feather|avro|orc|npy|npz|h5|hdf5|pdf|mp3|mp4|mov|wav|webm|log|out)$|(^|\/)logs\/[^/.]+$/i;
 /** Data files: JSON, CSV, TSV and raster images. YAML and TOML are never data here: deploy configs and API specs stay code. An SVG is data only as a drawing (svgDrawing); executable SVG stays code. */
 export const DATA_PATH = /\.(json|jsonl|ndjson|csv|tsv|png|jpe?g|gif|webp|bmp|ico|avif)$/i;
+/** Row data, never runtime lines whether code names it or not (harness-evals#432 counted its results rows as code); JSON counts too in a docs, results or preregistration tree. */
+export const DATA_ROWS = /\.(jsonl|ndjson|csv|tsv)$/i;
+/** A preregistration's own directory or file (R114): a path segment named prereg or preregistration (wiki/plans/<id>-prereg/, prereg-harbor.json, lanes/<x>/prereg2.md). */
+export const PREREG_PATH = /(^|\/|[-_.])(prereg|preregistration)s?\d*([-_./]|$)/i;
 /** Data-shaped files tools read by convention, with no code naming them: always code. */
 const DATA_CONFIG = [
   /(^|\/)\.github\//, /(^|\/)config\//, /(^|\/)\.[^/]+$/, /(^|\/)[^/]+\.config\.[^/]+$/, HARNESS_PINS,
@@ -168,7 +172,7 @@ export function svgDrawing(text: string): boolean {
 /** A hash of the constants and patterns that decide a depth, not of this file's bytes: a comment edit keeps it, a threshold edit changes it. */
 export const DEPTH_RULES = createHash('sha256').update(JSON.stringify({
   RISK_RULES, SMALL_DIFF_LINES, RED_TEAM_LINES, LARGE_DIFF_LINES, FULL_PASS_CAP, LIGHT_FIXED, BATCH_SCOPED, SCOPED_RANGE_LINES, ROLE_EFFORT, SVG_ELEMENTS: [...SVG_ELEMENTS],
-  patterns: Object.entries({ BINARY_DATA_PATH: [BINARY_DATA_PATH], GATE_PATH, AGENT_PROSE, TEST_PATH, RELEASE_METADATA, DOC_PATH: [DOC_PATH], DATA_PATH: [DATA_PATH], DATA_CONFIG, SVG_MARKUP: [SVG_MARKUP], SVG_REFUSED, SVG_HREF: [SVG_HREF], SVG_STYLE_OPEN: [SVG_STYLE_OPEN], SVG_STYLE_CLOSE: [SVG_STYLE_CLOSE], SVG_STYLE_TAG: [SVG_STYLE_TAG], SVG_TAG_NAME: [SVG_TAG_NAME], SVG_ATTR: [SVG_ATTR], SVG_CSS_REF: [SVG_CSS_REF], SVG_CSS_REFUSED: [SVG_CSS_REFUSED] }).map(([k, v]) => [k, v.map(r => `/${r.source}/${r.flags}`)]),
+  patterns: Object.entries({ BINARY_DATA_PATH: [BINARY_DATA_PATH], DATA_ROWS: [DATA_ROWS], PREREG_PATH: [PREREG_PATH], GATE_PATH, AGENT_PROSE, TEST_PATH, RELEASE_METADATA, DOC_PATH: [DOC_PATH], DATA_PATH: [DATA_PATH], DATA_CONFIG, SVG_MARKUP: [SVG_MARKUP], SVG_REFUSED, SVG_HREF: [SVG_HREF], SVG_STYLE_OPEN: [SVG_STYLE_OPEN], SVG_STYLE_CLOSE: [SVG_STYLE_CLOSE], SVG_STYLE_TAG: [SVG_STYLE_TAG], SVG_TAG_NAME: [SVG_TAG_NAME], SVG_ATTR: [SVG_ATTR], SVG_CSS_REF: [SVG_CSS_REF], SVG_CSS_REFUSED: [SVG_CSS_REFUSED] }).map(([k, v]) => [k, v.map(r => `/${r.source}/${r.flags}`)]),
 })).digest('hex').slice(0, 16);
 
 /**
@@ -258,7 +262,11 @@ const sanitize = (s: string) => s.replace(/[\0-\x1f]+/g, ' ').slice(0, 200);
 const isOutput = (i: ClassInput, p: string) => !!i.registry?.outputs.length && matchesAny(i.registry.outputs, p);
 export const unconsumedData = (i: Pick<ClassInput, 'consumed' | 'drawings' | 'root' | 'executables'>, p: string) => !i.executables?.includes(p) && Array.isArray(i.consumed) && !i.consumed.includes(p) && (dataCandidate(p, i.root) || (!!i.drawings?.includes(p) && svgCandidate(p, i.root)));
 const binaryData = (i: ClassInput, p: string) => !i.executables?.includes(p) && BINARY_DATA_PATH.test(p) && classifyPath(p, i.root) === 'code' && ![...AGENT_PROSE, ...GATE_PATH, TOKEN_PATH, ...DATA_CONFIG].some(r => r.test(p));
-const pathClass = (i: ClassInput, p: string): PathClass => i.executables?.includes(p) && !i.excluded?.has(p) ? 'code' : (i.excluded?.has(p) || (i.stampOnly ?? []).includes(p) || unconsumedData(i, p) || binaryData(i, p) ? 'docs' : classifyPath(p, i.root));
+/** A preregistration's plain data (R114): a data candidate under PREREG_PATH, docs even when code names it; its guard and risk checks still run (classifyDiff). */
+const preregData = (i: ClassInput, p: string) => !i.executables?.includes(p) && PREREG_PATH.test(p) && dataCandidate(p, i.root);
+/** A data file whose lines are rows, not runtime lines (DATA_ROWS): a JSON elsewhere, such as a guard's allowlist, can be config and keeps counting. */
+const dataRows = (i: ClassInput, e: PathLines) => !e.binary && !i.executables?.includes(e.path) && dataCandidate(e.path, i.root) && (DATA_ROWS.test(e.path) || (/\.json$/i.test(e.path) && (RESULTS_TREE.test(e.path) || PREREG_PATH.test(e.path))));
+const pathClass = (i: ClassInput, p: string): PathClass => i.executables?.includes(p) && !i.excluded?.has(p) ? 'code' : (i.excluded?.has(p) || (i.stampOnly ?? []).includes(p) || unconsumedData(i, p) || binaryData(i, p) || preregData(i, p) ? 'docs' : classifyPath(p, i.root));
 
 /** The diff's class, raised to gate by any gate signal; `errors` lists every input that fails the depth closed; `runtimeLines` counts code-class lines outside the base registry's outputs. */
 export function classifyDiff(i: ClassInput): ClassResult {
@@ -270,12 +278,14 @@ export function classifyDiff(i: ClassInput): ClassResult {
   for (const p of i.paths) { const c = pathClass(i, p); if (CLASS_RANK[c] > CLASS_RANK[cls]) raise(c, `${c}: ${p}`); }
   const data = i.paths.filter(p => unconsumedData(i, p));
   if (data.length) reasons.push(`docs: ${data.length} data path(s) no code names`);
+  const prereg = i.paths.filter(p => !i.excluded?.has(p) && preregData(i, p) && !unconsumedData(i, p));
+  if (prereg.length) reasons.push(`docs: ${prereg.length} preregistration data path(s) (R114)`);
   const s = i.scope ?? {};
   if (s.SCOPE_ERROR) {
     raise('code', `scope error: ${s.SCOPE_ERROR}`);
     errors.push({ code: 'scope_error', detail: sanitize(s.SCOPE_ERROR), input: 'gstack-diff-scope <base>', repair: 'run gstack-diff-scope <base> by hand and fix what it reports' });
   }
-  if (CLASS_RANK[cls] >= CLASS_RANK.tests) {
+  if (CLASS_RANK[cls] >= CLASS_RANK.tests || prereg.length) {
     if (i.gateTagged === null) {
       raise('gate', 'gate scan unavailable');
       errors.push({ code: 'gate_scan_unavailable', detail: 'gstack-gate-diff reported no GATE_SUMMARY', input: 'gstack-gate-diff <base>', repair: 'run gstack-gate-diff <base> and read its GATE_ERROR line, or pass the recorded scan as --gate-tagged <n>' });
@@ -289,7 +299,7 @@ export function classifyDiff(i: ClassInput): ClassResult {
     for (const p of i.paths) if (GATE_PATH.some(r => r.test(p)) || secretPath(p, [...(i.added?.[p] ?? []), ...(i.removed?.[p] ?? [])])) { raise('gate', `gate path: ${p}`); break; }
     if (i.registry?.error) errors.push(i.registry.error);
   }
-  const riskHits = CLASS_RANK[cls] >= CLASS_RANK.code ? matchRisk({ codePaths: i.paths.filter(p => pathClass(i, p) === 'code'), executables: i.executables, added: i.added, removed: i.removed, scopeAuth: s.SCOPE_AUTH === 'true', ...(i.riskPaths?.length ? { isRiskPath: (p: string) => matchesAny(i.riskPaths!, p) && !DATA_PATH.test(p) } : {}) }) : new Map<RiskClass, string>();
+  const riskHits = CLASS_RANK[cls] >= CLASS_RANK.code || prereg.length ? matchRisk({ codePaths: i.paths.filter(p => pathClass(i, p) === 'code' || prereg.includes(p)), executables: i.executables, added: i.added, removed: i.removed, scopeAuth: s.SCOPE_AUTH === 'true', ...(i.riskPaths?.length ? { isRiskPath: (p: string) => matchesAny(i.riskPaths!, p) && !DATA_PATH.test(p) } : {}) }) : new Map<RiskClass, string>();
   const docSecret = i.paths.find(p => DOC_PATH.test(p) && (i.added?.[p] ?? []).some(l => DOC_SECRET_LINE.some(r => r.test(l))));
   if (docSecret && !riskHits.has('security')) riskHits.set('security', `docs that can print a credential: ${docSecret}`);
   const byRank = (a: RiskClass, b: RiskClass) => RISK_CLASSES.indexOf(a) - RISK_CLASSES.indexOf(b);
@@ -301,7 +311,7 @@ export function classifyDiff(i: ClassInput): ClassResult {
   if (!i.perPath) return { class: cls, reasons, errors, runtimeLines: null, risk, detected, declared };
   let runtimeLines = 0;
   for (const e of i.perPath) {
-    if (pathClass(i, e.path) !== 'code' || isOutput(i, e.path)) continue;
+    if (pathClass(i, e.path) !== 'code' || isOutput(i, e.path) || dataRows(i, e)) continue;
     if (e.binary) errors.push({ code: 'binary_code_path', detail: 'git reports a binary change, so its lines cannot be counted', input: e.path, repair: "register it as an output of an entry with a command in the base branch's .gstack/generated.json, or accept the full review" });
     else runtimeLines += e.lines;
   }
@@ -388,39 +398,96 @@ export interface History {
   postReview?: boolean;
   /** In the loop, the CLI bound `granted` to the last fix-check's own stop head, its commit (--range-base): a new grant, never the previous link's. */
   chained?: boolean;
+  /** R51 rounds earlier /ship runs on this PR already spent, fix-checks and scoped passes included (--prior-rounds; GST-2673): printed as pr_rounds=. */
+  priorRounds?: number;
+  /** The full review rounds among them (--prior-full): the PR cap compares these plus this run's full passes with FULL_PASS_CAP, so a run's own fix rounds stay as the in-run table plans them. */
+  priorFull?: number;
+  /** The lane's or Captain's recorded round grant at this head (--round-grant): one more round for the PR, with its fix round, never the owner's. */
+  roundGrant?: string;
+  /** A fix-check round grant that answers the stop record at --stop (GST-2968): the stopped review's fix round, one scoped fix-check of the PR's own change since the stop's head, in this run or a new one. */
+  grantedStop?: string;
 }
-export interface NextStep { step: Step; reason: string }
+/**
+ * keepReader (GST-3562 A): this step stands where main's table planned a fix-check, or is the read-only final review, so its
+ * dispatch keeps one full-effort reader that excludes nothing (the reader the fix-check was). The table sets it; prCapped's
+ * spreads carry it; the dispatch reads it, never the reason text. readOnly marks the read-only final review: the dispatcher
+ * stages it on the PR's merge base whatever --diff-base the driver passes, and Step 3's edit guard applies no fix on it.
+ */
+export interface NextStep { step: Step; reason: string; keepReader?: true; readOnly?: true }
 
 /**
  * The transition table (docs/review-policy.md#transitions). Pass 1 is full. A fixed
  * blocking finding earns a second full pass on the range, scoped when `depth` (known
  * only to planReview) is below full and the fix range has at most SCOPED_RANGE_LINES
- * runtime lines; any other fix earns one fix-check, except a light pass whose fix range
- * changes no runtime lines; two rounds is the cap (R51: a scoped pass or a fix-check is
- * one): after round 2, below-floor fixes finish with notes, and a blocker open or fixed
- * there, or a gate-class edit there, stops for the owner, whose grant may add one scoped fix-check.
+ * runtime lines; any other fix earns a full second pass on the range too, except a light pass whose fix range
+ * changes no runtime lines (GST-3562 A: no new fix-check is planned, and the step's keepReader keeps the full-effort reader
+ * the fix-check was); two rounds is the cap (R51), and capStep says what a fix after the cap gets.
  * The cap limits fix rounds, not Step 11's voices: on gate class any stop waits for them (GST-967),
- * and the owner's recorded grant (`granted`) turns the stop after a round-2 full pass with a fixed finding, or after a round-2
- * fix-check when `fixChecks` says it was the only one (GEVA-223), into its one fix-check; a fix-check never earns another, so
+ * and the owner's recorded grant (`granted`) turns the stop after a round-2 fix-check that was the run's only one
+ * (`fixChecks`, GEVA-223) into one more fix-check, for one release; a fix-check never earns another, so
  * the grant cannot repeat. Edits after the review bound (`postReview`) that follow a fix-check are a new stop, and a new grant
  * there adds one fix-check, the next link of the chain finish counts (GST-1676, docs/ship-policy.md#fix-check-chain). In the
  * loop, a grant the CLI bound to the last fix-check's own stop head (`chained`) adds one more the same way (GST-1681).
  */
 export function nextStep(h: History, depth?: Depth): NextStep {
-  const n = h.lean ? leanStep(h, depth) : loopStep(h, depth);
+  if (h.grantedStop && h.last !== 'fix-check') return h.rangeRuntimeLines == null
+    ? { step: 'stop', reason: `fix-check grant ${h.grantedStop} answers the stop, but there is no fix to read since its head: commit the fix (a base merge, an empty or reverted change is none), then ask again` }
+    : { step: 'fix-check', reason: `fix-check grant ${h.grantedStop} buys the stopped review's fix round: one scoped fix-check of the PR's own change since the stop's head, never a new full review and never a second fix-check` };
+  const n = prCapped(h, h.lean ? leanStep(h, depth) : loopStep(h, depth));
   if (n.step !== 'stop') return n;
   if (h.gate && !h.adversarialRan) return { step: 'voices', reason: `gate class: Step 11's ${h.lean ? 'one reader' : 'voices (adversarial, outside, targeted)'} run${h.lean ? 's' : ''} before the owner's exit, then ask again with --adversarial-ran (${n.reason})` };
   const afterFixCheck = h.last === 'fix-check' && h.fullPasses === FULL_PASS_CAP - 1 && h.fixChecks === 1;
   if (h.postReview && h.last === 'fix-check' && h.granted && !h.blockingOpen) return { step: 'fix-check', reason: `the owner's grant ${h.granted} adds one scoped fix-check for the edits after the last fix-check, a new link of the fix-check chain (docs/ship-policy.md#fix-check-chain); a later post-review edit needs a grant of its own` };
   if (h.chained && h.last === 'fix-check' && h.granted && !h.blockingOpen) return { step: 'fix-check', reason: `the owner's grant ${h.granted} adds one scoped fix-check at the last fix-check's stop, a new link of the fix-check chain (docs/ship-policy.md#fix-check-chain); another stop needs a grant of its own` };
-  if (!h.lean && h.granted && !h.blockingOpen && (afterFixCheck || (h.last === 'full' && h.fullPasses === FULL_PASS_CAP))) return { step: 'fix-check', reason: `the owner's grant ${h.granted} adds one scoped fix-check after round ${FULL_PASS_CAP} (review_loop_exception), ${afterFixCheck ? 'never a second' : 'never a fourth round'}` };
+  if (!h.lean && h.granted && !h.blockingOpen && afterFixCheck) return { step: 'fix-check', reason: `the owner's grant ${h.granted} adds one scoped fix-check after round ${FULL_PASS_CAP} (review_loop_exception), never a second` };
   return n;
 }
 
 /**
+ * R51 per pull request (GST-2673, docs/review-policy.md#rounds-per-pull-request): the rounds earlier /ship runs on this
+ * PR spent count against FULL_PASS_CAP with this run's, and a recorded round grant at this head adds one. At the cap a
+ * below-floor fix ships as notes and anything else stops with PR_ROUND_CAP for the lane or its Captain, never the owner.
+ * A PR already at the cap gets one read-only full review of this head: no fix round, the count does not reopen, and a
+ * blocker stops with PR_ROUND_CAP as the lane's Captain's decision.
+ */
+function prCapped(h: History, n: NextStep): NextStep {
+  const prior = h.priorFull ?? 0;
+  const cap = FULL_PASS_CAP + (h.roundGrant ? 1 : 0);
+  if (prior >= cap) {
+    if (h.last === 'none') return n.step === 'full' || n.step === 'scoped' ? { step: 'full', reason: `read-only final review (R51): this PR already had ${prior} full review rounds on earlier heads, so this head gets one full review with no fix round; a blocker goes to the lane's Captain as a decision and the count does not reopen` } : n;
+    if (n.step === 'done') return n;
+    if (h.fixedBelow && !h.fixedBlocking && !h.blockingOpen && !h.touchedGate && n.step !== 'stop') return { step: 'stop', reason: `a fix followed the read-only final review: ${CAPTAIN_DECIDES}` };
+    if (!h.fixedBlocking && !h.blockingOpen && !h.touchedGate && n.step !== 'stop') return { step: 'done', reason: `read-only final review done (R51): its below-floor findings ship as notes in the PR body and receipt, with no fix round` };
+    return { step: 'stop', reason: `PR_ROUND_CAP: the read-only final review of a PR that already had ${prior} full review rounds found a blocker; the lane's Captain decides (ship with the note, park, or keep the fix and run /ship again for one more read-only full review of the final head), not an owner ask` };
+  }
+  if (!prior || (n.step !== 'full' && n.step !== 'scoped')) return n;
+  const used = prior + h.fullPasses;
+  if (used < cap) return { ...n, reason: `${n.reason}; this PR already had ${prior} full review round${prior === 1 ? '' : 's'} on earlier heads, so this is its full round ${used + 1} of ${cap}${used + 1 === cap ? ', the last' : ''}` };
+  if (h.roundGrant && used === cap && prior === cap - 1 && h.fullPasses === 1 && h.last === 'full') return { ...n, reason: `${n.reason}; round grant ${h.roundGrant} bought pass 1 as this PR's full round ${cap}, and this is that round's fix round, its last` };
+  if (h.last !== 'none' && !h.blockingOpen) return used === cap
+    ? { step: 'full', reason: `${READ_ONLY_REVIEW}; this PR already had ${prior} full review round${prior === 1 ? '' : 's'} on earlier heads`, keepReader: true, readOnly: true }
+    : { step: 'stop', reason: `a fix followed the read-only final review: ${CAPTAIN_DECIDES}` };
+  return { step: 'stop', reason: `PR_ROUND_CAP: this PR already had ${used} full review round${used === 1 ? '' : 's'} across its heads and /ship runs${h.roundGrant ? ` (round grant ${h.roundGrant} included)` : ''}; another needs a reason the lane or its Captain records with gstack-approvals round-grant, not an owner ask` };
+}
+
+const READ_ONLY_REVIEW = 'read-only final review (R51): fixes changed code after the last round, so the final head gets one full review of the whole PR diff (the dispatcher stages it on the merge base) with no fix round (GST-3562 A)';
+const CAPTAIN_DECIDES = "the lane's Captain decides (R51): ship with it as a ruled note, or keep the fix and run /ship again for one read-only full review of the final head";
+
+/**
+ * A step that applied fixes in the last allowed round (GST-3562 A, R51): the final head gets one read-only full review, unless
+ * the fixes are below-floor and change no runtime lines on a light diff; a fix after that read-only review stops for the lane's
+ * Captain. Code a fix changed never ships unread now that the fix-check is gone.
+ */
+function capStep(h: History, depth?: Depth): NextStep {
+  if (h.fullPasses > FULL_PASS_CAP) return { step: 'stop', reason: `a fix followed the read-only final review: ${CAPTAIN_DECIDES}` };
+  if (!h.fixedBlocking && !h.touchedGate && depth === 'light' && h.rangeRuntimeLines === 0) return { step: 'done', reason: `round cap ${FULL_PASS_CAP} reached: the below-floor fixes change no runtime lines and ship as notes in the PR body and receipt` };
+  return { step: 'full', reason: READ_ONLY_REVIEW, keepReader: true, readOnly: true };
+}
+
+/**
  * R65's lean table (GSTA-258): pass 1 is the one reviewer; any fix on a risk-class diff, and a fixed blocker or a gate-class
- * edit on any diff, earns one scoped fix-check (round 2, the cap); below-floor fixes on a light diff ship as notes. After the
- * fix-check a blocker or gate-class edit stops for the owner, whose recorded grant adds one more fix-check, never two.
+ * edit on any diff, earns the one reviewer's full pass on the range (round 2, the cap; GST-3562 A); below-floor fixes on a
+ * light diff ship as notes; capStep says what a fix after round 2 gets.
  */
 function leanStep(h: History, depth?: Depth): NextStep {
   if (h.last === 'none') return { step: 'full', reason: 'pass 1: one reviewer reads the whole diff (R65)' };
@@ -431,20 +498,19 @@ function leanStep(h: History, depth?: Depth): NextStep {
   }
   if (h.blockingOpen) return { step: 'stop', reason: 'a blocking finding is still open in fix scope: name it for the owner' };
   if (!h.fixedBlocking && !h.fixedBelow && !h.touchedGate) return { step: 'done', reason: 'the step applied no edits' };
-  if (depth === 'light' && !h.fixedBlocking && !h.touchedGate) return { step: 'done', reason: 'light depth: the below-floor fixes ship as notes in the PR body and receipt without a fix-check (R65)' };
-  return { step: 'fix-check', reason: `${h.fixedBlocking ? 'a blocking finding was fixed' : h.touchedGate ? 'a fix touched a gate-class path' : 'below-floor fixes on a risk-class diff'}: one scoped fix-check reads the touched hunks (round 2, the cap)` };
+  if (depth === 'light' && !h.fixedBlocking && !h.touchedGate && h.rangeRuntimeLines === 0) return { step: 'done', reason: 'light depth: the below-floor fixes change no runtime lines, so they ship as notes in the PR body and receipt (R65)' };
+  if (h.fullPasses >= FULL_PASS_CAP) return capStep(h, depth);
+  return { step: 'full', reason: `${h.fixedBlocking ? 'a blocking finding was fixed' : h.touchedGate ? 'a fix touched a gate-class path' : depth === 'light' ? 'below-floor fixes changed runtime lines' : 'below-floor fixes on a risk-class diff'}: round 2 is the one reviewer's full pass on the range, never a fix-check (R51, GST-3562 A)`, keepReader: true };
 }
 
 function loopStep(h: History, depth?: Depth): NextStep {
   if (h.last === 'none') return { step: 'full', reason: 'pass 1 reviews the whole diff' };
-  const fixed = !!(h.fixedBlocking || h.fixedBelow);
+  const fixed = !!(h.fixedBlocking || h.fixedBelow || h.touchedGate);
   if (h.last === 'fix-check') return h.blockingOpen || h.fixedBlocking || h.touchedGate ? { step: 'stop', reason: `the fix-check ${h.touchedGate && !h.blockingOpen && !h.fixedBlocking ? 'edited a gate-class path' : 'found a blocking finding'}: name it for the owner, whose grant may add one scoped fix-check, never a third round` } : { step: 'done', reason: fixed ? 'round cap 2 reached: the below-floor fixes ship as notes in the PR body and receipt' : 'the fix-check found nothing blocking' };
   if (h.blockingOpen && h.fullPasses >= FULL_PASS_CAP) return { step: 'stop', reason: `a blocking finding is open after ${FULL_PASS_CAP} rounds: name it for the owner` };
   if (h.blockingOpen) return { step: 'stop', reason: 'a blocking finding is still open in fix scope: name it for the owner' };
   if (!fixed) return { step: 'done', reason: 'the step applied no edits' };
-  if (h.fullPasses >= FULL_PASS_CAP) return h.fixedBlocking || h.touchedGate
-    ? { step: 'stop', reason: `${h.fixedBlocking ? 'a blocking finding was fixed' : 'a fix edited a gate-class path'} in round ${FULL_PASS_CAP}, the cap: name it for the owner, whose grant may add one scoped fix-check (review_loop_exception)` }
-    : { step: 'done', reason: `round cap ${FULL_PASS_CAP} reached: the below-floor fixes ship as notes in the PR body and receipt` };
+  if (h.fullPasses >= FULL_PASS_CAP) return capStep(h, depth);
   if (!h.fixedBlocking && !h.touchedGate && depth === 'light' && h.rangeRuntimeLines === 0) return { step: 'done', reason: 'light depth: the below-floor fixes change no runtime lines, so they ship as notes without a fix-check' };
   if (h.fixedBlocking || h.touchedGate) {
     if (!h.fixedBlocking) return { step: 'full', reason: 'a fix touched a gate-class path: full pass on the range' };
@@ -454,7 +520,7 @@ function loopStep(h: History, depth?: Depth): NextStep {
     if (keep) return { step: 'full', reason: `a blocking finding was fixed and ${keep}: full pass on the range` };
     return { step: 'scoped', reason: `a blocking finding was fixed on a ${depth} diff with ${n} runtime lines in the fix range (<= ${SCOPED_RANGE_LINES}): scoped pass on the range` };
   }
-  return { step: 'fix-check', reason: 'only below-floor fixes: one fix-check reads the touched hunks (round 2)' };
+  return { step: 'full', reason: 'below-floor fixes changed code after round 1: round 2 is a full pass on the range, never a fix-check (R51, GST-3562 A)', keepReader: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -570,13 +636,18 @@ export function keepCommand(d: Dispatch): string | null {
 
 /** The reviewers the next step dispatches at its depth, with each role's effort tier and excluded pathspecs. */
 export function planReview(i: PlanInput): ReviewPlan {
+  return planReviewAt(i, (h, d) => nextStep(h, d));
+}
+
+/** planReview with the transition table passed in, so a no-loss replay can plan the step an earlier table chose. */
+export function planReviewAt(i: PlanInput, table: (h: History, depth: Depth) => NextStep): ReviewPlan {
   const c = classifyDiff(i);
   const depth = decideDepth(c, c.runtimeLines ?? (CLASS_RANK[c.class] >= CLASS_RANK.code ? i.diffLines : 0), i.floor);
   const { class: cls, runtimeLines } = depth;
   const sh = i.shape;
   const platformNow = !!sh && sh.platform === 'on' && sh.platformReview?.head === sh.head && i.history.fullPasses === 0 && !riskClass(c, depth) && platformFits(c.class, i.paths, depth.runtimeLines, i.numbers);
   const panel = !platformNow && (!sh || sh.panel === 'all' || (sh.panel === 'risk' && riskClass(c, depth)));
-  const next = nextStep({ ...i.history, gate: cls === 'gate', adversarialRan: !!i.adversarialRan, lean: !panel }, depth.depth);
+  const next = table({ ...i.history, gate: cls === 'gate', adversarialRan: !!i.adversarialRan, lean: !panel }, depth.depth);
   if (!panel) return leanPlan(i, c, depth, next);
   const h = i.history;
   const raise = depth.depth === 'light' && (h.fixedBlocking || h.blockingOpen || i.criticalFound);
@@ -647,6 +718,7 @@ export function planReview(i: PlanInput): ReviewPlan {
     add('adversarial-native', 'adversarial', 'full');
     add('outside-voice', 'outside-voice', 'host');
   }
+  if (next.keepReader && !dispatches.some(d => d.effort === 'full' && d.exclude.length === (x?.specs.length ?? 0))) add('red-team', 'red-team', 'full');
   if (i.targeted?.classes.length && ['full', 'scoped', 'fix-check', 'voices'].includes(next.step)) {
     if (i.targeted.ran) skipped.push('targeted (already read this product patch)');
     else add('targeted', 'targeted', ROLE_EFFORT.targeted);
@@ -666,7 +738,7 @@ export function planReview(i: PlanInput): ReviewPlan {
 /** Risk class read from the paths and lines (gate class, an R51 or review.risk_paths class, a classifier error), or a floor above light (FOUN-64 item 7: never the recorded review_depth). */
 const riskClass = (c: ClassResult, depth: DepthResult) => c.class === 'gate' || c.risk.length > 0 || c.errors.length > 0 || depth.depth !== 'light';
 /** Whether a light diff may take the platform depth (FOUN-64 item 2): docs or tests only, no numeric claims, no results, prereg, eval or checker path. The receipt and the queue ask the same. */
-export const platformFits = (cls: DiffClass, paths: readonly string[], runtimeLines: number, numbers: NumbersResult) => (cls === 'docs' || cls === 'tests') && runtimeLines === 0 && !numbers.publishes && !paths.some(p => CLAIM_PATH.test(p));
+export const platformFits = (cls: DiffClass, paths: readonly string[], runtimeLines: number, numbers: NumbersResult) => (cls === 'docs' || cls === 'tests') && runtimeLines === 0 && !numbers.publishes && !paths.some(p => CLAIM_PATH.test(p) || PREREG_PATH.test(p));
 /** Paths that carry results or preregistration claims: never the platform depth (FOUN-64 item 2). */
 const CLAIM_PATH = /(^|\/|[-_.])(results?|prereg|preregistration|benchmarks?|evals?|scorers?|checkers?)([-_./]|$)/i;
 
@@ -681,7 +753,7 @@ function leanPlan(i: PlanInput, c: ClassResult, depth: DepthResult, next: NextSt
   const plan = (n: NextStep, mode: ReviewMode): ReviewPlan => ({ ...depth, stepDepth: depth.depth, depthReasons: depth.reasons, reasons: c.reasons, next: n, numbers: i.numbers, dispatches, skipped, mode });
   const pr = sh.platformReview;
   const platformFit = !risky && platformFits(c.class, i.paths, depth.runtimeLines, i.numbers);
-  if (next.step === 'full' && platformFit && sh.platform === 'on' && pr && pr.head === sh.head) {
+  if (next.step === 'full' && i.history.last === 'none' && platformFit && sh.platform === 'on' && pr && pr.head === sh.head) {
     const why = `planned skip: platform review ${pr.id} by ${pr.reviewer} at ${pr.head.slice(0, 12)}`;
     for (const r of ['core checklist', 'specialists', 'red-team', 'adversarial-native', 'outside-voice', 'targeted']) skipped.push(`${r} (${why})`);
     return plan({ step: 'platform', reason: `review.platform on: the platform review ${pr.id} read HEAD ${pr.head.slice(0, 12)}, so /ship runs no reader (Step 11.5 binds the planned skip)` }, 'platform');
@@ -694,6 +766,7 @@ function leanPlan(i: PlanInput, c: ClassResult, depth: DepthResult, next: NextSt
     : add('adversarial-native', 'single', 'full', docsAndOutputs, { checklists: [...batchChecklists('code', i, skipped), 'red-team'], model: sh.readerModel, ...classes });
   if (next.step === 'full' && (risky || depth.runtimeLines > 0)) {
     reader();
+    if (i.history.fullPasses > 0 && i.numbers.publishes && i.reviewedNumbers !== undefined && i.reviewedNumbers !== i.numbers.fingerprint) add('outside-voice', 'outside-voice (numbers changed)', 'host');
     skipped.push(`specialists, red-team and outside-voice as their own readers (R65: the one ${risky ? 'risk-class' : 'light'} reader carries them)`);
   } else if (next.step === 'full') {
     const effort: Effort = i.tiers === false ? 'host' : ROLE_EFFORT.specialist;
@@ -706,15 +779,16 @@ function leanPlan(i: PlanInput, c: ClassResult, depth: DepthResult, next: NextSt
     add('fix-check', 'fix-check', 'full');
     if (i.numbers.publishes && i.reviewedNumbers !== undefined && i.reviewedNumbers !== i.numbers.fingerprint) add('outside-voice', 'outside-voice (numbers changed)', 'host');
   }
-  if (next.step === 'fix-check' && i.targeted?.classes.length) {
+  if (next.keepReader && !dispatches.some(d => d.effort === 'full' && d.exclude.length === (x?.specs.length ?? 0))) add('red-team', 'red-team', 'full');
+  if ((next.step === 'fix-check' || (next.keepReader && !dispatches.some(d => d.classes?.length))) && i.targeted?.classes.length) {
     if (i.targeted.ran) skipped.push('targeted (already read this product patch)');
     else add('targeted', 'targeted', ROLE_EFFORT.targeted);
   }
   return plan(next, 'lean');
 }
 
-export function reviewPlanLine(p: ReviewPlan, pass: number): string {
-  return `REVIEW_PLAN: class=${p.class} pass=${pass} next=${p.next.step} dispatches=${p.dispatches.length} numbers=${p.numbers.publishes ? `yes(${p.numbers.claims})` : 'no'} fingerprint=${p.numbers.fingerprint} reason=${JSON.stringify(p.next.reason)}`;
+export function reviewPlanLine(p: ReviewPlan, pass: number, priorRounds = 0): string {
+  return `REVIEW_PLAN: class=${p.class} pass=${pass}${priorRounds ? ` pr_rounds=${priorRounds}` : ''} next=${p.next.step} dispatches=${p.dispatches.length} numbers=${p.numbers.publishes ? `yes(${p.numbers.claims})` : 'no'} fingerprint=${p.numbers.fingerprint} reason=${JSON.stringify(p.next.reason)}`;
 }
 
 export function reviewDepthLine(p: ReviewPlan): string {

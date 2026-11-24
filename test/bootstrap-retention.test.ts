@@ -108,8 +108,12 @@ test('paid scope creation preserves non-Linux behavior without inherited qualifi
   }
 });
 
+// Root passes the ptrace check that makes a nondumpable process's /proc/<pid>/cwd unreadable, so the uninspectable-process
+// paths these cases need cannot happen there.
+const NONDUMPABLE_DENIES = process.getuid?.() !== 0;
+
 describe.skipIf(process.platform !== 'linux')('bootstrap attempt retention boundaries', () => {
-  test('pre-existing same-uid nondumpable host process is not an attempt writer', async () => {
+  test.skipIf(!NONDUMPABLE_DENIES)('pre-existing same-uid nondumpable host process is not an attempt writer', async () => {
     const child = await censusProcess('dumpable(0);');
     expect(fs.statSync(`/proc/${child.pid}`).uid).toBe(process.getuid!());
     expect(() => fs.readlinkSync(`/proc/${child.pid}/cwd`)).toThrow('EACCES');
@@ -126,7 +130,32 @@ describe.skipIf(process.platform !== 'linux')('bootstrap attempt retention bound
     expect(() => process.kill(child.pid!, 0)).not.toThrow();
   });
 
-  test.each(['new process', 'new denial', 'different lifetime'])('%s cannot inherit an unrelated process census exclusion', async scenario => {
+  // Value: protects=scope creation survives a same-uid process that denies its fd table and exits mid-census (the
+  //   flaky free test on 2026-11-20); fails_when=that denial throws again or the exited process is recorded as
+  //   uninspectable; why_new=only live denials were covered; seam=fs.readdirSync and fs.readFileSync on that pid's /proc
+  test('scope creation skips an owned process that exits after denying its fd table', () => {
+    const child = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
+    children.push(child);
+    const realDir = fs.readdirSync;
+    const realFile = fs.readFileSync;
+    let stats = 0;
+    const dir = spyOn(fs, 'readdirSync').mockImplementation(((file: any, ...args: any[]) => {
+      if (file === `/proc/${child.pid}/fd`) throw Object.assign(new Error('fd table denied'), { code: 'EACCES' });
+      return (realDir as any)(file, ...args);
+    }) as any);
+    const read = spyOn(fs, 'readFileSync').mockImplementation(((file: any, ...args: any[]) => {
+      if (file === `/proc/${child.pid}/stat` && ++stats > 1) throw Object.assign(new Error('exited'), { code: 'ENOENT' });
+      return (realFile as any)(file, ...args);
+    }) as any);
+    try {
+      const { scope } = fixture();
+      const census = JSON.parse(Object.values(scope.env)[0]!);
+      expect(stats).toBe(2);
+      expect(census.uninspectable.some((native: any) => native.pid === child.pid)).toBe(false);
+    } finally { dir.mockRestore(); read.mockRestore(); }
+  });
+
+  test.skipIf(!NONDUMPABLE_DENIES).each(['new process', 'new denial', 'different lifetime'])('%s cannot inherit an unrelated process census exclusion', async scenario => {
     const child = scenario === 'new process' ? undefined : await censusProcess(scenario === 'different lifetime'
       ? 'dumpable(0);'
       : "process.stdin.once('data', () => { dumpable(0); console.log('changed'); });");
@@ -240,7 +269,7 @@ describe.skipIf(process.platform !== 'linux')('bootstrap attempt retention bound
     } finally { stat.mockRestore(); }
   });
 
-  test('reusing a scope cannot baseline-exempt an unreadable process from its prior attempt', async () => {
+  test.skipIf(!NONDUMPABLE_DENIES)('reusing a scope cannot baseline-exempt an unreadable process from its prior attempt', async () => {
     const { temporary, scope, root: outer } = fixture();
     const first = project(temporary);
     const retained = register(first, scope);

@@ -99,7 +99,7 @@ through CDP before `goto`, as the cookbook does), and no `file://` navigation.
 | `/scrape` | Prototype the extraction with `aside repl`, hand back the table, list, or prices as structured data. Read-only. |
 | `/devex-review` | Walk the real onboarding flow and time it, carrying the cookbook inline. |
 | `/ship`, `/spec`, `/land-and-deploy`, `/setup-deploy`, `/office-hours` | Third-party web actions (vendor dashboards, API keys, webhooks) offered as an Aside drive across your real sessions, with the one-question consent gate for anything mutating. |
-| `/plan-ceo-review`, `/plan-devex-review`, `/design-consultation`, `/review`, `/cso`, `/office-hours` | Web research runs through `aside exec` in your real browser (`{{ASIDE_RESEARCH}}`), one read-only request per question, answers treated as untrusted content. No Aside → the same queries go to the host's WebSearch tool; no WebSearch either → "Search unavailable" once and the skill proceeds on in-distribution knowledge. |
+| `/plan-ceo-review`, `/plan-eng-review`, `/plan-devex-review`, `/design-consultation`, `/review`, `/cso`, `/office-hours` | Web research runs through `aside exec` in your real browser (`{{ASIDE_RESEARCH}}`), one read-only request per question, answers treated as untrusted content. No Aside → the same queries go to the host's WebSearch tool; no WebSearch either → "Search unavailable" once and the skill proceeds on in-distribution knowledge. |
 
 ### Local-HTML rendering
 
@@ -638,7 +638,10 @@ names it, so you can switch away or close it without `--force-restart`.
 known agent harness (Claude Code, Codex and others) gets a session named after
 that agent process; its first command opens the session's own tab and later
 commands stay there without moving the shared active tab. Name one with
-`--session <name>` or `BROWSE_SESSION=<name>`; `BROWSE_SESSION=` turns it off.
+`--session <name>` (before or after the command) or `BROWSE_SESSION=<name>`;
+`BROWSE_SESSION=` turns it off. Windows has no automatic session (the harness
+lookup reads `/proc` or `ps`), so give each parallel agent its own
+`BROWSE_SESSION` there.
 `--tab-id` and `BROWSE_TAB` win over a session and no longer move the active
 tab either. Sessions isolate tabs, not cookies or storage, and only the local
 root token can name one.

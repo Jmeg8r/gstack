@@ -282,11 +282,29 @@ reason, helping builders or letting others reproduce a published finding. None
 of this bends the rules above: no number is rounded in our favour and no caveat
 is dropped.
 
+### Write-up checklist
+
+Before a post or write-up goes out, check three things. The second also holds for every
+ready or status report.
+
+1. **The words match the page.** Every claim the text makes, the page it links makes too,
+   at the same strength. If the page says the other side won by a few points, the post
+   doesn't say "as good as". Readers repeat the post, not the page.
+2. **Every number, "green" and "ready" names its source, read at the current head.** Give
+   the run id, commit, command or file it came from, and read it again on the tree you are
+   shipping. A number carried over from an earlier head, or taken from a list a tool
+   capped, is a guess until re-read; re-read it or mark it unverified.
+3. **A fresh model reads it cold, once.** Give a model with none of the work's context the
+   finished text and the pages it links, and ask what the text claims and where it lost
+   the thread. Fix what it misread, then send. One read, not a loop.
+
 **Anti-patterns:**
 - A speedup from one run on each side.
 - A pass rate without the trial count.
 - "Faster" with no theory of what changed.
 - A results file whose lesson, or whose null, sits under a page of run ids.
+- A post that says more than the page it links.
+- "Green" read from an earlier head.
 
 ---
 
@@ -309,7 +327,9 @@ or from an unmasked arm is a lead, not a verdict.
 When a fair test shows an existing part doesn't help, it gets one "Why null?"
 cycle: did the model use the part, did the task fit, was there enough power and
 room below the ceiling, and does today's model do the job without it. Then
-keep it, fix the method, or cut it, and say which plainly.
+keep it, fix the method, or cut it, and say which plainly. A cut, like any
+attempt that fails or is shelved, gets a short write-up before it closes
+(docs/shelved-attempt.md).
 
 Safety and security guards (careful, freeze, guard, unfreeze, cso) stay on
 their stated reason: they stop the rare bad run that an average score can't see.

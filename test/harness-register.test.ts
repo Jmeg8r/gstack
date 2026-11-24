@@ -140,6 +140,19 @@ describe('gstack-harness register and unregister (skill folders)', () => {
     }
   }, 60_000);
 
+  // #4548: the harness payload (OpenClaw, Hermes, Dots) honors gstack-config disabled_skills like every other install.
+  test('a skill turned off with disabled_skills is left out of the harness payload (#4548)', () => {
+    const d = tmp();
+    fs.mkdirSync(path.join(d, 'state'), { recursive: true });
+    fs.writeFileSync(path.join(d, 'state', 'config.yaml'), 'disabled_skills: ship,/cso,gstack-qa\n');
+    const r = register(opts(d, 'dots', { mode: 'all', skillsDir: path.join(d, 'all') }));
+    for (const off of ['ship', 'cso', 'qa']) expect(fs.existsSync(path.join(r.dest, off))).toBe(false);
+    expect(fs.existsSync(path.join(r.dest, 'review', 'SKILL.md'))).toBe(true);
+    const names = sourceSkills(TARGETS.dots, ROOT, d, { GSTACK_STATE_ROOT: path.join(d, 'state') }).map(s => s.name);
+    expect(names).toContain('review');
+    for (const off of ['ship', 'cso', 'qa']) expect(names).not.toContain(off);
+  }, 60_000);
+
   test('Claude-render targets (dots, generic) never register a retired skill; /autoplan still carries its methodology', () => {
     const d = tmp();
     const names = sourceSkills(TARGETS.dots, ROOT, d).map(s => s.name);
@@ -234,7 +247,7 @@ describe('GSTA-135: registered skills get used', () => {
 
   test('router lines lead with each skill\'s trigger, within 160 chars; the router description leads with task verbs', () => {
     expect(ROUTER_DESCRIPTION.length).toBeLessThanOrEqual(ROUTER_DESCRIPTION_MAX);
-    for (const verb of ['review', 'debug', 'test', 'plan', 'ship']) expect(ROUTER_DESCRIPTION.slice(0, 200), verb).toContain(verb);
+    for (const verb of ['review', 'test', 'plan', 'ship']) expect(ROUTER_DESCRIPTION.slice(0, 200), verb).toContain(verb);
     const d = tmp();
     for (const [target, mode] of [['openclaw', 'router'], ['dots', 'router']] as const) {
       const r = register(opts(d, target, { mode, skillsDir: path.join(d, target) }));

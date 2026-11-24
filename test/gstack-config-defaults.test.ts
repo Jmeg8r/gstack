@@ -322,6 +322,22 @@ describe('design_detector (auto|off, rejecting validator)', () => {
   });
 });
 
+describe('verify_before_commit (retired, #4593)', () => {
+  // Value: protects=an old script or config that sets the retired key still works and is told nothing changes, and list/defaults
+  //   stop showing it; fails_when=set errors, stores the value silently, or the key is listed again; why_new=/verify became
+  //   /build-check, so nothing runs the pre-commit pass on its own (#4593); seam=none; no_claim=Claude Code's commit instruction
+  test('set succeeds with a retirement note, stores nothing, and the key is no longer listed', () => {
+    const run = (...args: string[]) => spawnSync('bash', [CONFIG_BIN, ...args], { encoding: 'utf-8', timeout: 30_000, env: { ...process.env, GSTACK_STATE_ROOT: STATE } });
+    for (const value of ['off', 'on', 'of']) {
+      const r = run('set', 'verify_before_commit', value);
+      expect(r.status).toBe(0);
+      expect(r.stderr).toContain('verify_before_commit is retired and has no effect');
+    }
+    expect(get('verify_before_commit')).toEqual({ out: '', code: 1 });
+    for (const verb of ['list', 'defaults']) expect(run(verb).stdout).not.toContain('verify_before_commit');
+  });
+});
+
 describe('skill_routing and skill_contracts (on|off, default SWITCH_DEFAULT)', () => {
   test('get, list and defaults report SWITCH_DEFAULT for both', () => {
     for (const key of ['skill_routing', 'skill_contracts'] as const) expect(get(key)).toEqual({ out: SWITCH_DEFAULT[key], code: 0 });

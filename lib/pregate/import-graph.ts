@@ -10,12 +10,18 @@
  *      import) and literal directories (`test/fixtures/x` → `x/**`), and in
  *      Python, dotted `mock.patch` targets (`'pkg.mod.Class.method'`);
  *   3. the `bin/<name>` → `test/<name>*.test.*` convention (with and without
- *      the `gstack-` prefix);
+ *      the `gstack-` prefix), and RSpec's `[<root>/]spec/<path>_spec.rb` →
+ *      `[<root>/]app/<path>.rb` or `[<root>/]<path>.rb` (Rails autoloads constants,
+ *      so no require names the file);
  *   4. explicit `.gstack/pregate.json` `dependencies` declarations;
  *   5. in a Django project, the files Django loads by name (lib/pregate/django.ts);
  *   6. in a Cargo crate, every `.rs` file and the Cargo.toml select the crate's
  *      tests and its dependents' (lib/pregate/rust.ts); in-source
  *      `#[cfg(test)]` files and `<crate>/tests/` files are the tests.
+ * A module specifier written with the emitted extension (NodeNext: `./x.js`
+ * for `x.ts` or `x.tsx`, `.jsx`→`.tsx`, `.mjs`→`.mts`, `.cjs`→`.cts`) resolves to
+ * its TypeScript source first, as tsc does, then as written; a filesystem
+ * literal always names the path as written.
  * Dart directives (`import`/`export`/`part`, conditional URIs included) resolve
  * `package:<name>/x` through every tracked pubspec.yaml to `<root>/lib/x`.
  * Uncertainty selects more tests, never fewer: a dependency on a directory
@@ -23,7 +29,7 @@
  * caller's `no lane` failure, not a pass. test/helpers/touchfile-closure.ts
  * (helpers and fixtures only, a lower bound by its own words) is the precedent.
  */
-import { spawnSync } from 'node:child_process';
+import { spawnSync } from '../spawn-sync';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { matchesAny } from '../ship-policy';
@@ -170,6 +176,7 @@ export function blankDartComments(source: string): string {
 
 export function listRepoFiles(repoRoot: string): string[] {
   const r = spawnSync('git', ['ls-files', '-co', '--exclude-standard', '-z'], { cwd: repoRoot, encoding: 'utf8', timeout: 60_000, maxBuffer: 64 * 1024 * 1024 });
+  if (r.error) throw new Error(`git ls-files did not finish: ${r.error.message}`);
   return (r.stdout ?? '').split('\0').filter(p => p && !p.startsWith('node_modules/'));
 }
 
@@ -177,10 +184,10 @@ function normalize(p: string): string { return path.posix.normalize(p.replace(/\
 
 /** One tsconfig/jsconfig `compilerOptions.paths` entry: `@/*` → [`./*`], already joined to its base. */
 export interface PathAlias { prefix: string; suffix: string; wildcard: boolean; targets: string[] }
-/** The effective `paths` of the root config, its `baseUrl` (repo-relative, or null) and what could not be read. */
+/** The effective `paths` of one config, its `baseUrl` (repo-relative, or null) and what could not be read. */
 export interface PathAliases { aliases: PathAlias[]; baseUrl: string | null; notes: string[] }
 
-/** How many relative `extends` hops are followed from the root tsconfig/jsconfig. */
+/** How many relative `extends` hops are followed from a tsconfig/jsconfig. */
 export const MAX_TSCONFIG_EXTENDS = 4;
 
 /** JSONC → JSON: drop comments, and a comma whose next token closes an object or array, outside strings. */
@@ -213,7 +220,9 @@ interface ConfigOptions { baseUrl?: Located<string>; paths?: Located<Record<stri
 /** `baseUrl` and `paths` of one config after its relative `extends` chain (later entries and the config itself override). */
 function effectiveOptions(repoRoot: string, rel: string, depth: number, seen: Set<string>, notes: string[]): ConfigOptions | null {
   let json: { extends?: unknown; compilerOptions?: { baseUrl?: unknown; paths?: unknown } };
-  try { json = JSON.parse(stripJsonc(fs.readFileSync(path.join(repoRoot, rel), 'utf8'))) ?? {}; } catch { return null; }
+  const text = readRepoFile(repoRoot, rel);
+  if (text === null) return null;
+  try { json = JSON.parse(stripJsonc(text)) ?? {}; } catch { return null; }
   const dir = path.posix.dirname(rel);
   let options: ConfigOptions = {};
   const parents = typeof json.extends === 'string' ? [json.extends] : Array.isArray(json.extends) ? json.extends.filter((e): e is string => typeof e === 'string') : [];
@@ -234,16 +243,18 @@ function effectiveOptions(repoRoot: string, rel: string, depth: number, seen: Se
 }
 
 /**
- * The root tsconfig.json (else jsconfig.json) `paths`, relative to the repo,
- * following relative `extends` up to MAX_TSCONFIG_EXTENDS hops. Targets join
+ * The tsconfig.json (else jsconfig.json) `paths` in repo directory `dir` (the
+ * root by default), relative to the repo, following relative `extends` inside
+ * the repo up to MAX_TSCONFIG_EXTENDS hops. Targets join
  * `baseUrl` when one is set, else the directory of the config declaring
  * `paths`. What is not followed is recorded in `notes` for the no-lane
  * explanation; a missing alias leaves no edge (so `no lane`), never a wrong one.
  */
-export function readPathAliases(repoRoot: string): PathAliases {
+export function readPathAliases(repoRoot: string, dir = '.'): PathAliases {
   for (const name of ['tsconfig.json', 'jsconfig.json']) {
     const notes: string[] = [];
-    const options = effectiveOptions(repoRoot, name, 0, new Set([name]), notes);
+    const rel = normalize(path.posix.join(dir, name));
+    const options = effectiveOptions(repoRoot, rel, 0, new Set([rel]), notes);
     if (!options) continue;
     const baseUrl = options.baseUrl ? normalize(path.posix.join(options.baseUrl.dir, options.baseUrl.value)) : null;
     const base = baseUrl ?? options.paths?.dir ?? '.';
@@ -262,6 +273,40 @@ export function readPathAliases(repoRoot: string): PathAliases {
 const NO_ALIASES: PathAliases = { aliases: [], baseUrl: null, notes: [] };
 
 /**
+ * The aliases governing each file: those of the nearest nested tsconfig.json
+ * or jsconfig.json above it (its own directory first) that declares `paths`
+ * or `baseUrl`, itself or through `extends`, else the root config's. A nested
+ * config that declares neither defers upward, so a file never loses an alias
+ * the root gives it. With no nested config every file gets the root's.
+ */
+export function pathAliasResolver(repoRoot: string, files: readonly string[]): { aliasesFor: (rel: string) => PathAliases; notes: string[] } {
+  const root = readPathAliases(repoRoot);
+  const notes = [...root.notes];
+  const read = new Set<string>();
+  const declaring = new Map<string, PathAliases>();
+  for (const f of files) {
+    const dir = path.posix.dirname(f);
+    if (dir === '.' || read.has(dir) || !/^[tj]sconfig\.json$/.test(path.posix.basename(f))) continue;
+    read.add(dir);
+    const config = readPathAliases(repoRoot, dir);
+    for (const n of config.notes) if (!notes.includes(n)) notes.push(n);
+    if (config.aliases.length || config.baseUrl !== null) declaring.set(dir, config);
+  }
+  const byDir = new Map<string, PathAliases>();
+  const aliasesFor = (rel: string): PathAliases => {
+    const start = path.posix.dirname(rel);
+    let hit = byDir.get(start);
+    if (hit) return hit;
+    let d = start;
+    while (d !== '.' && !declaring.has(d)) d = path.posix.dirname(d);
+    hit = declaring.get(d) ?? root;
+    byDir.set(start, hit);
+    return hit;
+  };
+  return { aliasesFor, notes };
+}
+
+/**
  * TypeScript's pattern choice: an exact pattern, else the matching wildcard
  * with the longest prefix. `chosen` is that pattern's expanded targets in
  * order; `others` are the other matching patterns' targets.
@@ -277,6 +322,8 @@ function matchAliases(aliases: readonly PathAlias[], ref: string): { chosen: str
 /** One candidate repo path → the file it names (trying extensions), `dir/**`, a bare bin, or null. */
 function resolveCandidate(files: Set<string>, dirs: Set<string>, c: string, literal: boolean): string | null {
   if (c.startsWith('../') || c === '..' || c === '.' || c === '') return null;
+  const ts = literal ? null : /\.([mc]?)js(x?)$/.exec(c);
+  if (ts) for (const t of ts[1] || ts[2] ? [`.${ts[1]}ts${ts[2]}`] : ['.ts', '.tsx']) { const f = c.slice(0, -ts[0].length) + t; if (files.has(f)) return f; }
   for (const ext of RESOLVE_EXT) if (files.has(c + ext)) return c + ext;
   // A directory literal needs two segments (`test/fixtures/x`): a bare word is a name, not a path.
   if (dirs.has(c) && (!literal || c.includes('/'))) return `${c}/**`;
@@ -468,6 +515,12 @@ function conventionBins(test: string, files: Set<string>): string[] {
   return out;
 }
 
+/** The Ruby sources an RSpec spec names by convention: spec/models/user_spec.rb names app/models/user.rb, spec/lib/parser_spec.rb names lib/parser.rb, and an engine's engines/x/spec/... names engines/x/app/... the same way. */
+function conventionRubySubjects(test: string, files: Set<string>): string[] {
+  const m = /^((?:.+\/)?)spec\/(.+)_spec\.rb$/.exec(test);
+  return m ? [`${m[1]}app/${m[2]}.rb`, `${m[1]}${m[2]}.rb`].filter(f => files.has(f)) : [];
+}
+
 export interface BuildOptions {
   declarations?: Record<string, string[]>; maxBytes?: number;
   /** Paths that no longer exist (deleted or renamed-from) but that tests may still name; they resolve as dependencies so their consumers are found, and are never tests themselves (`git ls-files` still lists an unstaged deletion). */
@@ -483,8 +536,8 @@ export function buildGraph(repoRoot: string, opts: BuildOptions = {}): Graph {
   const files = new Set([...all, ...gone]);
   const dirs = new Set<string>();
   for (const f of files) { let d = path.posix.dirname(f); while (d && d !== '.') { dirs.add(d); d = path.posix.dirname(d); } }
-  const config = readPathAliases(repoRoot);
-  const graph: Graph = { files, tests: new Set(all.filter(isTestFile)), reverse: new Map(), unresolved: new Map(), aliasNotes: config.notes };
+  const aliases = pathAliasResolver(repoRoot, all);
+  const graph: Graph = { files, tests: new Set(all.filter(isTestFile)), reverse: new Map(), unresolved: new Map(), aliasNotes: aliases.notes };
   const maxBytes = opts.maxBytes ?? 2 * 1024 * 1024;
   const packages = dartPackages(repoRoot, all);
   const pySources = new Map<string, string>();
@@ -494,7 +547,7 @@ export function buildGraph(repoRoot: string, opts: BuildOptions = {}): Graph {
     try { const st = fs.statSync(path.join(repoRoot, rel)); if (!st.isFile() || st.size > maxBytes) continue; source = fs.readFileSync(path.join(repoRoot, rel), 'utf8'); } catch { continue; }
     if (rel.endsWith('.py')) pySources.set(rel, source);
     const unresolved: string[] = [];
-    for (const { target, via } of referencesIn(files, dirs, rel, source, config, graph.tests.has(rel) ? unresolved : undefined, packages)) addEdge(graph, target, rel, via);
+    for (const { target, via } of referencesIn(files, dirs, rel, source, aliases.aliasesFor(rel), graph.tests.has(rel) ? unresolved : undefined, packages)) addEdge(graph, target, rel, via);
     if (unresolved.length) graph.unresolved!.set(rel, unresolved);
   }
   const rust = rustEdges(all, rel => readRepoFile(repoRoot, rel, maxBytes));
@@ -502,12 +555,12 @@ export function buildGraph(repoRoot: string, opts: BuildOptions = {}): Graph {
   for (const e of rust.edges) addEdge(graph, e.dependency, e.dependent, e.via);
   const django = djangoEdges({ files: [...files], tests: graph.tests, read: rel => pySources.get(rel) ?? readRepoFile(repoRoot, rel, maxBytes), code: pythonCode, resolveDotted: dotted => pythonPatchTarget(files, dotted) });
   for (const e of django) addEdge(graph, e.dependency, e.dependent, 'framework');
-  for (const test of graph.tests) for (const bin of conventionBins(test, files)) addEdge(graph, bin, test, 'convention');
+  for (const test of graph.tests) for (const subject of [...conventionBins(test, files), ...conventionRubySubjects(test, files)]) addEdge(graph, subject, test, 'convention');
   if (opts.goneSources) {
     const present = new Set(all);
     graph.goneSubjects = new Map();
     for (const [rel, source] of opts.goneSources) {
-      const targets = [...referencesIn(files, dirs, rel, source, config, undefined, packages).map(r => r.target), ...conventionBins(rel, files)];
+      const targets = [...referencesIn(files, dirs, rel, source, aliases.aliasesFor(rel), undefined, packages).map(r => r.target), ...conventionBins(rel, files), ...conventionRubySubjects(rel, files)];
       graph.goneSubjects.set(rel, [...new Set(targets)].filter(t => present.has(t) && !isTestFile(t) && !TEST_TREE.test(t)).sort());
     }
   }

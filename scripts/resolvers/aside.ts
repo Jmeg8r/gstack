@@ -105,7 +105,8 @@ else
     125) echo "ASIDE_UNAVAILABLE: bounded probe unavailable" ;;
     0) if printf '%s\\n' "$_o" | grep -q '^ASIDE_READY '; then echo "READY: $_A"
        else echo "ASIDE_NOT_RUNNING: no readiness marker"; fi ;;
-    *) echo "ASIDE_CLI_ERROR: exit $_rc; inspect aside --help locally" ;;
+    *) case "$_o" in *"isn't running"*) echo "ASIDE_NOT_RUNNING: app not running" ;;
+       *) echo "ASIDE_CLI_ERROR: exit $_rc; inspect aside --help locally" ;; esac ;;
   esac
   unset _o
 fi
@@ -154,7 +155,7 @@ function asideExecSend(ctx: TemplateContext, request: string): string {
   return `${asideExecPrelude(ctx)}
 PROMPT_FILE=${FREE_TEXT_DIR.slice(0, -1)}/<prompt-file-name>"
 [ -s "$PROMPT_FILE" ] || { echo "Not sent: $PROMPT_FILE is missing or empty. Write the prompt, then rerun this block." >&2; exit 1; }
-_aside_exec "${request}" && rm -f "$PROMPT_FILE"`;
+_aside_exec "${request}" && rm "$PROMPT_FILE"`;
 }
 
 /** {{ASIDE_RESEARCH_SEND}} — sends a research query the agent wrote into PROMPT_FILE. */

@@ -70,7 +70,7 @@ PREFIX=$("$GSTACK_CONFIG" get skill_prefix 2>/dev/null || echo "false")
 DISABLED=" "
 if [ -f "$SCRIPT_DIR/gstack-install-registry.sh" ]; then
   . "$SCRIPT_DIR/gstack-install-registry.sh"
-  DISABLED="$(gstack_disabled_normalize "$("$GSTACK_CONFIG" get disabled_skills 2>/dev/null || true)")"
+  DISABLED="$(gstack_disabled_config "$("$GSTACK_CONFIG" get disabled_skills 2>/dev/null || true)")"
 fi
 # Retired skills, and the crew skills off a Capy machine
 # (GSTACK_UNREGISTERED_SKILLS), lose their entry the same way; only the user's
@@ -107,7 +107,7 @@ RENDER_DIR="${RENDER_DIR:-$GSTACK_STATE_ROOT/render/claude}"
 # refreshed in place. WEAK (byte-identity with our source, or gen-skill-docs'
 # two-line banner on a real file) proves only that the SKILL.md came from us:
 # it authorizes touching that one file, never deleting the directory, and a
-# differing file is moved to $GSTACK_STATE_ROOT/backups/skills/<ts>/
+# differing file is moved to $GSTACK_STATE_ROOT/backups/skills/<ts>.<random>/
 # before we link over it (a user who started their own skill from a gstack
 # SKILL.md looks exactly like a pre-marker legacy copy).
 #
@@ -231,12 +231,18 @@ _report_foreign() {
 }
 
 # Weakly-proven real files we would otherwise overwrite go here, one summary
-# line at the end. mv, not cp: the link that follows needs the path free.
-BACKUP_ROOT="$GSTACK_STATE_ROOT/backups/skills/$(date +%Y%m%dT%H%M%S)"
+# line at the end. mv, not cp: the link that follows needs the path free. The
+# folder is made on first use with mktemp, so two runs in the same second never
+# share it and one run's backup can't overwrite another's.
+BACKUP_ROOT=""
 BACKED_UP=()
 _backup_skill_md() {
   # Non-zero when the file could NOT be moved: the caller leaves the entry alone.
   local file="$1" name="$2"
+  if [ -z "$BACKUP_ROOT" ]; then
+    mkdir -p "$GSTACK_STATE_ROOT/backups/skills" 2>/dev/null || return 1
+    BACKUP_ROOT="$(mktemp -d "$GSTACK_STATE_ROOT/backups/skills/$(date +%Y%m%dT%H%M%S).XXXXXX" 2>/dev/null)" || return 1
+  fi
   mkdir -p "$BACKUP_ROOT/$name" 2>/dev/null || return 1
   mv -f "$file" "$BACKUP_ROOT/$name/SKILL.md" 2>/dev/null || return 1
   BACKED_UP+=("$name")
@@ -246,7 +252,7 @@ _backup_skill_md() {
 # Helper: remove an OLD skill entry from the opposite prefix mode. Only entries
 # we can prove are ours are removed; anything else is reported and kept.
 _cleanup_skill_entry() {
-  local entry="$1" skill="${2:-}" e dest src
+  local entry="$1" skill="${2:-}" whole="${3:-whole}" e dest src
   [ -e "$entry" ] || [ -L "$entry" ] || return 0
   # Unclaimed dir (no SKILL.md, no marker): nothing of ours to clean.
   if [ -d "$entry" ] && [ ! -L "$entry" ] && [ ! -e "$entry/SKILL.md" ] && [ ! -L "$entry/SKILL.md" ] && [ ! -f "$entry/.gstack-owned" ]; then
@@ -266,8 +272,9 @@ _cleanup_skill_entry() {
     # the marker (we created the dir) while the skill's source still exists, or
     # a directory holding nothing but links. A retired skill's marked entry
     # takes the path below, so a real SKILL.md is backed up and the user's
-    # files stay.
-    if { [ -f "$entry/.gstack-owned" ] && { [ -z "$skill" ] || [ -f "$src" ]; }; } || { [ -L "$entry/SKILL.md" ] && _dir_only_links "$entry"; }; then
+    # files stay. A third argument other than "whole" (an alias entry, whose
+    # marked directory may still hold the user's files) always takes that path.
+    if { [ "$whole" = whole ] && [ -f "$entry/.gstack-owned" ] && { [ -z "$skill" ] || [ -f "$src" ]; }; } || { [ -L "$entry/SKILL.md" ] && _dir_only_links "$entry"; }; then
       rm -rf "$entry"
     else
       # Otherwise only what is ours goes: the SKILL.md, the marker, and our
@@ -400,6 +407,15 @@ for skill_dir in "$INSTALL_DIR"/*/; do
     *" ${skill#gstack-} "*)
       _cleanup_skill_entry "$SKILLS_DIR/$skill" "$skill"
       case "$skill" in gstack-*) ;; *) _cleanup_skill_entry "$SKILLS_DIR/gstack-$skill" "$skill" ;; esac
+      # setup's rewritten-copy alias of this skill goes with it (#4308); the loop
+      # above skips the alias's symlinked source dir, and a checkout made without
+      # symlinks has none. The next ./setup writes it back once the skill is on.
+      # Only the generated SKILL.md goes: an edited one is backed up, and the
+      # user's other files stay.
+      if [ "$skill" = open-gstack-browser ]; then
+        _cleanup_skill_entry "$SKILLS_DIR/connect-chrome" "$skill" files
+        _cleanup_skill_entry "$SKILLS_DIR/gstack-connect-chrome" "$skill" files
+      fi
       case "$DISABLED" in *" ${skill#gstack-} "*) DISABLED_COUNT=$((DISABLED_COUNT + 1)) ;; esac
       continue ;;
   esac
@@ -461,11 +477,13 @@ for skill_dir in "$INSTALL_DIR"/*/; do
   fi
   SKILL_COUNT=$((SKILL_COUNT + 1))
 done
-# A retired skill whose source is gone (investigate, GST-1717) never reaches
-# the loop above, so its old gstack-owned entries go here, plain and prefixed.
+# A retired skill whose source is gone (investigate, GST-1717; verify, #4593)
+# never reaches the loop above, so its old gstack-owned entries go here, plain
+# and prefixed. "files": a stale render of the retired skill must not pass for
+# live source and let a marked directory be deleted with the user's files in it.
 for skill in ${GSTACK_RETIRED_SKILLS:-}; do
-  _cleanup_skill_entry "$SKILLS_DIR/$skill" "$skill"
-  _cleanup_skill_entry "$SKILLS_DIR/gstack-$skill" "$skill"
+  _cleanup_skill_entry "$SKILLS_DIR/$skill" "$skill" files
+  _cleanup_skill_entry "$SKILLS_DIR/gstack-$skill" "$skill" files
 done
 
 # Patch SKILL.md name: fields to match prefix setting. When a gbrain render

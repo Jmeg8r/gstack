@@ -395,6 +395,43 @@ describe('.pending marker', () => {
     expect(events[0].outcome).toBe('chromium-install');
   });
 
+  test('each onboarding step is recorded at most once a day, however often setup reruns', () => {
+    setConfig('telemetry', 'community');
+    for (let i = 0; i < 3; i++) run(`${BIN}/gstack-telemetry-log --event-type onboarding --skill _setup_playwright --outcome chromium-install --no-sweep`);
+    run(`${BIN}/gstack-telemetry-log --event-type onboarding --skill _setup_welcome --outcome shown --no-sweep`);
+    run(`${BIN}/gstack-telemetry-log --event-type onboarding --skill _setup_welcome --outcome shown --no-sweep`);
+    expect(parseJsonl().map(e => e.skill)).toEqual(['_setup_playwright', '_setup_welcome']);
+  });
+
+  test('a different onboarding outcome for the same step on the same day is still recorded', () => {
+    setConfig('telemetry', 'community');
+    run(`${BIN}/gstack-telemetry-log --event-type onboarding --skill _setup_playwright --outcome chromium-install --no-sweep`);
+    run(`${BIN}/gstack-telemetry-log --event-type onboarding --skill _setup_playwright --outcome deps-missing --no-sweep`);
+    run(`${BIN}/gstack-telemetry-log --event-type onboarding --skill _setup_playwright --outcome deps-missing --no-sweep`);
+    expect(parseJsonl().map(e => e.outcome)).toEqual(['chromium-install', 'deps-missing']);
+  });
+
+  test('a run still on yesterday\'s date never deletes today\'s marker, so a later run today sends nothing (#4597)', () => {
+    setConfig('telemetry', 'community');
+    fs.writeFileSync(path.join(tmpDir, 'bin', 'date'), '#!/bin/sh\nif [ "$*" = "-u +%Y-%m-%d" ] && [ -n "$FAKE_DAY" ]; then echo "$FAKE_DAY"; else PATH=/usr/bin:/bin exec date "$@"; fi\n', { mode: 0o755 });
+    const one = `${BIN}/gstack-telemetry-log --event-type onboarding --skill _setup_playwright --outcome chromium-install --no-sweep`;
+    run(one, { FAKE_DAY: '2026-11-22' });
+    run(one, { FAKE_DAY: '2026-11-21' });
+    run(one, { FAKE_DAY: '2026-11-22' });
+    expect(parseJsonl().map(e => e.outcome)).toEqual(['chromium-install', 'chromium-install']);
+    const markers = fs.readdirSync(path.join(tmpDir, 'analytics')).filter(f => f.startsWith('.onboarding-')).sort();
+    expect(markers).toEqual(['.onboarding-_setup_playwright--chromium-install-2026-11-21', '.onboarding-_setup_playwright--chromium-install-2026-11-22']);
+    run(one, { FAKE_DAY: '2026-11-23' });
+    expect(fs.readdirSync(path.join(tmpDir, 'analytics')).filter(f => f.startsWith('.onboarding-'))).toEqual(['.onboarding-_setup_playwright--chromium-install-2026-11-23']);
+  });
+
+  test('concurrent setup runs record an onboarding step once', () => {
+    setConfig('telemetry', 'community');
+    const one = `${BIN}/gstack-telemetry-log --event-type onboarding --skill _setup_playwright --outcome chromium-install --no-sweep`;
+    run(`for i in $(seq 1 24); do ${one} & done; wait`);
+    expect(parseJsonl().map(e => e.outcome)).toEqual(['chromium-install']);
+  });
+
   test('finalizes stale .pending from another session as outcome:unknown', () => {
     setConfig('telemetry', 'anonymous');
 

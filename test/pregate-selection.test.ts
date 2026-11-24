@@ -218,33 +218,75 @@ describe('literals (pure)', () => {
   //   shell module is; fails_when=`/<stem>` again accepts any following `.<word>`, the file name accepts a further extension,
   //   a non-JS module takes JS/TS extensions, or stops accepting a following space, bracket or sentence end
   //   (GST-820: 17 false files in gbrain #8372 on ARM_SHARDS 12 -> 18); why_new=no test had a same-stem sibling; seam=none;
-  //   no_claim=name-gated hits (a file naming ARM_SHARDS still counts any 12)
+  //   no_claim=name-gated hits (a file naming ARM_SHARDS still counts any 12); the two-digit run pins which module matches still count (#4312)
   test('consumersOf: a sibling file sharing the module stem is not the module; real imports of it still are (GST-820)', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-literals-stem-'));
     const nl = String.fromCharCode(10);
-    const files: Record<string, string> = {
-      'test/a.test.ts': ['// listed in test/postgres-unit-arms.txt', 'expect(n).toBe(12);', ''].join(nl),
-      'test/json.test.ts': ["const arms = read('fixtures/postgres-unit-arms.json');", 'expect(arms.length).toBe(12);', ''].join(nl),
-      'test/longer.test.ts': ["run('scripts/postgres-unit-arms-v2.ts');", 'expect(n).toBe(12);', ''].join(nl),
-      'test/import.test.ts': ["import { shards } from '../scripts/postgres-unit-arms';", 'expect(shards()).toBe(12);', ''].join(nl),
-      'test/import-js.test.ts': ["import { shards } from '../scripts/postgres-unit-arms.js';", 'expect(shards()).toBe(12);', ''].join(nl),
-      'test/own.test.ts': ["const out = run('scripts/postgres-unit-arms.ts');", 'expect(out).toBe(12);', ''].join(nl),
-      'test/line-end.test.ts': ['// covers scripts/postgres-unit-arms', 'expect(n).toBe(12);', ''].join(nl),
-      'test/prose.test.ts': ['// covers scripts/postgres-unit-arms and more', 'expect(n).toBe(12);', ''].join(nl),
-      'test/paren.test.ts': ['// (scripts/postgres-unit-arms)', 'expect(n).toBe(12);', ''].join(nl),
-      'test/sentence.test.ts': ['// see scripts/postgres-unit-arms.', 'expect(n).toBe(12);', ''].join(nl),
-      'test/dts.test.ts': ["import type { Arms } from '../scripts/postgres-unit-arms.d.ts';", 'expect(n).toBe(12);', ''].join(nl),
-      'test/sibling-test.test.ts': ["run('scripts/postgres-unit-arms.test.ts');", 'expect(n).toBe(12);', ''].join(nl),
-      'test/snap.test.ts': ["read('scripts/__snapshots__/postgres-unit-arms.ts.snap');", 'expect(n).toBe(12);', ''].join(nl),
-      'test/sh-twin.test.ts': ["import { arms } from '../lib/arms-tool.ts';", 'expect(n).toBe(12);', ''].join(nl),
-      'test/sh-own.test.ts': ["run('scripts/arms-tool.sh');", 'expect(n).toBe(12);', ''].join(nl),
-    };
+    const armsFiles = (v: string): Record<string, string> => ({
+      'test/a.test.ts': ['// listed in test/postgres-unit-arms.txt', `expect(n).toBe(${v});`, ''].join(nl),
+      'test/json.test.ts': ["const arms = read('fixtures/postgres-unit-arms.json');", `expect(arms.length).toBe(${v});`, ''].join(nl),
+      'test/longer.test.ts': ["run('scripts/postgres-unit-arms-v2.ts');", `expect(n).toBe(${v});`, ''].join(nl),
+      'test/import.test.ts': ["import { shards } from '../scripts/postgres-unit-arms';", `expect(shards()).toBe(${v});`, ''].join(nl),
+      'test/import-js.test.ts': ["import { shards } from '../scripts/postgres-unit-arms.js';", `expect(shards()).toBe(${v});`, ''].join(nl),
+      'test/own.test.ts': ["const out = run('scripts/postgres-unit-arms.ts');", `expect(out).toBe(${v});`, ''].join(nl),
+      'test/line-end.test.ts': ['// covers scripts/postgres-unit-arms', `expect(n).toBe(${v});`, ''].join(nl),
+      'test/prose.test.ts': ['// covers scripts/postgres-unit-arms and more', `expect(n).toBe(${v});`, ''].join(nl),
+      'test/paren.test.ts': ['// (scripts/postgres-unit-arms)', `expect(n).toBe(${v});`, ''].join(nl),
+      'test/sentence.test.ts': ['// see scripts/postgres-unit-arms.', `expect(n).toBe(${v});`, ''].join(nl),
+      'test/dts.test.ts': ["import type { Arms } from '../scripts/postgres-unit-arms.d.ts';", `expect(n).toBe(${v});`, ''].join(nl),
+      'test/sibling-test.test.ts': ["run('scripts/postgres-unit-arms.test.ts');", `expect(n).toBe(${v});`, ''].join(nl),
+      'test/snap.test.ts': ["read('scripts/__snapshots__/postgres-unit-arms.ts.snap');", `expect(n).toBe(${v});`, ''].join(nl),
+      'test/sh-twin.test.ts': ["import { arms } from '../lib/arms-tool.ts';", `expect(n).toBe(${v});`, ''].join(nl),
+      'test/sh-own.test.ts': ["run('scripts/arms-tool.sh');", `expect(n).toBe(${v});`, ''].join(nl),
+       });
+    const files = armsFiles('120');
     for (const [rel, text] of Object.entries(files)) { fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true }); fs.writeFileSync(path.join(root, rel), text); }
-    expect(consumersOf(root, Object.keys(files), { name: 'ARM_SHARDS', old: '12', new: '18', file: 'scripts/postgres-unit-arms.ts' })).toEqual([
+    expect(consumersOf(root, Object.keys(files), { name: 'ARM_SHARDS', old: '120', new: '180', file: 'scripts/postgres-unit-arms.ts' })).toEqual([
       'test/import.test.ts:2', 'test/import-js.test.ts:2', 'test/own.test.ts:2', 'test/line-end.test.ts:2',
       'test/prose.test.ts:2', 'test/paren.test.ts:2', 'test/sentence.test.ts:2', 'test/dts.test.ts:2',
     ]);
-    expect(consumersOf(root, ['test/sh-twin.test.ts', 'test/sh-own.test.ts'], { name: 'ARMS', old: '12', new: '18', file: 'scripts/arms-tool.sh' })).toEqual(['test/sh-own.test.ts:2']);
+    expect(consumersOf(root, ['test/sh-twin.test.ts', 'test/sh-own.test.ts'], { name: 'ARMS', old: '120', new: '180', file: 'scripts/arms-tool.sh' })).toEqual(['test/sh-own.test.ts:2']);
+    // The incident's own two-digit change: a test that imports the module, or keeps what running it returned, and asserts 12 is still
+    // a consumer; a comment naming the module, a type-only import, or a script run with no binding beside an unrelated 12 is not (#4312).
+    for (const [rel, text] of Object.entries(armsFiles('12'))) fs.writeFileSync(path.join(root, rel), text);
+    expect(consumersOf(root, Object.keys(files), { name: 'ARM_SHARDS', old: '12', new: '18', file: 'scripts/postgres-unit-arms.ts' })).toEqual([
+      'test/import.test.ts:2', 'test/import-js.test.ts:2', 'test/own.test.ts:2',
+    ]);
+    expect(consumersOf(root, ['test/sh-twin.test.ts', 'test/sh-own.test.ts'], { name: 'ARMS', old: '12', new: '18', file: 'scripts/arms-tool.sh' })).toEqual([]);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  // Value: protects=a one- or two-digit old value found only through the module counts in a statement that uses a binding the file
+  //   takes from it (an import, multi-line, namespace or require, a local declared from one, a hook assignment, a declaration whose
+  //   module path sits on a continuation line), never beside a comment naming the module or after a type-only import, and a negative
+  //   two-digit value gets the same rule; three digits keep the module rule; fails_when=short integers match any line in a file that
+  //   mentions the module again (#4312: 10 -> 11 flagged 194 lines in 11 files), or a derived local stops counting; why_new=only
+  //   one-character values were gated; seam=none; no_claim=Python or shell bindings, and a local helper function that wraps an
+  //   imported name (a short value there needs the constant's name or a binding on the asserting statement)
+  test('consumersOf: a one- or two-digit value found through its module counts only beside a binding taken from it (#4312)', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-literals-short-'));
+    const nl = String.fromCharCode(10);
+    const files: Record<string, string> = {
+      'test/unrelated.test.ts': ["import { other } from '../lib/retry';", 'expect(items.length).toBe(10);', 'expect(other()).toBe(11);', ''].join(nl),
+      'test/prose.test.ts': ['// covers lib/retry', 'expect(rows).toHaveLength(10);', ''].join(nl),
+      'test/type-only.test.ts': ["import type { Opts } from '../lib/retry';", 'expect(rows).toHaveLength(10);', ''].join(nl),
+      'test/named.test.ts': ['expect(MAX_ITEMS).toBe(10);', ''].join(nl),
+      'test/binding.test.ts': ['import {', '  maxItems as limit,', "} from '../lib/retry.js';", 'expect(n).toBe(10);', 'expect(', '  limit(),', ').toBe(10);', ''].join(nl),
+      'test/namespace.test.ts': ["import * as retry from '../lib/retry';", 'expect(retry.MAX).toBe(10);', ''].join(nl),
+      'test/require.test.ts': ["const { maxItems } = require('../lib/retry');", 'expect(maxItems()).toBe(10);', ''].join(nl),
+      'test/derived.test.ts': ["import { listItems } from '../lib/retry';", 'const items = listItems();', 'expect(items).toHaveLength(10);', ''].join(nl),
+      'test/hook.test.ts': ['let out;', "beforeAll(() => { out = run('lib/retry.ts'); });", 'expect(out.count).toBe(10);', ''].join(nl),
+      'test/multiline.test.ts': ["const r = spawnSync('bun', [", "  path.join(ROOT, 'lib/retry.ts'),", '], { timeout: 1000 });', 'expect(r.status).toBe(10);', ''].join(nl),
+    };
+    for (const [rel, text] of Object.entries(files)) { fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true }); fs.writeFileSync(path.join(root, rel), text); }
+    expect(consumersOf(root, Object.keys(files), { name: 'MAX_ITEMS', old: '10', new: '11', file: 'lib/retry.ts' })).toEqual([
+      'test/named.test.ts:1', 'test/binding.test.ts:7', 'test/namespace.test.ts:2', 'test/require.test.ts:2',
+      'test/derived.test.ts:3', 'test/hook.test.ts:3', 'test/multiline.test.ts:4',
+    ]);
+    fs.writeFileSync(path.join(root, 'test/negative.test.ts'), ['// covers lib/retry', 'expect(offset).toBe(-10);', ''].join(nl));
+    fs.writeFileSync(path.join(root, 'test/negative-import.test.ts'), ["import { offset } from '../lib/retry';", 'expect(offset()).toBe(-10);', ''].join(nl));
+    expect(consumersOf(root, ['test/negative.test.ts', 'test/negative-import.test.ts'], { name: 'OFFSET', old: '-10', new: '-11', file: 'lib/retry.ts' })).toEqual(['test/negative-import.test.ts:2']);
+    fs.writeFileSync(path.join(root, 'test/wide.test.ts'), ['// covers lib/retry', 'expect(rows).toHaveLength(100);', ''].join(nl));
+    expect(consumersOf(root, ['test/wide.test.ts'], { name: 'MAX_ITEMS', old: '100', new: '101', file: 'lib/retry.ts' })).toEqual(['test/wide.test.ts:2']);
     fs.rmSync(root, { recursive: true, force: true });
   });
   test('consumersOf: a module stem is a path fragment, never a bare word, and a one-character old value needs the constant name (GSTA-114 flood: install.sh 2 -> 3 flagged 575 consumers)', () => {
@@ -308,6 +350,26 @@ describe('literals (pure)', () => {
     };
     for (const [rel, text] of Object.entries(files)) { fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true }); fs.writeFileSync(path.join(root, rel), text); }
     expect(consumersOf(root, Object.keys(files), { name: 'attempts', old: '1', new: '3', file: 'lanes/review-noloss/judge-run.ts' })).toEqual(['tests/judge-run.test.ts:3']);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  // Value: protects=a call-site literal of any length (`limit: 120`) counts only in a file that also names the changed module, while a
+  //   test that imports the module still fails on the old value; fails_when=a file that only uses the word and holds the old number is
+  //   reported again (#4478: a rate limit lowered from 120 to 30 flagged 30 unrelated test files), or the importer stops being reported;
+  //   why_new=the module gate covered one-character values only; seam=none; no_claim=a wrapper or barrel that never names the module
+  test('consumersOf: a longer call-site literal also needs the changed module in the file; an importer of it still counts (#4478)', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-literals-call-long-'));
+    const nl = String.fromCharCode(10);
+    const files: Record<string, string> = {
+      'tests/pagination.test.ts': ['const page = await list({ limit: 50 });', 'expect(page.rows.length).toBeLessThanOrEqual(120);', ''].join(nl),
+      'tests/upload.test.ts': ['// the size limit is checked before the upload starts', 'expect(chunk(120)).toHaveLength(3);', ''].join(nl),
+      'tests/sibling.test.ts': ["import { quota } from '../src/rate-limits-v2';", 'expect(quota().limit).toBe(120);', ''].join(nl),
+      'tests/rate-limits.test.ts': ["import { SEND_RATE } from '../src/rate-limits';", 'expect(SEND_RATE.limit).toBe(120);', ''].join(nl),
+      'tests/send.test.ts': ["import { send } from '../src/rate-limits.ts';", 'const burst = 120;', 'expect(send(burst).ok).toBe(true);', ''].join(nl),
+      'tests/send-limit.test.ts': ['expect(SEND_LIMIT).toBe(120);', ''].join(nl),
+    };
+    for (const [rel, text] of Object.entries(files)) { fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true }); fs.writeFileSync(path.join(root, rel), text); }
+    expect(consumersOf(root, Object.keys(files), { name: 'limit', old: '120', new: '30', file: 'src/rate-limits.ts' })).toEqual(['tests/rate-limits.test.ts:2', 'tests/send.test.ts:2']);
+    expect(consumersOf(root, Object.keys(files), { name: 'SEND_LIMIT', old: '120', new: '30', file: 'src/other.ts' })).toEqual(['tests/send-limit.test.ts:1']);
     fs.rmSync(root, { recursive: true, force: true });
   });
   // Value: protects=a test that keeps an old value on purpose (the refused input after a minimum-version bump) can waive that one line
@@ -1016,6 +1078,69 @@ describe('nested JS packages run their own runner from their own directory', () 
     expect(planRuns(ctxFor(repo, { PATH: path.join(repo.root, 'empty-path') }), ['app/e2e/app.spec.ts'])).toEqual({ groups: [], unclaimed: ['app/e2e/app.spec.ts'], missing: ['pnpm'], noPubspec: [] });
   });
 
+
+  // Value: protects=a spec that takes `test` from a local fixtures module built on @playwright/test (Playwright's documented fixtures pattern),
+  //   directly, aliased, through a re-export or an index module, or through a .js specifier naming a .ts source, runs through `playwright test`,
+  //   an `export *` barrel or a mergeTests module, while a unit test that imports some other Playwright-based helper, or takes `test` from a vitest fixture that
+  //   uses Playwright's request API, keeps its runner and a module outside the repo (`../../x` or `../..`) is never followed;
+  //   fails_when=only a direct @playwright/test import marks a spec again (#4347: the spec went to vitest, which found no test files);
+  //   why_new=no case covered fixtures modules; seam=none; no_claim=a real Playwright run (plan only)
+  test('a spec taking test from a local Playwright fixtures module runs through playwright test; other helpers keep the unit runner (#4347)', () => {
+    const repo = fixture({ pregate: null, baseFiles: APP });
+    const ctx = ctxFor(repo, pmShim(repo));
+    write(repo.work, 'package.json', JSON.stringify({ name: 'fixture', devDependencies: { vitest: '^3.2.0', '@playwright/test': '^1.48.0' } }) + '\n');
+    write(repo.work, 'e2e/base.ts', "import { test as base } from '@playwright/test';\nexport const test = base.extend({});\nexport { expect } from '@playwright/test';\n");
+    write(repo.work, 'e2e/fixtures/index.ts', "export { test, expect } from '../base';\n");
+    write(repo.work, 'e2e/direct.spec.ts', "import { expect, test } from './base';\ntest('direct', async ({ page }) => expect(page).toBeTruthy());\n");
+    write(repo.work, 'e2e/aliased.spec.ts', "import {\n  test as it,\n  expect,\n} from './fixtures';\nit('aliased', () => {});\n");
+    write(repo.work, 'e2e/js-specifier.spec.ts', "import { test } from './base.js';\ntest('js', () => {});\n");
+    write(repo.work, 'test/helper.ts', "import { chromium } from '@playwright/test';\nexport const launch = () => chromium;\nexport const test = 1;\n");
+    write(repo.work, 'test/unit.test.ts', "import { expect, test } from 'vitest';\nimport { launch } from './helper';\ntest('unit', () => expect(launch).toBeTruthy());\n");
+    write(repo.work, 'test/outside.test.ts', "import { test } from '../../outside/base';\ntest('outside', () => {});\n");
+    write(repo.work, 'e2e/barrel/index.ts', "export * from '../base';\n");
+    write(repo.work, 'e2e/star.spec.ts', "import { test } from './barrel';\ntest('star', () => {});\n");
+    write(repo.work, 'test/api-fixture.ts', "import { test as base } from 'vitest';\nimport { request } from '@playwright/test';\nexport const test = base.extend({ api: async ({}, use) => use(await request.newContext()) });\n");
+    write(repo.work, 'test/api.test.ts', "import { test } from './api-fixture';\ntest('api', () => {});\n");
+    write(repo.work, 'e2e/merged.ts', "import { mergeTests } from '@playwright/test';\nimport { test as dbTest } from 'database-test-utils';\nexport const test = mergeTests(dbTest);\n");
+    write(repo.work, 'e2e/merged.spec.ts', "import { test } from './merged';\ntest('m', () => {});\n");
+    write(repo.work, '../index.ts', "import { test as base } from '@playwright/test';\nexport const test = base;\n");
+    write(repo.work, 'test/up.test.ts', "import { test } from '../..';\ntest('up', () => {});\n");
+    const plan = planRuns(ctx, ['e2e/direct.spec.ts', 'e2e/aliased.spec.ts', 'e2e/js-specifier.spec.ts', 'e2e/star.spec.ts', 'e2e/merged.spec.ts', 'test/unit.test.ts', 'test/outside.test.ts', 'test/api.test.ts', 'test/up.test.ts']);
+    expect(plan.groups).toEqual([
+      { runner: 'npx vitest run {files}', cwd: '', files: ['test/unit.test.ts', 'test/outside.test.ts', 'test/api.test.ts', 'test/up.test.ts'] },
+      { runner: 'npx playwright test --reporter=list {files}', cwd: '', files: ['e2e/direct.spec.ts', 'e2e/aliased.spec.ts', 'e2e/js-specifier.spec.ts', 'e2e/star.spec.ts', 'e2e/merged.spec.ts'] },
+    ]);
+  });
+
+  // Value: protects=a JS test that loads node:test runs through `node --test`, never the repo's vitest (which finds no suite in it and fails
+  //   the lane, stopping /ship's finish on every PR that selects one); fails_when=the repo-wide runner takes node:test files again (#4586);
+  //   why_new=no detection looked at node:test imports; seam=none; no_claim=a real node or vitest run (plan only)
+  test('a JS test importing node:test runs through node --test even when the repo declares vitest; vitest tests keep vitest', () => {
+    const repo = fixture({ pregate: null, baseFiles: APP });
+    const ctx = ctxFor(repo, pmShim(repo));
+    write(repo.work, 'package.json', JSON.stringify({ name: 'monorepo', private: true, devDependencies: { vitest: '^4.1.0' } }) + '\n');
+    write(repo.work, 'scripts/release-notes.test.mjs', "import { describe, it } from \"node:test\";\nimport assert from 'node:assert/strict';\nit('formats', () => assert.ok(true));\n");
+    write(repo.work, 'scripts/bare.test.js', "import 'node:test';\n");
+    write(repo.work, 'scripts/legacy.test.cjs', "const assert = require('node:assert');\nconst { test } = require( 'node:test' );\ntest('legacy', () => assert.ok(true));\n");
+    write(repo.work, 'app/scripts/check.test.mjs', "import test from 'node:test';\ntest('nested', () => {});\n");
+    write(repo.work, 'test/a.test.ts', "import { expect, test } from 'vitest';\nimport { test as nodeTest } from 'node:test';\ntest('ts stays', () => expect(1).toBe(1));\n");
+    write(repo.work, 'test/fixture-text.test.js', "import { test } from 'vitest';\n// import { test } from 'node:test';\nconst sample = \"const { test } = require('node:test');\";\ntest('mentions node:test only in text', () => {});\n");
+    const files = ['test/a.test.ts', 'scripts/release-notes.test.mjs', 'test/fixture-text.test.js', 'scripts/bare.test.js', 'scripts/legacy.test.cjs', 'app/src/sum.test.ts', 'app/scripts/check.test.mjs'];
+    expect(planRuns(ctx, files)).toEqual({ groups: [
+      { runner: 'npx vitest run {files}', cwd: '', files: ['test/a.test.ts', 'test/fixture-text.test.js'] },
+      { runner: 'node --test {files}', cwd: '', files: ['scripts/release-notes.test.mjs', 'scripts/bare.test.js', 'scripts/legacy.test.cjs', 'app/scripts/check.test.mjs'] },
+      { runner: 'pnpm exec vitest run {files}', cwd: 'app', files: ['src/sum.test.ts'] },
+    ], unclaimed: [], missing: [], noPubspec: [] });
+    expect(planRuns(ctx, ['test/fixture-text.test.js']).groups).toEqual([{ runner: 'npx vitest run {files}', cwd: '', files: ['test/fixture-text.test.js'] }]);
+    write(repo.work, 'test/mixed.test.js', "import { test } from 'vitest';\nimport { mock } from 'node:test';\ntest('vitest owns it', () => {});\n");
+    write(repo.work, 'test/jest-mixed.test.cjs', "const { test } = require('@jest/globals');\nconst { mock } = require('node:test');\ntest('jest owns it', () => {});\n");
+    expect(planRuns(ctx, ['test/mixed.test.js', 'test/jest-mixed.test.cjs']).groups).toEqual([{ runner: 'npx vitest run {files}', cwd: '', files: ['test/mixed.test.js', 'test/jest-mixed.test.cjs'] }]);
+    write(repo.work, 'scripts/gen.test.mjs', "import { test } from 'node:test';\nconst generated = `\nimport { test } from 'vitest';\ntest('generated', () => {});\n`;\ntest('writes a vitest file', () => generated.includes('vitest'));\n");
+    expect(planRuns(ctx, ['scripts/gen.test.mjs']).groups).toEqual([{ runner: 'node --test {files}', cwd: '', files: ['scripts/gen.test.mjs'] }]);
+    const declared = { ...ctx, config: { ...DEFAULT_CONFIG, runner: 'npx vitest run {files}' } } as PregateContext;
+    expect(planRuns(declared, ['scripts/release-notes.test.mjs']).groups).toEqual([{ runner: 'npx vitest run {files}', cwd: '', files: ['scripts/release-notes.test.mjs'] }]);
+  });
+
   // Value: protects=repos where root detection works today are unchanged: a nested package that declares no test runner stays with the
   //   root runner from the root, a root vitest stays `npx vitest run` from the root, and a declared runner takes every file;
   //   fails_when=every nested package.json splits a group or the root command changes; why_new=negative controls for the new
@@ -1028,7 +1153,10 @@ describe('nested JS packages run their own runner from their own directory', () 
     fs.rmSync(path.join(repo.work, 'bun.lock'));
     write(repo.work, 'package.json', JSON.stringify({ name: 'fixture', devDependencies: { vitest: '^3.2.0' } }) + '\n');
     write(repo.work, 'pnpm-lock.yaml', "lockfileVersion: '9.0'\n");
-    expect(planRuns(ctx, ['app/src/sum.test.ts', 'test/util.test.js']).groups).toEqual([{ runner: 'npx vitest run {files}', cwd: '', files: ['app/src/sum.test.ts', 'test/util.test.js'] }]);
+    expect(planRuns(ctx, ['app/src/sum.test.ts', 'test/util.test.js']).groups).toEqual([
+      { runner: 'npx vitest run {files}', cwd: '', files: ['app/src/sum.test.ts'] },
+      { runner: 'node --test {files}', cwd: '', files: ['test/util.test.js'] },
+    ]);
     const declared = { ...ctx, config: { ...DEFAULT_CONFIG, runner: 'bun test {files}' } } as PregateContext;
     write(repo.work, 'app/package.json', APP['app/package.json']);
     expect(planRuns(declared, ['app/src/sum.test.ts']).groups).toEqual([{ runner: 'bun test {files}', cwd: '', files: ['app/src/sum.test.ts'] }]);

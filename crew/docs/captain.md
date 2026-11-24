@@ -55,6 +55,8 @@ by a daily pass; nothing is retried into green.
   so CI pings wake the lane that can act on them, never the Captain.
 - **The controller never commits to a lane's branch**, and a lane never pushes to another
   lane's. One committer per shared tree.
+- **Work with another agent system** (a second coding agent, an agent on its own machine)
+  follows [working-across-agent-systems.md](../../docs/working-across-agent-systems.md).
 
 ## Drive layout
 
@@ -63,18 +65,20 @@ surface. Keep it small and predictable:
 
 | Path | Who writes | What it holds |
 |---|---|---|
-| `AGENTS.md` | the controller | standing rules and the owner's decisions, each with date and words ([template](../../captain/templates/AGENTS.md)) |
-| `CREW.md` | the controller | the lanes' contract ([template](../../captain/templates/CREW.md)) |
+| `AGENTS.md` | the controller | the controller's own rules and the owner's decisions, each with date and words ([template](../../captain/templates/AGENTS.md)) |
+| `CREW.md` | the controller | the lanes' contract and the owner words lanes cite ([template](../../captain/templates/CREW.md)) |
 | `DIGEST.md` | the controller | Needs you / New / In progress, rewritten every turn ([template](../../captain/templates/DIGEST.md)) |
 | `NOTES.md` | the controller | the append-only timestamped log the digest is derived from ([template](../../captain/templates/NOTES.md)) |
 | `skills/<name>/SKILL.md` | the controller | crew procedures the lanes load (the runbooks) |
-| `reports/<code>.md` | each lane, once | Outcome with its Unverified line, PR, Needs, Cost, Lesson, Approvals ([template](../../captain/templates/report.md)) |
+| `reports/<code>.md` | each lane, once | Outcome with its Failed or skipped, Also changed and Unverified lines, PR, Needs, Cost, Lesson, Approvals ([template](../../captain/templates/report.md)) |
 | `reports/postmortem-<n>.md` | the controller, or a lane it names | why a reverted or S1-fixed merged PR passed every reviewer ([template](../../captain/templates/postmortem.md)) |
 | `handoffs/` | lanes | datasets and specs the next lane needs; `handoffs/flaky-ledger.md` is the flaky ledger ([template](../../captain/templates/flaky-ledger.md)) |
 | `plans/` | the controller | approved plans, with their Approvals table |
 
-Scope instructions in the drive root (`AGENTS.md`, `CREW.md`) apply to every thread in
-the crew, so a rule written there needs no relaying.
+On Capy, crew threads read `CREW.md` on every turn but never the drive-root `AGENTS.md`,
+which reaches the controller alone ([Capy's Captain docs](https://docs.capy.ai/captains)).
+Put every lane-facing rule, and every owner word a lane must cite, in `CREW.md`'s standing
+approvals with its date and words; a rule kept only in `AGENTS.md` needs relaying.
 
 On Capy, `tools.capy.read` returns a view of a file, not the whole file: roughly the first
 38,000 characters, with each line cut at 2,000. A program that reads a file, changes it
@@ -106,7 +110,7 @@ Where each rule lives:
 | 4 | File ownership: edit only what you own; the controller routes the rest | [Lane discipline](#lane-discipline); the ownership list is the digest's **In progress** |
 | 5 | Standing spend and its cap per rerun | [Approvals, shape A](#approvals-three-shapes); the `SPEND` parameter |
 | 6 | The job ends at an unstamped READY; stamp on call; never merge | [The READY contract](#the-ready-contract), the [READY](../../captain/templates/READY.md) and [slot call](../../captain/templates/slot-call.md) templates, [ship-policy.md](../../docs/ship-policy.md#stamp-at-merge) |
-| 7 | One report per lane: Outcome with its Unverified line, PR, Needs, Cost, Lesson, Approvals | [Drive layout](#drive-layout); the [report template](../../captain/templates/report.md) |
+| 7 | One report per lane: Outcome with its Failed or skipped, Also changed and Unverified lines, PR, Needs, Cost, Lesson, Approvals | [Drive layout](#drive-layout); the [report template](../../captain/templates/report.md) |
 | 8 | One path: everything through the controller, never peer to peer | [Roles](#roles); [Lane discipline](#lane-discipline) |
 | 9 | Hands: a real browser, the owner's session or local work go through the controller | [The owner's device](#the-owners-device) |
 | 10 | Keep going; come back only for scope, a conflict, access or the owner's decision | [Lane discipline](#lane-discipline) |
@@ -117,7 +121,7 @@ Where each rule lives:
 | 15 | CHANGELOG entry under `## [Unreleased]` before READY; the stamp touches only `STAMP_FILES` | [ship-policy.md](../../docs/ship-policy.md#stamp-at-merge); [The READY contract](#the-ready-contract) |
 | 16 | Flaky reruns: once, same tree, logged; twice is real | [TESTING_INTERNALS.md](../../docs/TESTING_INTERNALS.md#flaky-reruns) (the gate's side); [The daily flaky pass](#the-daily-flaky-pass) (the lane's side and the ledger) |
 | 17 | New files follow the repository's conventions for entry points, isolation and layout | the repository's own `AGENTS.md` (the `REPO_CONVENTIONS` parameter names the section) |
-| 18 | Outside PRs are bug reports: a verdict within 7 days; rewrite real bugs on main with credit, no contributor commit in the tree | [Contributions from outside the crew](#contributions-from-outside-the-crew) |
+| 18 | Outside PRs are bug reports: a reply within 48 hours, a verdict within 7 days; rewrite real fixes on main with credit; only a docs-only PR for people merges as it is, after a text read | [Contributions from outside the crew](#contributions-from-outside-the-crew) |
 | 19 | CHANGELOG-only conflicts are the train's to resolve, not the lane's | folded into 14: [ship-policy.md](../../docs/ship-policy.md#ship-before-ready) ("the stamp keeps the pin's receipt") |
 | 20 | A READY from before a contract change needs a fresh receipt | [The READY contract](#the-ready-contract) |
 | 21 | Approvals, plan asks and merge asks in the three shapes | [Approvals](#approvals-three-shapes); [capy/skill/gstack/captain.md](../../capy/skill/gstack/captain.md) |
@@ -154,6 +158,34 @@ such decision with a plain-language explanation of every option: what it is, why
 matters, what each answer does, and what it costs. A gate code or a tool's result line
 alone is not an ask.
 
+A lane goes forward instead of stopping to fix. When one item goes bad (a page, a file,
+a test case, a line of a report), it sets that item aside, keeps the rest of the work
+moving, says in its next report what it set aside and why, and repairs the item
+afterwards. Two things still stop work: a red main gets the change that broke it
+reverted rather than the whole crew waiting on a root cause, and a finding at the
+blocking floor ([review-policy.md](../../docs/review-policy.md)) still stops the PR it is
+found in.
+
+When a review round finds another case of a kind an earlier round already found (another
+bypass, another misfire, another double-send path), a lane stops patching cases and changes
+the design. Either it lists every case up front (each caller or trigger against each
+outcome: done, failed, failed partway, refused, retried) with a test for each case that
+sends, deletes or grants, or it rebuilds on a shape that can't have that kind of bug, such
+as an allowlist of named file types instead of a guess about what a file contains. Four
+crews reached this on their own: one PR met a new double-send path in each of four rounds,
+one took five /ship runs before an allowlist rebuild passed in one, one closed a
+pattern-matching PR for a rebuild after every round found new misfires, and one dropped
+exemptions after reads kept finding bypasses.
+
+To narrow a safety or security guard that catches too much, a lane keeps the broad match
+and adds an exemption that a test proves, never a narrower replacement match. A guard that
+decides by matching command text is bypassed by quoting, environment variables,
+redirection, `xargs` or a renamed program, so when reviews keep finding bypasses of an
+exemption, drop the exemption and change the caller or remove the capability instead.
+Three crews hit this: three review blockers on one PR came from replacing a broad match
+with a narrower one, a narrowed command hold was bypassed three ways, and a wrapper that
+blocked one migration command outright broke every upgrade.
+
 ## Lane context
 
 Every step a lane takes re-reads its whole conversation. A step within about five minutes
@@ -173,7 +205,7 @@ cheap:
   A status read in between counts and does not restart the 30 minutes. A wait expected to run
   longer sleeps on its operations alone. For short lane waits this overrides "waits go on
   operations, never on polling wakes" ([unattended.md](../../docs/unattended.md#report-length)). The
-  controller never warm-waits, and a lane still sleeps while /ship runs
+  controller never warm-waits, and a lane running /ship follows the waits in `ship/DRIVER.md`
   ([the lane's /ship sequence](#the-lanes-ship-sequence-before-ready)).
 - **Batched reads.** Independent reads (files, greps, pull request and thread state) go in
   one parallel program, not one call each. Each call returns 4k characters or less; long
@@ -191,15 +223,24 @@ cheap:
   is still worth it. Spend is the
   thread's credit meter, never a token count.
 - **Keep the PR to the end.** A lane keeps its PR until it merges or closes and hands
-  off only at that boundary, never mid-PR on a token count. When its own tokens pass 1
-  billion (about $330), it checks in with the controller once, then carries on unless
-  told otherwise. Standing threads that wake on every event (merge lanes, watchers, an
-  automation's standing thread) still rotate at 500M own tokens or 3 days, and subagent
-  limits stay as they are: look at any subagent past 100M, and never reuse one across PRs
-  ([/runaway-stopper](../../runaway-stopper/SKILL.md)). Why: every handoff wakes the
+  off only at that boundary, never mid-PR on a token count. When its own tokens pass
+  500M, it checks in with the controller once, then carries on unless told otherwise.
+  Standing threads that wake on every event (merge lanes, watchers, an automation's
+  standing thread) rotate at 250M own tokens or 3 days. Look at any subagent past 50M,
+  and never reuse one across PRs ([/runaway-stopper](../../runaway-stopper/SKILL.md)).
+  These lines are half their figures before 2026-11-15, because Capy's token counts have
+  read about half what they did since then for the same work. Why: every handoff wakes the
   controller, whose tokens cost about 1.7 times a lane's, and handoffs are where orphaned
   PRs came from. One PR went through four threads in eight hours (about 103k credits) on
   per-thread token stops and was still a draft.
+- **Subagents earn their context.** A lane starts a subagent only for parallel work whose
+  context can be thrown away, a fresh-eyes review, or a model from another family. It
+  never starts one to run a step of its own procedure (a test run, a rebase, a report),
+  because the subagent re-reads its own brief and context on every step and its tree's
+  spend adds to the lane's: subagent trees were about a quarter of one day's crew spend.
+  The brief names the compact result the subagent returns, such as a verdict line, a file
+  path or a short list, and nothing else comes back. /ship is the lane's own procedure, so
+  the lane runs it in its own thread; only /ship's reviewers are subagents.
 
 ## New threads join the crew
 
@@ -245,6 +286,15 @@ went stale and conflicting, and started to look like junk.
   does this for rotations), while the old thread stays: a successor never makes archiving a
   thread with an open PR OK. When no successor is needed yet, the Captain takes the work
   itself, on an issue assigned to a live thread with the trigger written in it.
+- **Move the clock with the work.** A successor brief lists every wait, watch, webhook and
+  automation the old thread holds, not only its PRs, and the successor registers and
+  confirms each one before the old thread cancels its own, because archiving a thread can
+  pause its automations. A thread holding a deadline checks its waits after every wake,
+  because another wake can end a timer wait for good, and a paid run on an unattended
+  machine collects its own results at the end of its chain instead of trusting a later
+  wake. Three crews lost work this way: an archive paused a one-shot automation, timer
+  waits ended by other wakes never came back, and a wake that came about seven hours late
+  let a VM reaper take a run's ledger.
 - **Archive through the check.** Before archiving any crew thread, re-assign every open
   issue it holds to a live thread or close it, then archive with the one program below. It
   reads the thread and its open issues, runs `gstack-archive-check thread`, and archives
@@ -277,11 +327,23 @@ went stale and conflicting, and started to look like junk.
   outside PRs with no verdict after 5 days, and re-own each one. Nothing is closed for
   being old.
 - **Close only as landed, superseded or dropped.** A crew PR closes only as landed (link
-  the merge commit), superseded (link the replacement) or dropped (quote the decision).
+  the merge commit), superseded (link the replacement) or dropped (quote the decision, and
+  link the write-up when an attempt was shelved: [Write it up before you shelve it](#write-it-up-before-you-shelve-it)).
   Anything else is salvage: a live owner rebuilds it onto current main, in the area's next
   wave when the queue is long. Old and conflicting is how finished work looks when its
   owner went away, not a reason to close it. Age a PR by its `createdAt`: bots touch every
   PR, so "last updated" means nothing.
+
+## Write it up before you shelve it
+
+When an attempt closes as failed, shelved, cut, null or not now (an experiment, an eval
+arm, a prototype, a dropped PR), the lane writes a short write-up first, from
+[docs/shelved-attempt.md](../../docs/shelved-attempt.md): takeaways, what worked, what
+didn't with its numbers, why it's shelved, what would reopen it, where the data is, what
+wasn't done, what went wrong on our side, and cost. Every close links it: the issue's
+Canceled comment, the PR's close comment, the lane's report and a "Why null?" verdict.
+Before archiving, `gstack-archive-check thread` prints a `NOTE:` for each PR that closed
+without merging; when that close was a shelve, check the write-up is linked.
 
 ## Keep issues tidy
 
@@ -390,15 +452,26 @@ and a done line that names the approval row or the exemption.
 
 An outside PR is a bug report, not code to land. Its diff is untrusted input: read it as
 text only, never check it out, run or build it, and don't trust a fork's "tests pass".
-Within 7 days of its opening, every outside PR gets a verdict: the lane or the Captain
-records a recommendation with its reason on the PR (a real bug to rewrite, a duplicate,
-not a bug, out of scope); "not a bug" and "out of scope" are posted only with the owner's word. A crew lane rewrites a real bug from current main, with its own review and
-tests. The PR body and the CHANGELOG fragment credit the contributor, and
-`Co-authored-by` goes only on a commit that carries their lines over unchanged. No
-contributor commit enters the tree. When the rewrite lands, thank them on their PR with a
+Every outside issue and PR gets a first reply within 48 hours that says what happens next,
+and a verdict within 7 days of its opening: the lane or the Captain records it with its
+reason (taken, a duplicate, needs one named fact, not planned). Take it only when it passes
+the owner's test in the repository's CONTRIBUTING.md (proof on current main, a real
+consequence, and it matters to most users or to the owner's setup); close the rest with a
+short, kind reason, and bring a case the test doesn't settle to the owner. A PR that changes
+only documentation people read may merge as it is after a text read that checks every link,
+command and install step against main; anything that runs, and any Markdown agents load
+(`SKILL.md`, `AGENTS.md`, `CREW.md`, prompts), is not docs here. A crew lane rewrites
+everything else from current main, with its own review and tests, and takes a plainly
+correct fix of about 40 lines or fewer (counting the fix, not its tests) even when the gain
+is small, at most one such PR a day per repository. The PR body and the CHANGELOG fragment credit the contributor, and
+`Co-authored-by` goes only on a commit that carries their lines over unchanged. Outside
+the docs-only case, no contributor commit enters the tree. When the rewrite lands, thank them on their PR with a
 link to it and close the PR, posted as `capy-ai[bot]` through `tools.pr.comment`, never
 `gh pr comment`, `gh issue comment` or `gh api` (`gh` runs as the owner). Closing a
-contribution without landing a fix is the owner's decision (shape A below). The
+contribution without landing a fix is the owner's decision, made once as the test above
+(shape A below). Only a chronic author is limited to 3 open PRs: 3 or more PRs closed
+untaken in 30 days, fewer than 1 in 4 taken, and none taken (merged or rebuilt) in the
+last 90 days; the note that closes an extra PR says the limit lifts once one is taken. The
 repository's own statement of these steps is
 [CONTRIBUTING.md](../../CONTRIBUTING.md#how-a-contributors-pr-lands).
 
@@ -416,7 +489,9 @@ cases are already in the ledger; the CHANGELOG entry sits under `## [Unreleased]
 the version files at the base's version; the lane declares the head frozen; and an
 `Unverified:` line lists every claim the lane did not check itself (a local test that
 timed out, a paid run skipped, a number a model reported, a review finding set aside on an
-assumption nobody tested), or says `none`. A green PR page is not a READY. A cheap test
+assumption nobody tested), or says `none`. `Failed or skipped:` and `Also changed:` lines
+name each check, case or step that failed or never ran, and each config, CI or out-of-scope
+file the PR touches, or say `none`. A green PR page is not a READY. A cheap test
 tier is not merge evidence. The controller refuses a block that misses any of this and
 sends the lane back, never into a train. When the
 contract changes (a new required line, a new check name, a new receipt), every READY
@@ -424,6 +499,8 @@ taken before the change is stale: the lane runs `ready` again at the same pin an
 the fresh block; the controller trains nothing older than the change. The `Unverified:`
 line is the one exception: the controller asks for a missing line in a follow-up message,
 never refuses or stales a READY for it, and the lane reruns neither `ready` nor /ship.
+The same exception covers a missing `Failed or skipped:` or `Also changed:` line: the
+controller asks for it in a follow-up message and never refuses or stales a READY over it.
 
 ### The lane's /ship sequence before READY
 
@@ -456,32 +533,30 @@ a push included. The sequence that works unattended on Capy (steps 3 to 8 run in
    `/ship --resume <record>`; no READY goes out on the conditional receipt,
    except on a train with `gates` ([Merge trains for other repos](#merge-trains-for-other-repos)).
 9. READY: `gstack-ship-queue ready --pr <n> --pregate <pregate.json> --screen|--no-screen`;
-   send the printed block. The lane runs this on /ship's completion wake, below.
+   send the printed block. The lane runs this once /ship prints its receipt, below.
 10. After the slot call, the stamp commit keeps the pin's receipt; re-READY with the same
     receipt, no second /ship.
 
-When /ship runs in a subagent, the lane sleeps while it runs. After dispatching /ship, the
-lane ends its turn and wakes only on /ship's completion: one wake to relay READY, because the
-controller hears READY from the lane, never from its subagent. So the lane holds no pull request watch of its own
-while /ship runs: /ship opens the pull request, and on a re-READY the lane cancels the watch
-it already holds before it dispatches. Every READY duty has one owner, so `train build`
+The lane runs /ship itself, in its own thread: one call per `ship/DRIVER.md` phase, with every
+reviewer started as the lane's own subagent. It never hands /ship to a subagent. gstack's trial of
+/ship without one (GST-3003, 30 paired runs on fresh threads, review and fix phases only) found no
+clear difference in cost or catches; its verdict rested on one scoring ruling, and the owner chose to
+drop the extra layer (A1, 2026-11-22). Lanes that reach /ship with a large context were not measured.
+Every READY duty has one owner, so `train build`
 never refuses the pin with `QUEUE_NOT_READY` for a step nobody ran:
 
 | READY duty | Owner |
 |---|---|
 | The ship receipt (`SHIP_RECEIPT:`) and the pregate record behind the `PREGATE:` line (steps 4, 7 and 8) | /ship |
-| `gstack-ship-queue ready --pr <n> --pregate <pregate.json> --screen\|--no-screen` at the pin, with its notes pushed to origin `refs/notes/gstack-trains` (step 9; /ship runs on the lane's machine, or the lane copies its `pregate.json` over first) | the lane |
+| `gstack-ship-queue ready --pr <n> --pregate <pregate.json> --screen\|--no-screen` at the pin, with its notes pushed to origin `refs/notes/gstack-trains` (step 9, on the lane's machine, where /ship ran) | the lane |
 | The decision-trail audit and the READY's `Attention` section, when the crew keeps a trail ([unattended.md](../../docs/unattended.md#the-decision-trail)) | the lane |
 
-On the completion wake the lane subscribes to the pull request's check and review notices,
-reads its checks and comments once (a notice that landed while /ship ran went to /ship, or to nobody on a re-READY),
-stops the /ship subagent, runs `ready`, audits its trail, writes `Attention` and sends the
-READY. A completion that ends `SHIP_PAUSED: base-red` follows step 8 instead: the lane
+When /ship prints its receipt, the lane reads the pull request's checks and comments once,
+runs `ready`, audits its trail, writes `Attention` and sends the READY. A run that ends
+`SHIP_PAUSED: base-red` follows step 8 instead: the lane
 registers the base-red wait, tells the controller, and sends no READY. From then on the lane handles the pull request's events as before: red checks, human
-review, the slot stamp and re-READY of step 10, and any receipt carry. It does that work
-itself or sends it to the subagent as an explicit instruction. The tradeoff: a red check
-that lands while /ship runs waits for /ship to finish instead of being fixed in parallel.
-In exchange, the lane stops re-reading its whole context on every notice during /ship. On
+review, the slot stamp and re-READY of step 10, and any receipt carry. A red check that
+lands while /ship runs waits for /ship to finish instead of being fixed mid-run. On
 Capy the mechanics are in [the gstack skill](../../capy/skill/gstack/SKILL.md#plan-approve-ship).
 
 When the base moves under a reviewed branch, merge it in; never rebase. A merge that
@@ -491,6 +566,54 @@ needs a fresh /ship. A rebase carries only onto a tree the receipt already cover
 the same product diff; any other rebase is a full /ship
 ([ship-policy.md](../../docs/ship-policy.md#receipt-carry)). A controller never asks a lane to
 rebase a reviewed branch.
+
+## Drain the queue
+
+A finished PR that sits unmerged goes stale: main moves under it, conflicts appear, and
+its lane sits idle. On 2026-11-22 gbrain had 22 waiting and gstack 21, gstack's held for
+hours by a stale land lock. The repository owner's ruling that day: fix it now, and put a
+standing process in place so it never builds up again, in this project and in every other
+crew. So every Captain that lands PRs counts its queue at every wake and drains it before it
+piles up.
+
+**Count at every sweep and standing wake.** Run `gstack-ship-queue count` in each repository
+you land, from its checkout. It makes one gh call and prints one `QUEUE_COUNT:` line (how
+many PRs are finished, how many have waited 24 hours or more, and the oldest wait), then a
+`FINISHED:` line per PR, oldest first. A PR is finished when one of ours opened it
+(garrytan, capy-ai or garrytan-agents; `--authors a,b` for another repo's), it targets the
+base, it isn't a draft, GitHub doesn't report it conflicting, and the checks on its newest
+commit are green. Its wait counts from that commit.
+
+**A `DRAIN:` line means drain this turn.** count prints it when more than 6 PRs are
+finished, or when one has waited 24 hours or more. Drain before you start anything new:
+
+1. Land every PR that has a verified READY ([direct land](#direct-land-merge-direct)).
+2. Sort the rest into the two lanes below.
+3. Send each idle owner its next step in one line: /ship at the head, `ready`, merge main
+   and resolve, or "goes in bundle N". A PR whose thread is gone gets a new owner
+   ([no orphaned work](#no-orphaned-work)).
+
+**Lane 1: a low-risk PR lands alone, on its own green head.** No re-merge and no re-test
+when main moves, once the repository has passed one timed
+[revert drill](../../docs/ship-policy.md#revert-drill). If main then goes red, revert the
+culprit within 30 minutes. Low-risk means it touches none of: migrations, dependencies, CI,
+security, user data, money, or a default that flips. Until its drill passes, a repository
+keeps re-testing a stale base (`land.merged_checks`, `land.merged_ci`).
+
+**Lane 2: risky PRs land in a bundle of 3 to 6.** Pick PRs from one area. One integrator
+lane merges their branches into one bundle branch from main and opens one PR naming each
+one; that PR gets one /ship (one review), one full CI and one landing. A PR whose part fails
+drops out and goes back to its owner, and the rest land. Close each bundled PR as landed in
+the bundle. A bundle lives only until it lands: never a standing merge branch, which one bad
+PR poisons.
+
+**A cheap-tier green is never landing evidence.** Land only when every required check
+passes at the exact head (CREW.md `REQUIRED_CHECKS`), the same as any land.
+
+**A stale land lock no longer stops the queue.** `land --pin` takes over a lock whose land
+has exited or expired, and logs it
+([the land lock can't go stale](../../docs/ship-policy.md#land-lock)). A
+`QUEUE_LAND_LOCKED` that says a land is still running means wait for it.
 
 ## Direct land (`merge: direct`)
 
@@ -531,9 +654,9 @@ What to do with each refusal (nothing was merged unless the code says so):
 | `QUEUE_RECEIPT_MISSING` / `QUEUE_RECEIPT_STALE` | lane | /ship at the pin |
 | `QUEUE_NOT_READY` | lane, or Captain | no READY note: `ready --pr <n> --no-screen` at the pin; `merge: train`: use the train; closed or retargeted PR: as named |
 | `QUEUE_LAND_CHECKS` | Captain, then lane | pending: `gstack-pr-wait <n> --until green` and rerun; red: back to the lane (rule 16 rerun for a flaky case); missing: dispatch the workflow on the branch |
-| `QUEUE_LAND_MERGED_CHECKS` | lane | a `land.merged_checks` command failed on the pin merged onto main: the lane merges main (rule 19), fixes it, /ship, `ready`, new READY |
+| `QUEUE_LAND_MERGED_CHECKS` | Captain, then lane | the message says the checks changed files land's git or gh calls read: hold, nothing goes back to the lane yet; restore each named path from a trusted copy, release the lock with `land --pr <n> --pin <sha>` (no `--allow-repo-commands`), and find out why the checks wrote there. Otherwise a `land.merged_checks` command failed, or the `land.merged_ci` run was red, on the pin merged onto main: one rerun for a flaky case (rule 16; for a red `land.merged_ci` run that is `gh run rerun <id>` then land, since land reuses that run), else back to the lane, which merges main (rule 19), fixes it, /ship, `ready`, new READY ([troubleshooting](../../docs/troubleshooting.md#queue-land-merged-checks)) |
 | `QUEUE_LAND_NOT_CLEAN` | lane, or Captain | `CONFLICTING`, or the pin conflicts with main's tip on a stale base: the lane merges main (rule 19), /ship, `ready`; `UNKNOWN`: rerun in a minute |
-| `QUEUE_TRAIN_FROZEN` / `QUEUE_LAND_LOCKED` | Captain | finish the repair or the holder first |
+| `QUEUE_TRAIN_FROZEN` / `QUEUE_LAND_LOCKED` | Captain | finish the repair or the holder first. land takes over a lock whose land exited or expired by itself; a lock it refuses says why: a land still running (wait, or stop the process it names if stuck), another machine's land (rerun after the expiry it prints, or `--break-lock` once you know that land stopped), or a deliberate hold (release it as the `LOCK:` line says) |
 | `QUEUE_TRAIN_UNTRUSTED` | Captain | a fork head; rewrite on a crew branch |
 | `QUEUE_LAND_UNVERIFIED` | Captain | merged, but main isn't the pin on its parent, or main moved after land's check and `land.merged_checks` failed or is absent on the landed tree: revert the stray change or fix forward, report it |
 | `RELEASE_STAMP_INVALID` | Captain | the `release/<version>` head is more than its stamp: close it, `gstack-release-stamp open` again |
@@ -657,6 +780,9 @@ case-kind change, closing a contribution without landing it, and anything destru
 Standing spend is the commonest standing approval: `SPEND` in CREW.md names what the
 owner pre-approved (train gates, screens, bisects, the backstop, focused paid cases) with
 the owner's date and words and the cap per rerun; anything over the cap is a fresh ask.
+A review round past a PR's two (`PR_ROUND_CAP`) is the lane's or the controller's call, recorded
+with `gstack-approvals round-grant`, never an owner ask
+([rounds per pull request](../../docs/review-policy.md#rounds-per-pull-request)).
 
 **B. The plan ask** ([template](../../captain/templates/plan-ask.md)): before → after, why it
 matters, what caused this work, the big decisions, and what we need from you in the ask

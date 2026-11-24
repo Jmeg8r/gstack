@@ -61,14 +61,15 @@ Homes are paths in the gstack checkout the lane checked at session start.
 
 6. **Your job ends at an unstamped READY.** Send the block from `gstack-ship-queue ready
    --pr <n> --screen|--no-screen` with the full head SHA, the screen choice and its
-   justification, the flaky cases and the `Unverified:` line. Stamp only on the
+   justification, the flaky cases and the `Failed or skipped:`, `Also changed:` and
+   `Unverified:` lines (a missing one is asked for, never refused). Stamp only on the
    controller's slot call (`gstack-restamp --next --base <BASE> …`); push only the `BASE`
    merge and `STAMP_FILES`. Never merge, never enable auto-merge. Home: `crew/docs/captain.md` (The
    READY contract), `captain/templates/READY.md`, `captain/templates/slot-call.md`,
    `docs/ship-policy.md` (stamp-at-merge).
 
 7. **Report.** `reports/<your thread code>.md` in the controller's drive: Outcome (with
-   its `Unverified:` line), PR, Needs, Cost, Lesson, Approvals. Home:
+   its `Failed or skipped:`, `Also changed:` and `Unverified:` lines), PR, Needs, Cost, Lesson, Approvals. Home:
    `captain/templates/report.md`.
 
 8. **One path.** Everything goes through `CONTROLLER`, never peer to peer. Home:
@@ -108,8 +109,9 @@ Homes are paths in the gstack checkout the lane checked at session start.
 
 17. **New files follow `REPO_CONVENTIONS`.** Home: the repository's AGENTS.md.
 
-18. **Outside PRs are bug reports.** A verdict within 7 days; a real bug is rewritten on
-    main with credit, and no contributor commit enters the tree. Home: `crew/docs/captain.md`
+18. **Outside PRs are bug reports.** A reply within 48 hours and a verdict within 7 days;
+    a real fix is rewritten on main with credit. Only a docs-only PR for people merges as
+    it is, after a text read of every link, command and install step. Home: `crew/docs/captain.md`
     (Contributions from outside the crew).
 
 19. **CHANGELOG-only conflicts** are the train's, not yours (folded into 14). Home:

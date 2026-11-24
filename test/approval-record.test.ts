@@ -389,6 +389,105 @@ describe('import --autoplan', () => {
     expect(typed.status).not.toBe(0);
   });
 
+  // Value: protects=a run id interactive /autoplan minted before #4402 (<branch>-<YYYYMMDD-HHMMSS>) imports on a branch whose name ends in
+  //   digits, as the 14-digit minted shape does (GST-2047), while a phone number in the same row, a run id of another shape, a phone number
+  //   in the name half of the id, or the same id typed into add --ask still refuses; fails_when=an approval answered before the upgrade cannot
+  //   be imported after it, or the exemption reaches past the stamp; why_new=the GST-2047 test covers only the 14-digit stamp; seam=none
+  test('an interactive run id minted before #4402 imports on a numbered branch; a phone number elsewhere still refuses', () => {
+    const importWith = (o: { runId: string; words?: string }) => {
+      const run = tmp('appr-run-');
+      autoplanRun(run, [{ by: 'agent:GSTA-36', words: o.words ?? 'do it', at: '2026-11-22T09:40:00.000Z', p1: 'a' }]);
+      fs.writeFileSync(path.join(run, 'run.json'), JSON.stringify({ run: o.runId, status: 'complete' }));
+      return importAutoplan(run, 'b', 'Garry');
+    };
+    for (const runId of ['fix-4402-20261122-093321', 'gsta-802-20261122-093321', 'fix-12-20261122-093321']) {
+      const rows = importWith({ runId });
+      expect([runId, 'code' in rows ? rows.message : rows[0]!.source]).toEqual([runId, `autoplan:${runId}@gate_rev=1`]);
+    }
+    const refused: Array<[{ runId: string; words?: string }, string]> = [
+      [{ runId: 'fix-4402-20261122-093321', words: 'do it, call 14155552671 if it breaks' }, 'words'],
+      [{ runId: 'fix-4402-20261122-0933' }, 'ask'],
+      [{ runId: 'fix-4402-20261399-093321' }, 'ask'],
+      [{ runId: 'fix-4402-20261122-993321' }, 'ask'],
+      [{ runId: 'call-415-555-2671-20261122-093321' }, 'ask'],
+      [{ runId: '14155552671-20261122-093321' }, 'source'],
+    ];
+    for (const [o, field] of refused) {
+      const r = importWith(o);
+      expect([o, 'code' in r && r.code, 'code' in r && r.message.startsWith(`field ${field}: `) && r.message.includes('pii.phone.e164')]).toEqual([o, 'APPROVAL_RECORD_SECRET', true]);
+    }
+    const typed = bin(['add', '--ask', 'Approve the plan (autoplan run fix-4402-20261122-093321, 2 decisions)', '--words', 'do it', '--by', 'Garry', '--scope', 'the plan'], { cwd: repo(), env: { GSTACK_STATE_ROOT: tmp('appr-state-') } });
+    expect(typed.status).not.toBe(0);
+    expect(typed.out + typed.err).toContain('field ask: pii');
+  });
+
+  // Value: protects=an interactive /autoplan run (no run.json; its gate rows carry the run id) imports under that run id,
+  //   so the id can be cited and two interactive runs never share one gate state; fails_when=the import falls back to the
+  //   shared directory name "autoplan"; why_new=every answered-gate import case wrote run.json (#4402); seam=none
+  test('an interactive run without run.json imports under the run id its gate rows carry', () => {
+    const run = path.join(tmp('appr-run-'), 'autoplan');
+    fs.mkdirSync(run);
+    const id = 'feature-x-20261122-104500';
+    fs.writeFileSync(path.join(run, 'decisions.jsonl'), JSON.stringify({ schema_version: 1, run: id, id: `${id}-p1`, label: 'P1', title: 'Plan approval',
+      options: ['a', 'b'], recommended: 'a', kind: 'approval', status: 'approved', gate_rev: 1, chosen: 'a', answered_at: '2026-11-22T10:50:00.000Z', reply: 'a' }) + '\n');
+    const rows = importAutoplan(run, 'b', 'owner');
+    if ('code' in rows) throw new Error(rows.message);
+    expect(rows.map(r => r.source)).toEqual([`autoplan:${id}@gate_rev=1`]);
+    expect(rows[0]!.ask).toContain(`autoplan run ${id}`);
+  });
+
+  // Value: protects=a second interactive run appended to the same autoplan directory imports under its own run id with only
+  //   its own answers; fails_when=mixed run ids fall back to the directory name and pool both runs' answers; why_new=the
+  //   interactive case held a single run; seam=none
+  test('a second interactive run appended to the same directory imports under its own run id', () => {
+    const run = path.join(tmp('appr-run-'), 'autoplan');
+    fs.mkdirSync(run);
+    const row = (id: string, at: string) => JSON.stringify({ schema_version: 1, run: id, id: `${id}-p1`, label: 'P1', title: 'Plan approval',
+      options: ['a', 'b'], recommended: 'a', kind: 'approval', status: 'approved', gate_rev: 1, chosen: 'a', answered_at: at, reply: 'a' }) + '\n';
+    const a = 'feature-x-20261122-104500', b = 'feature-y-20261122-114500';
+    fs.writeFileSync(path.join(run, 'decisions.jsonl'), row(a, '2026-11-22T10:50:00.000Z'));
+    const first = importAutoplan(run, 'b', 'owner');
+    if ('code' in first) throw new Error(first.message);
+    expect(first.map(r => r.source)).toEqual([`autoplan:${a}@gate_rev=1`]);
+    fs.appendFileSync(path.join(run, 'decisions.jsonl'), row(b, '2026-11-22T11:50:00.000Z'));
+    const second = importAutoplan(run, 'b', 'owner');
+    if ('code' in second) throw new Error(second.message);
+    expect(second.map(r => r.source)).toEqual([`autoplan:${b}@gate_rev=1`]);
+  });
+
+  // Value: protects=an abandoned older interactive run's pending rows do not mark a newer approved run as unanswered;
+  //   fails_when=stillPending counts pending rows from every run in the directory; why_new=the newest-run selection
+  //   left the pending count pooled; seam=none
+  test('an abandoned older run leaves no unanswered decisions on the newer approved run', () => {
+    const run = path.join(tmp('appr-run-'), 'autoplan');
+    fs.mkdirSync(run);
+    const a = 'feature-x-20261122-104500', b = 'feature-y-20261122-114500';
+    fs.writeFileSync(path.join(run, 'decisions.jsonl'), JSON.stringify({ schema_version: 1, run: a, id: `${a}-d1`, label: 'D1', title: 'Abandoned decision', status: 'pending', gate_rev: 1 }) + '\n'
+      + JSON.stringify({ schema_version: 1, run: b, id: `${b}-p1`, label: 'P1', title: 'Plan approval', options: ['a', 'b'], recommended: 'a', kind: 'approval',
+        status: 'approved', gate_rev: 1, chosen: 'a', answered_at: '2026-11-22T11:50:00.000Z', reply: 'a' }) + '\n');
+    const rows = importAutoplan(run, 'b', 'owner');
+    if ('code' in rows) throw new Error(rows.message);
+    expect(rows.map(r => [r.source, r.outcome, r.pending])).toEqual([[`autoplan:${b}@gate_rev=1`, 'approved', 'none']]);
+  });
+
+  // Value: protects=the run id interactive /autoplan mints (autoplan/SKILL.md.tmpl's RUN_ID line) imports on a branch whose name ends in
+  //   digits; fails_when=the id puts those digits straight before the date stamp, which pii.phone.e164 and pii.cc read as a phone or card
+  //   number, so the import is refused (#4402); why_new=the interactive cases above use branch names without digits; seam=none
+  test('the run id interactive /autoplan mints on a numbered branch imports', () => {
+    const tmpl = fs.readFileSync(path.join(ROOT, 'autoplan', 'SKILL.md.tmpl'), 'utf8');
+    const stamp = /^DATETIME=\$\(date \+([^)]+)\)$/m.exec(tmpl)![1]!.replace(/%([YmdHMS])/g, (_, c: string) => ({ Y: '2026', m: '11', d: '22', H: '09', M: '33', S: '21' } as Record<string, string>)[c]!);
+    const minted = (/^_ID=([^;\s]+);/m.exec(tmpl) ?? /^echo "RUN_ID=([^"]+)"/m.exec(tmpl))![1]!.replace(/\$\{?BRANCH\}?/, '<branch>').replace(/\$\{?DATETIME\}?/, stamp);
+    const run = path.join(tmp('appr-run-'), 'autoplan');
+    fs.mkdirSync(run);
+    for (const branch of ['fix-4402', 'gsta-802', '4402']) {
+      const id = minted.replace('<branch>', branch);
+      fs.writeFileSync(path.join(run, 'decisions.jsonl'), JSON.stringify({ schema_version: 1, run: id, id: `${id}-p1`, label: 'P1', title: 'Plan approval',
+        options: ['a', 'b'], recommended: 'a', kind: 'approval', status: 'approved', gate_rev: 1, chosen: 'a', answered_at: '2026-11-22T10:50:00.000Z', reply: 'a' }) + '\n');
+      const rows = importAutoplan(run, 'b', 'owner');
+      expect([branch, 'code' in rows ? rows.message : rows.map(r => r.source)]).toEqual([branch, [`autoplan:${id}@gate_rev=1`]]);
+    }
+  });
+
   test('an unanswered gate imports nothing and says why', () => {
     const run = tmp('appr-run-');
     fs.writeFileSync(path.join(run, 'decisions.jsonl'), JSON.stringify({ schema_version: 1, run: 'run-1', id: 'run-1-p1', label: 'P1', status: 'pending', gate_rev: 1 }) + '\n');
@@ -408,6 +507,38 @@ describe('Capy mirror', () => {
     expect(r.out).toContain('“rec”');
     expect(r.err).toContain('read the Drive mirror');
     expect(bin(['sync'], { cwd, env: { GSTACK_STATE_ROOT: fresh, GSTACK_APPROVALS_DIR: mirror } }).out).toMatch(/^APPROVAL_SYNCED: rows=1 /);
+  });
+
+  test('a fixture never mirrors into a Drive outside its temp root, through a symlink either (GST-3027)', () => {
+    const base = tmp('appr-fixture-');
+    const fixtureTmp = path.join(base, 'tmp'); const real = path.join(base, 'real-home');
+    const realDrive = path.join(real, '.capy', 'drive', 'project-user-gstack-dana');
+    fs.mkdirSync(fixtureTmp, { recursive: true }); fs.mkdirSync(realDrive, { recursive: true });
+    const fixtureRepo = () => { const d = fs.mkdtempSync(path.join(fixtureTmp, 'fx-')); spawnSync('git', ['init', '-q', '-b', 'qa-fixture'], { cwd: d, timeout: 30_000 }); return d; };
+    const realFiles = () => fs.readdirSync(realDrive, { recursive: true }).filter(f => String(f).endsWith('.jsonl'));
+    const linkedHome = path.join(fixtureTmp, 'linked-home');
+    fs.mkdirSync(path.join(linkedHome, '.capy'), { recursive: true });
+    if (process.platform !== 'win32') fs.symlinkSync(path.join(real, '.capy', 'drive'), path.join(linkedHome, '.capy', 'drive'), 'dir');
+    const cases: Array<[string, Record<string, string>]> = [
+      ['fixture repository, real state root', { NODE_ENV: '', HOME: real, GSTACK_STATE_ROOT: path.join(real, '.gstack') }],
+      ['fixture state root', { NODE_ENV: '', HOME: real, GSTACK_STATE_ROOT: path.join(fixtureTmp, 'state') }],
+      ['explicit mirror directory', { NODE_ENV: '', HOME: path.join(fixtureTmp, 'home'), GSTACK_STATE_ROOT: path.join(fixtureTmp, 'state'), GSTACK_APPROVALS_DIR: path.join(realDrive, 'approvals') }],
+      ...(process.platform === 'win32' ? [] : [['Drive linked out of the fixture', { NODE_ENV: '', HOME: linkedHome, GSTACK_STATE_ROOT: path.join(fixtureTmp, 'state') }] as [string, Record<string, string>]]),
+    ];
+    for (const [name, env] of cases) {
+      const r = bin(['add', '--ask', 'Spend cap', '--words', 'do it', '--by', 'QA', '--scope', 'spend cap'], { cwd: fixtureRepo(), env: { TMPDIR: fixtureTmp, GSTACK_CAPY: '1', ...env } });
+      expect({ name, status: r.status }).toEqual({ name, status: 1 });
+      expect(r.err).toContain('(APPROVAL_RECORD_WRITE_FAILED)');
+      expect(r.err).toContain('outside the temp root');
+      expect({ name, written: realFiles() }).toEqual({ name, written: [] });
+    }
+    const underTest = bin(['add', '--ask', 'Spend cap', '--words', 'do it', '--by', 'QA', '--scope', 'spend cap'], { cwd: ROOT, env: { TMPDIR: fixtureTmp, NODE_ENV: 'test', GSTACK_CAPY: '1', HOME: real, GSTACK_STATE_ROOT: path.join(real, '.gstack'), GSTACK_PROJECT_SLUG: 'acme-widgets' } });
+    expect(underTest.err).toContain('outside the temp root');
+    expect(realFiles()).toEqual([]);
+    const inside = path.join(fixtureTmp, 'home'); fs.mkdirSync(path.join(inside, '.capy', 'drive', 'project-user-gstack-qa'), { recursive: true });
+    const ok = bin(['add', '--ask', 'Spend cap', '--words', 'do it', '--by', 'QA', '--scope', 'spend cap'], { cwd: fixtureRepo(), env: { TMPDIR: fixtureTmp, NODE_ENV: '', GSTACK_CAPY: '1', HOME: inside, GSTACK_STATE_ROOT: path.join(fixtureTmp, 'state') } });
+    expect(ok.status).toBe(0);
+    expect(ok.out).toContain(`mirror=${path.join(inside, '.capy', 'drive', 'project-user-gstack-qa', 'approvals', 'acme-widgets')}`);
   });
 
   test('an ephemeral state root with no record and no mirror is unavailable, not empty', () => {
@@ -468,3 +599,68 @@ describe('import --autoplan --stack', () => {
     expect(bin(['import', '--autoplan', tmp('appr-run-'), '--branch', 'feature/one', '--stack', 'feature/one'], { cwd }).status).toBe(2);
   });
 });
+
+// Value: protects=each --owner-ref refusal of rule and round-grant names the one check that failed and the ref shape OWNER_REF accepts, never echoes the rejected ref, and every APPROVAL_RECORD_INVALID fix clause stops pointing at add's flags;
+//   fails_when=a bad ref, a missing --words and a missing --by print one shared sentence again, the refusal prints the raw ref, or fix: sends rule, round-grant, lane-exception or gate to add (--ask, --scope) (#4718, idea from @Barack-zero-to-one in #4720);
+//   why_new=no test read the refusal text, only its exit code; seam=gstack-approvals rule|round-grant|lane-exception|gate
+describe('APPROVAL_RECORD_INVALID names the failed check and no other command (#4718)', () => {
+  const committed = () => {
+    const cwd = repo();
+    spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-q', '--allow-empty', '-m', 'init'], { cwd, timeout: 30_000 });
+    return { cwd, env: { GSTACK_STATE_ROOT: tmp('appr-state-') } };
+  };
+  const split = (err: string) => { const at = err.indexOf('; fix: '); return { why: err.slice(0, at), fix: err.slice(at + 7) }; };
+  const RULE = ['rule', '--finding', 'a.txt:1:docs', '--head', 'HEAD', '--reason', 'synthetic'];
+  const REF = 'SHIP-161:2026-11-22T18:42:14Z';
+  const BAD = 'ship-161:2026-11-22T18:40:00Z';
+
+  test('rule: a bad ref is refused for its shape alone, without echoing it; a good ref still records', () => {
+    const o = committed();
+    const r = bin([...RULE, '--words', 'A', '--by', 'owner', '--owner-ref', BAD], o);
+    expect([r.status, r.err]).toEqual([2, expect.stringContaining('(APPROVAL_RECORD_INVALID)')]);
+    const { why } = split(r.err);
+    expect(why).toContain('--owner-ref');
+    expect(why).toMatch(/uppercase/);
+    expect(why).not.toContain(BAD);
+    expect(why).not.toContain('--words');
+    expect(why).not.toContain('--by');
+    const ok = bin([...RULE, '--words', 'A', '--by', 'owner', '--owner-ref', REF], o);
+    expect(ok.status, ok.err).toBe(0);
+  });
+
+  test('rule: a good ref without --words names --words alone, and without --by names --by alone', () => {
+    const noWords = split(bin([...RULE, '--by', 'owner', '--owner-ref', REF], committed()).err).why;
+    expect(noWords).toContain('--words');
+    expect(noWords).not.toContain('--by');
+    expect(noWords).not.toMatch(/uppercase/);
+    const noBy = split(bin([...RULE, '--words', 'A', '--owner-ref', REF], committed()).err).why;
+    expect(noBy).toContain('--by');
+    expect(noBy).not.toContain('--words');
+    expect(noBy).not.toMatch(/uppercase/);
+  });
+
+  test('round-grant: a bad ref is refused for its shape alone; a good ref without --words names --words', () => {
+    const grant = ['round-grant', '--pr', '7', '--head', 'HEAD', '--kind', 'extra-round', '--reason', 'r', '--by', 'Captain'];
+    const bad = split(bin([...grant, '--owner-ref', 'ship-161:x', '--words', 'w'], committed()).err).why;
+    expect(bad).toMatch(/uppercase/);
+    expect(bad).not.toContain('ship-161');
+    expect(bad).not.toContain('--words');
+    const noWords = split(bin([...grant, '--owner-ref', REF], committed()).err).why;
+    expect(noWords).toContain('--words');
+    expect(noWords).not.toMatch(/uppercase/);
+  });
+
+  test('the fix clause of rule, round-grant, lane-exception and gate names no flag of add', () => {
+    const o = committed();
+    for (const args of [[...RULE, '--words', 'A', '--by', 'owner', '--owner-ref', BAD], ['round-grant'], ['lane-exception'], ['gate']]) {
+      const r = bin(args, o);
+      expect([args[0], r.status, r.err]).toEqual([args[0], 2, expect.stringContaining('(APPROVAL_RECORD_INVALID)')]);
+      const { fix } = split(r.err);
+      expect(fix).not.toContain('gstack-approvals add');
+      expect(fix).not.toContain('--ask');
+      expect(fix).not.toContain('--scope');
+      expect(fix).toContain('nothing was written');
+    }
+  });
+});
+

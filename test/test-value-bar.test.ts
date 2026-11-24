@@ -171,7 +171,7 @@ describe('ship parent decision rules', () => {
 
   test('the rejection step removes new rejected files and reports tracked ones for a hunk revert', () => {
     const start = shipSection.indexOf('   REJECTED_FILE="$(git rev-parse');
-    const end = shipSection.indexOf('   rm -f "$REJECTED_FILE"\n', start) + '   rm -f "$REJECTED_FILE"\n'.length;
+    const end = shipSection.indexOf('   rm -- "$REJECTED_FILE"\n', start) + '   rm -- "$REJECTED_FILE"\n'.length;
     const block = shipSection.slice(start, end).split('\n').map(line => line.replace(/^ {3}/, '')).join('\n');
     expect(block).toContain('<rejected-file-name>');
     expect(block).toContain('done < "$REJECTED_FILE"');
@@ -243,6 +243,16 @@ describe('template contracts', () => {
     expect(audit).toContain('`SESSION_KIND: spawned` or `headless`, this run is hard report-only');
     expect(audit).toContain('treat every batch as C) stop');
     expect(audit).toContain('A) approve this batch B) skip it C) stop');
+  });
+
+  test('/test-audit sets BRANCH the way the plan writer does before the seed plan lookup (#4216)', () => {
+    for (const file of ['test-audit/SKILL.md.tmpl', 'test-audit/SKILL.md']) {
+      const content = read(file);
+      const assign = content.indexOf('BRANCH=$(~/.claude/skills/gstack/bin/gstack-slug --get BRANCH');
+      const lookup = content.indexOf('-"$BRANCH"-eng-review-test-plan-');
+      expect(assign, `${file} must set BRANCH with gstack-slug`).toBeGreaterThan(-1);
+      expect(lookup, `${file} must look up the seed plan by BRANCH`).toBeGreaterThan(assign);
+    }
   });
 
   test('the caller search keeps production resolvers and excludes tests', () => {

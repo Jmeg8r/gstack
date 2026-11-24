@@ -2,13 +2,9 @@
 
 ## NEXT PRIORITY
 
-### P2: `/plan-eng-review` retirement follow-ups (filed 2026-11-06, GST-1698 /ship review of #4108)
+### P3: `/plan-eng-review` return follow-up (filed 2026-11-15, GST-2726)
 
-- **Delete the retired `plan-eng-multi-finding-batching` case and its counter subsystem.** The case checks one interactive question per eng finding; /autoplan Phase 3 auto-decides findings, so no shipped entry reaches it. The follow-up to #4108 took it out of the weekly lane through `PERIODIC_CI_EXCLUDE` instead of deleting it, because about 20 free tests and fixtures depend on its counter (`createEngBatchingIssueCounter` in `test/helpers/eng-seeded-coverage.ts`, `test/eng-batching-saved-ledger.test.ts`, `test/detector-corpus-plan-eng-multi-finding-batching.test.ts`, the `eng-batching-*` fixtures). Retirement card: detects=an eng review that batches findings into one plan write; non_test_callers=0; stronger_proof=the ceo/design/devex finding floors keep the shared one-question-per-finding contract; unlocks=the counter helpers, their free tests and fixtures. Delete each helper only after checking it has no other caller (plan-eng-review-artifact shares `engFirstReviewAUQ`). **Effort:** M. **Priority:** P3.
-- **Point the external-host methodology file's preamble Read at `gstack-autoplan`.** Every external host's `gstack-autoplan/plan-eng-review.md` says to Read `sections/preamble.md` relative to the installed `gstack-plan-eng-review` directory, which no longer exists. Normally the matching preamble id skips the reread, but after compaction late in a run the agent follows a missing path. Fixing it changes Phase 3 bytes, so it needs its own byte-pin update. **Effort:** S. **Priority:** P3.
-- **Redirect `gstack-doctor --for plan-eng-review`.** It now exits 2 with "unknown skill"; map the retired name to `/autoplan`'s requirements and print a one-line redirect, so saved lane scripts keep working. **Effort:** S. **Priority:** P3.
-- **Decide whether the QM edition keeps `gstack-plan`.** `hosts/qm.ts` and `qm/edition.json` still build `gstack-plan` from the `plan-eng-review` sources under another name, so the retired-name guards don't see it. Product call for Garry. **Effort:** S. **Priority:** P3.
-- **Pin the retirement in two more tests.** Assert that `generateLlmsTxt` output lists no `plan-eng-review` entry (`test/llms-txt-shape.test.ts`), and that `HYBRID_SKILLS` holds none of `RETIRED_SKILLS` (`test/harness-register.test.ts`). **Effort:** S. **Priority:** P3.
+- **Decide whether `plan-eng-multi-finding-batching` rejoins the weekly lane.** The cut of the standalone skill (GST-1698) took it out through `PERIODIC_CI_EXCLUDE`, because /autoplan Phase 3 auto-decides findings. The standalone `/plan-eng-review` is back (GST-2726) and asks one question per eng finding again, so the case reaches a shipped entry. Running it weekly is paid spend, so the call belongs to the measurement plan in GST-1966. The standalone paid cases deleted with the cut (`plan-eng-plan-mode`, `plan-eng-finding-floor`, `plan-eng-review-artifact-full`) are not restored either. **Effort:** S. **Priority:** P3.
 
 ### P3: clarity-judge removal follow-ups (filed 2026-11-04, GST-1371)
 
@@ -50,7 +46,7 @@
 
 ### P2/P3: pregate head-policy follow-ups (filed 2026-10-31, from the GST-419/GST-420 /ship review)
 - **`finish` fallback drops head-policy lanes (P2)** — `lib/ship-release.ts` reruns pregate on the stamped tree under the base policy, so after a version bump a lane the branch added under `--policy-from head` is gone and `finish` reports `PREGATE: fail (rerun on the stamped tree)`. GSTA-194 owns that file and has the note. **Effort:** S. **Priority:** P2.
-- **The 3600 s preflight and `finish` wrapper deadline (P3)** — it caps the whole pregate run, so several runners that each fit `timeout_s` can still be cut off together. Derive the wrapper deadline from `timeout_s` and the lane count, or document the cap. **Effort:** S. **Priority:** P3.
+- **The 3600 s `finish` wrapper deadline (P3)** — it caps the whole pregate rerun, so several runners that each fit `timeout_s` can still be cut off together. Derive the wrapper deadline from `timeout_s` and the lane count, or document the cap. Preflight's half is done: `gstack-ship-preflight --step-timeout <s>` sets that budget and a stop prints `PREGATE: time limit hit` (#4429). **Effort:** S. **Priority:** P3.
 - **A bootstrap head policy can still certify itself without `--remote` (P3)** — with no trusted policy, the head file may set `remote_gate: null`, or produce an obligation that `gstack-pregate clear --receipt` accepts from the branch's own gate. Decide what a bootstrap `pregate.json` may certify, then enforce it in `verify` from the recorded policy label instead of per entry point. The `--remote` refusal also prints the generic `PREGATE_HEAD_POLICY_LOOSENS` fix line, which does not apply when there is no trusted policy. **Effort:** S. **Priority:** P3.
 
 ### P3: `/codex --effort` follow-ups (filed 2026-10-11, from the #3146 autoplan review)
@@ -189,12 +185,15 @@ Left open by the iPad and route-drop release, each with its reason.
 
 Left open by v1.91.42.0, which lifted the snapshot file-count ceiling.
 
-- **Tracked symlinks refuse the whole /cso run** — `capture()` fails closed on
+- **Tracked symlinks refuse the whole /cso run** — `capture()` failed closed on
   any tracked symlink ("Symlink or special source file"). 5 of 8 mid-size OSS
-  repos measured for v1.91.42.0 stop there (django, rails, terraform, grafana,
-  vscode; 1-10 symlinks each, mostly test fixtures). Recording them as unread
-  exclusions in the manifest, like dependency trees, is a security design call
-  for Garry. **Effort:** M. **Priority:** P1.
+  repos measured for v1.91.42.0 stopped there (django, rails, terraform, grafana,
+  vscode; 1-10 symlinks each, mostly test fixtures). Decided on 2026-11-20 by
+  GStack Minder in #4567: /cso records each link by its target string, or notes that the target was withheld when it matches a secret pattern and never
+  dereferences it. This fork (jfcadm/gstack) keeps its own design instead: it
+  never writes link text anywhere, records an in-repo alias as an exclusion and
+  withholds every other link (docs/troubleshooting.md, "Symlinks").
+  **Effort:** M. **Priority:** P1.
 - **64 MiB aggregate source cap (#2993)** — files over 1 MiB are withheld from
   the audit but still read and counted. Stream-hash them without counting
   toward the cap, report them as unread coverage, and add an admission estimate
@@ -5513,9 +5512,10 @@ Garry for each; revisit 2026-10-29 unless a date says otherwise.
   (`['paste', 'enter', 'end_turn']`). Wait for the CLI's own write instead of a
   timer (docs/TESTING_INTERNALS.md#flake-ledger). **Effort:** S. **Priority:** P2.
 - **Split the free files the weekly seed puts over 60 s** —
-  `test/setup-install-registry.test.ts` (117 s), `test/brain-sync.test.ts` (91 s)
-  and `test/setup-codex-scope.test.ts` (77 s) are allowlisted with this todo in
-  `scripts/free-test-seed-allowlist.json` (2026-10-31 recording, run 41229924108).
+  `test/setup-install-registry.test.ts` (117 s) and `test/brain-sync.test.ts` (91 s)
+  are allowlisted with this todo in
+  `scripts/free-test-seed-allowlist.json` (2026-10-31 recording, run 41229924108);
+  `test/setup-codex-scope.test.ts` left the list at 58 s in the 2026-11-22 recording.
   `test/host-renders-prune.test.ts`, `test/setup-codex-scope-namespaces.test.ts`
   and seven other files the recordings put over 60 s were split in
   GSTA-151. Split each remaining file by describe block, rerun `bun run test:ubicloud --record-durations` and

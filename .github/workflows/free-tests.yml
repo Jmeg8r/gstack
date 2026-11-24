@@ -8,9 +8,9 @@ name: Free Tests
 # provider keys at all — least privilege, and fork PRs get real test signal
 # here (the eval matrix skips fork PRs because repository secrets can't reach
 # them). test/free-tests-workflow-wiring.test.ts fails CI if a secret sneaks in.
-# The exceptions are TRUNK_API_TOKEN in the trunk-dynamic-ci observer and
-# TRUNK_ORG_API_TOKEN in the trunk-flaky-tests uploader. Each runs no
-# pull-request code and nothing depends on it (see those jobs).
+# The one exception is TRUNK_API_TOKEN in the trunk-dynamic-ci observer, which
+# runs no pull-request code and nothing depends on it (see that job). The Trunk
+# Flaky Tests uploader runs after this workflow, in trunk-flaky-tests.yml.
 #
 # This is a REQUIRED check from day one (branch protection lists it). If it's
 # red, fix or quarantine-with-issue — don't make it advisory; an advisory lane
@@ -22,7 +22,9 @@ name: Free Tests
 # uploads a `tested-tree` record (tree.json) only after strict verification
 # passes. A push to main first runs `reuse`: when the merged pull request's
 # head has the pushed tree and a green pull_request or workflow_dispatch run of
-# this workflow verifies (lib/run-evidence.ts), every suite job is skipped and
+# this workflow verifies (lib/run-evidence.ts), or when land's newest dispatch
+# run on gstack-land/<pr> verifies with the pushed tree as its tested tree (a
+# stale-base land, docs/pregate.md#ci-reuse), every suite job is skipped and
 # the aggregate links that run instead. A pull request run reuses too, but
 # only a run the pull request cannot control: a green push or dispatch run on
 # main, or a dispatch run on its own branch, at the merge commit's exact tree,
@@ -42,7 +44,7 @@ on:
   workflow_dispatch:
     inputs:
       free_runner:
-        description: 'Runner-sizing experiments only: Ubicloud runner for the free-suite shards (ubicloud-standard-2, -4 or -8; empty keeps FREE_SUITE_RUNNER). Never cite such a run as a PR or train Free Tests result.'
+        description: 'Runner-sizing experiments only: Ubicloud runner for the free-suite shards (ubicloud-standard-2, -4, -8 or -16; empty keeps FREE_SUITE_RUNNER). Never cite such a run as a PR or train Free Tests result.'
         type: string
         default: ''
       free_shards:
@@ -207,11 +209,16 @@ jobs:
           read -ra tests <<< "$DOCS_TESTS"
           bun --no-env-file test --timeout=30000 "${tests[@]}"
 
+  # The planner runs beside reuse and docs-scope instead of after them, so the
+  # shards wait for one round of small jobs, not two (GST-3303: the second
+  # round cost 21 s at p50 and 363 s at p95 of GitHub queue). It only plans:
+  # free-suite and the aggregate still read reuse and docs-scope, so a reused
+  # main push or a docs-only pull request runs no shard. On those runs the
+  # plan and its artifact are unused; scripts/lib/ci-history.ts reads a run
+  # whose only artifact is free-plan as one that ran no shard.
   free-plan:
-    needs: [reuse, docs-scope]
-    if: ${{ !cancelled() && (needs.reuse.result != 'success' || needs.reuse.outputs.reused != 'true') && !(needs.docs-scope.result == 'success' && needs.docs-scope.outputs.docs_only == 'true') }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       runner: ${{ steps.plan.outputs.runner }}
@@ -240,8 +247,8 @@ jobs:
           shards="${SHARDS_OVERRIDE:-$FREE_SUITE_SHARDS}"
           jobs="${JOBS_OVERRIDE:-$FREE_SUITE_JOBS}"
           case "$runner" in
-            ubicloud-standard-2|ubicloud-standard-4|ubicloud-standard-8) ;;
-            *) echo "::error::free_runner '$runner' is not ubicloud-standard-2, -4 or -8"; exit 1 ;;
+            ubicloud-standard-2|ubicloud-standard-4|ubicloud-standard-8|ubicloud-standard-16) ;;
+            *) echo "::error::free_runner '$runner' is not ubicloud-standard-2, -4, -8 or -16"; exit 1 ;;
           esac
           case "$shards" in
             ''|*[!0-9]*) echo "::error::free_shards '$shards' is not a whole number"; exit 1 ;;
@@ -472,6 +479,32 @@ jobs:
         with:
           path: ~/.cache/ms-playwright
           key: linux-playwright-chromium-${{ steps.playwright.outputs.version }}
+      # --with-deps fetches about 38 MB of system packages from archive.ubuntu.com
+      # on every run. On 2026-11-19 that mirror served some runners at 85 to
+      # 280 kB/s: 17 of 456 first attempts hit the 5-minute limit, and each
+      # retry then died in seconds on the dpkg lock that the killed attempt's
+      # apt-get still held (run 44485949701). apt now waits for that lock, and
+      # the packages one run downloads are cached under a key made from the
+      # runner's installed package list and the Playwright version, so a later
+      # run on the same image installs them with dpkg and never touches the mirror.
+      - name: Make apt wait for its lock and keep the packages it downloads
+        run: printf 'DPkg::Lock::Timeout "240";\nAPT::Keep-Downloaded-Packages "true";\nBinary::apt::APT::Keep-Downloaded-Packages "true";\n' | sudo tee /etc/apt/apt.conf.d/90gstack-ci > /dev/null
+      - name: Fingerprint the runner's installed system packages
+        id: apt_base
+        env:
+          PLAYWRIGHT_VERSION: ${{ steps.playwright.outputs.version }}
+        run: echo "cache_key=linux-apt-debs-$(dpkg-query -W -f='${binary:Package}=${Version}\n' | sha256sum | cut -c1-16)-playwright-$PLAYWRIGHT_VERSION" >> "$GITHUB_OUTPUT"
+      - name: Restore the system packages an earlier run downloaded
+        id: apt_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cache/gstack-apt-debs
+          key: ${{ steps.apt_base.outputs.cache_key }}
+      - name: Install the cached system packages without the network
+        id: apt_offline
+        if: steps.apt_cache.outputs.cache-hit == 'true'
+        continue-on-error: true
+        run: sudo dpkg -i "$HOME"/.cache/gstack-apt-debs/*.deb
       # The cache restores the browser; --with-deps still runs apt for system
       # libraries. On 2026-10-21 apt stalled on an archive.ubuntu.com fetch and
       # held free-suite (12) for the whole 20-minute job timeout (run
@@ -482,11 +515,17 @@ jobs:
         id: playwright_install
         timeout-minutes: 5
         continue-on-error: true
-        run: npx playwright install --with-deps chromium
+        env:
+          SYSTEM_PACKAGES: ${{ steps.apt_offline.outcome }}
+        run: |
+          if [ "$SYSTEM_PACKAGES" = success ]; then npx playwright install chromium; else npx playwright install --with-deps chromium; fi
       - name: Retry the Playwright Chromium install once
         if: steps.playwright_install.outcome == 'failure'
         timeout-minutes: 5
-        run: npx playwright install --with-deps chromium
+        env:
+          SYSTEM_PACKAGES: ${{ steps.apt_offline.outcome }}
+        run: |
+          if [ "$SYSTEM_PACKAGES" = success ]; then npx playwright install chromium; else npx playwright install --with-deps chromium; fi
       - name: Configure the bundled Chromium sandbox helper
         run: |
           set -euo pipefail
@@ -516,6 +555,21 @@ jobs:
           sudo apparmor_parser -r "$profile"
       - name: Install Xvfb + X11 utilities + gate tools
         run: sudo apt-get install -y --no-install-recommends xvfb x11-utils poppler-utils fonts-noto-color-emoji zsh
+      - name: Keep the system packages this run downloaded
+        id: apt_keep
+        if: steps.apt_cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.cache/gstack-apt-debs
+          if compgen -G '/var/cache/apt/archives/*.deb' > /dev/null; then
+            cp /var/cache/apt/archives/*.deb ~/.cache/gstack-apt-debs/
+            echo "save=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Save the system packages for the next run on this image
+        if: steps.apt_keep.outputs.save == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cache/gstack-apt-debs
+          key: ${{ steps.apt_cache.outputs.cache-primary-key }}
       - name: Configure git identity (tests init temp repos)
         run: |
           git config --global user.email "free-tests-ci@gstack.test"
@@ -536,12 +590,38 @@ jobs:
         env:
           GSTACK_FREE_RETRY_FLAKY: "1"
           GSTACK_FLAKE_LEDGER: ${{ runner.temp }}/flake-ledger.jsonl
-        run: xvfb-run -a bun run test:quick
+        run: xvfb-run -a bun run test:quick --junit-dir "$RUNNER_TEMP/quick-junit"
+
+      # Kept for trunk-flaky-tests.yml, which uploads them to Trunk as the
+      # bun-default variant after the run, so a flaky pass here reaches Trunk
+      # as well as the flake ledger (GST-3303).
+      - name: Upload the quick tier's JUnit reports
+        if: always()
+        timeout-minutes: 3
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: quick-junit
+          path: ${{ runner.temp }}/quick-junit/*.xml
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # The quick tier retries a failing file once too, so its flaky passes go
+      # in the same flake-ledger-* series the aggregate summarizes and
+      # test:health counts. Before GST-3303 this ledger was written and lost.
+      - name: Upload the quick tier's flake ledger
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: flake-ledger-quick
+          path: ${{ runner.temp }}/flake-ledger.jsonl
+          if-no-files-found: ignore
+          retention-days: 90
 
   free-suite:
     name: free-suite (${{ matrix.shard }})
-    needs: [free-plan, reuse]
-    if: ${{ !cancelled() && needs.free-plan.result == 'success' && (needs.reuse.result != 'success' || needs.reuse.outputs.reused != 'true') }}
+    needs: [free-plan, reuse, docs-scope]
+    if: ${{ !cancelled() && needs.free-plan.result == 'success' && (needs.reuse.result != 'success' || needs.reuse.outputs.reused != 'true') && !(needs.docs-scope.result == 'success' && needs.docs-scope.outputs.docs_only == 'true') }}
     runs-on: ${{ needs.free-plan.outputs.runner }}
     # Per shard, from the plan: runner wall + flaky retry + setup (#3850).
     timeout-minutes: ${{ matrix.timeout_minutes }}
@@ -595,6 +675,32 @@ jobs:
           path: ~/.cache/ms-playwright
           key: linux-playwright-chromium-${{ steps.playwright.outputs.version }}
 
+      # --with-deps fetches about 38 MB of system packages from archive.ubuntu.com
+      # on every run. On 2026-11-19 that mirror served some runners at 85 to
+      # 280 kB/s: 17 of 456 first attempts hit the 5-minute limit, and each
+      # retry then died in seconds on the dpkg lock that the killed attempt's
+      # apt-get still held (run 44485949701). apt now waits for that lock, and
+      # the packages one run downloads are cached under a key made from the
+      # runner's installed package list and the Playwright version, so a later
+      # run on the same image installs them with dpkg and never touches the mirror.
+      - name: Make apt wait for its lock and keep the packages it downloads
+        run: printf 'DPkg::Lock::Timeout "240";\nAPT::Keep-Downloaded-Packages "true";\nBinary::apt::APT::Keep-Downloaded-Packages "true";\n' | sudo tee /etc/apt/apt.conf.d/90gstack-ci > /dev/null
+      - name: Fingerprint the runner's installed system packages
+        id: apt_base
+        env:
+          PLAYWRIGHT_VERSION: ${{ steps.playwright.outputs.version }}
+        run: echo "cache_key=linux-apt-debs-$(dpkg-query -W -f='${binary:Package}=${Version}\n' | sha256sum | cut -c1-16)-playwright-$PLAYWRIGHT_VERSION" >> "$GITHUB_OUTPUT"
+      - name: Restore the system packages an earlier run downloaded
+        id: apt_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cache/gstack-apt-debs
+          key: ${{ steps.apt_base.outputs.cache_key }}
+      - name: Install the cached system packages without the network
+        id: apt_offline
+        if: steps.apt_cache.outputs.cache-hit == 'true'
+        continue-on-error: true
+        run: sudo dpkg -i "$HOME"/.cache/gstack-apt-debs/*.deb
       # The cache restores the browser; --with-deps still runs apt for system
       # libraries. On 2026-10-21 apt stalled on an archive.ubuntu.com fetch and
       # held free-suite (12) for the whole 20-minute job timeout (run
@@ -605,12 +711,18 @@ jobs:
         id: playwright_install
         timeout-minutes: 5
         continue-on-error: true
-        run: npx playwright install --with-deps chromium
+        env:
+          SYSTEM_PACKAGES: ${{ steps.apt_offline.outcome }}
+        run: |
+          if [ "$SYSTEM_PACKAGES" = success ]; then npx playwright install chromium; else npx playwright install --with-deps chromium; fi
 
       - name: Retry the Playwright Chromium install once
         if: steps.playwright_install.outcome == 'failure'
         timeout-minutes: 5
-        run: npx playwright install --with-deps chromium
+        env:
+          SYSTEM_PACKAGES: ${{ steps.apt_offline.outcome }}
+        run: |
+          if [ "$SYSTEM_PACKAGES" = success ]; then npx playwright install chromium; else npx playwright install --with-deps chromium; fi
 
       - name: Configure the bundled Chromium sandbox helper
         run: |
@@ -655,6 +767,21 @@ jobs:
       # skip instead of running.
       - name: Install Xvfb + X11 utilities + gate tools
         run: sudo apt-get install -y --no-install-recommends xvfb x11-utils poppler-utils fonts-noto-color-emoji zsh
+      - name: Keep the system packages this run downloaded
+        id: apt_keep
+        if: steps.apt_cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.cache/gstack-apt-debs
+          if compgen -G '/var/cache/apt/archives/*.deb' > /dev/null; then
+            cp /var/cache/apt/archives/*.deb ~/.cache/gstack-apt-debs/
+            echo "save=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Save the system packages for the next run on this image
+        if: steps.apt_keep.outputs.save == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cache/gstack-apt-debs
+          key: ${{ steps.apt_cache.outputs.cache-primary-key }}
 
       - name: Configure git identity (tests init temp repos)
         run: |
@@ -735,7 +862,7 @@ jobs:
           if-no-files-found: error
 
       # bun's JUnit report from every child of this shard, the flaky retry
-      # included. Only trunk-flaky-tests reads it; no verdict does.
+      # included. Only trunk-flaky-tests.yml reads it; no verdict does.
       - name: Upload shard JUnit reports
         if: always()
         timeout-minutes: 3
@@ -776,60 +903,6 @@ jobs:
           path: .context/free-test-logs/gstack-free-test-*.log
           include-hidden-files: true
           if-no-files-found: ignore
-
-  # Trunk Flaky Tests, DETECTION ONLY (GST-1859). Uploads every free-suite
-  # shard's JUnit reports, failures included, to the Trunk test collection
-  # 7yDVXXE3 so Trunk can flag tests that fail and then pass on the same code.
-  # Nothing is quarantined or skipped: the uploader runs with quarantine off,
-  # the collection has quarantining off, and no job needs this one or reads it,
-  # so it cannot change which tests gate or turn free-tests red. It is the only
-  # job that sees TRUNK_ORG_API_TOKEN (Trunk's v1 organization token; the v2 API
-  # key in TRUNK_API_TOKEN does not work with the uploader), so the token never
-  # shares a job with pull-request code: it checks out nothing, downloads only
-  # the XML artifacts and runs one pinned action with no GITHUB_TOKEN scopes.
-  # The CLI version is pinned and use-cache is off, so the binary always comes
-  # from Trunk's checksummed release, never from an Actions cache entry that a
-  # pull-request job could have written.
-  # Same-repository pull requests and main pushes only; a missing token skips
-  # both steps. Fail-open at step and job level. Review:
-  # docs/TESTING_INTERNALS.md.
-  trunk-flaky-tests:
-    name: Trunk Flaky Tests (detection only)
-    needs: free-suite
-    if: always() && needs.free-suite.result != 'skipped' && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    continue-on-error: true
-    permissions: {}
-    env:
-      TRUNK_ORG_API_TOKEN: ${{ secrets.TRUNK_ORG_API_TOKEN }}
-    steps:
-      - name: Download every shard's JUnit reports
-        if: env.TRUNK_ORG_API_TOKEN != ''
-        timeout-minutes: 3
-        continue-on-error: true
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
-        with:
-          pattern: free-junit-*
-          path: ${{ runner.temp }}/free-junit
-      - name: Upload them to Trunk Flaky Tests (detection only, quarantine off)
-        if: env.TRUNK_ORG_API_TOKEN != ''
-        timeout-minutes: 5
-        continue-on-error: true
-        uses: trunk-io/analytics-uploader@a86313c7029d22e6ea2d5c346060a224d90053dc # v2.1.6
-        with:
-          junit-paths: ${{ runner.temp }}/free-junit/**/*.xml
-          org-slug: garry-tan
-          token: ${{ env.TRUNK_ORG_API_TOKEN }}
-          test-collection-id: 7yDVXXE3
-          cli-version: 0.16.2
-          use-cache: 'false'
-          quarantine: 'false'
-          use-uncloned-repo: 'true'
-          github-token: ''
-          gh-repo-url: ${{ github.server_url }}/${{ github.repository }}
-          gh-repo-head-sha: ${{ github.event.pull_request.head.sha || github.sha }}
-          gh-repo-head-branch: ${{ github.event.pull_request.head.ref || github.ref_name }}
 
   # Branch protection already requires the `free-tests` context. Keep that
   # stable name as an always-running aggregate so every platform-specific CSO

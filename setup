@@ -2,6 +2,9 @@
 # gstack setup — build browser binary + register skills with Claude Code / Codex
 set -e
 GSTACK_BUN_CONFIG=/dev/null; case "${OSTYPE:-}" in msys*|cygwin*) if command -v cygpath >/dev/null 2>&1; then GSTACK_BUN_CONFIG=NUL; fi ;; esac
+# Native Bun and Git cannot open a /c/x path: keep Git Bash's argument
+# conversion on for everything setup starts, even where a user turned it off (#4386).
+case "${OSTYPE:-}" in msys*|cygwin*) unset MSYS_NO_PATHCONV MSYS2_ARG_CONV_EXCL ;; esac
 umask 077  # Restrict new files to owner-only (0o600 files, 0o700 dirs)
 
 # Heredoc delivery guard. bash 5.2+ writes a heredoc body <=64KiB through a
@@ -60,6 +63,12 @@ Claude Code hooks (docs/skill-routing-and-contracts.md):
   --skill-contracts / --no-skill-contracts
                     Block once when a contract skill ends without its
                     required outputs (Stop). Saved as skill_contracts.
+  --destructive-guard / --no-destructive-guard
+                    Run /careful's destructive-command check before every
+                    Bash and PowerShell call (PreToolUse). Saved as
+                    destructive_guard.
+                    These three are on by default; the flag, env var or
+                    gstack-config set <name> off turns one off.
   --ceo-review-gate / --no-ceo-review-gate
                     After /plan-ceo-review loads, block its final stop (and a
                     review subagent's) until the output file ranks the top
@@ -140,7 +149,7 @@ _status_install_checks() {
           '$GSTACK_ROOT/'*) path="$root/${tok#\$GSTACK_ROOT/}" ;;
           '~/'*) path="$HOME/${tok#\~/}" ;;
           /*) path="$tok" ;;
-          ../*) path="$dir/$tok" ;;
+          ../*) path="$dir/$tok"; case "${dir##*/}" in gstack-*) [ -r "$path" ] || path="$dir/../gstack-${tok#../}" ;; esac ;;
           *) continue ;;
         esac
         checked=$((checked + 1))
@@ -201,6 +210,7 @@ PLAN_TUNE_HOOKS_MODE=""   # "" = resolve from env/config/prompt; "yes"/"no" = ex
 TIMELINE_STOP_HOOK_MODE=""  # "" = resolve from env/config; "yes"/"no" = explicit (#2677)
 SKILL_ROUTING_MODE=""       # "" = resolve from env/config; "on"/"off" = explicit (GST-1088)
 SKILL_CONTRACTS_MODE=""     # "" = resolve from env/config; "on"/"off" = explicit (GST-1088)
+DESTRUCTIVE_GUARD_MODE=""   # "" = resolve from env/config; "on"/"off" = explicit (GST-3110)
 CEO_REVIEW_GATE_MODE=""     # "" = resolve from env/config; "on"/"off" = explicit (GST-1461)
 AUTOPLAN_GATE_MODE=""       # "" = resolve from env/config; "on"/"off" = explicit (GST-1666)
 MODEL_OVERRIDE=""
@@ -216,7 +226,7 @@ _setup_unknown_option() {
   local bad="$1" next="${2:-}" best="" best_d=99 flag d value=""
   for flag in --host --model --claude-model --loadout --global --local --prefix --no-prefix --team --no-team \
     --plan-tune-hooks --no-plan-tune-hooks --timeline-stop-hook --no-timeline-stop-hook \
-    --skill-routing --no-skill-routing --skill-contracts --no-skill-contracts \
+    --skill-routing --no-skill-routing --skill-contracts --no-skill-contracts --destructive-guard --no-destructive-guard \
     --ceo-review-gate --no-ceo-review-gate --autoplan-gate --no-autoplan-gate \
     --refresh-registered --status --no-browser --no-harness-auto --quiet --help; do
     d="$(awk -v a="${bad%%=*}" -v b="$flag" 'BEGIN {
@@ -266,6 +276,9 @@ while [ $# -gt 0 ]; do
     --skill-contracts)    SKILL_CONTRACTS_MODE="on"; shift ;;
     --no-skill-contracts) SKILL_CONTRACTS_MODE="off"; shift ;;
     --skill-contracts=*)  SKILL_CONTRACTS_MODE="${1#--skill-contracts=}"; shift ;;
+    --destructive-guard)    DESTRUCTIVE_GUARD_MODE="on"; shift ;;
+    --no-destructive-guard) DESTRUCTIVE_GUARD_MODE="off"; shift ;;
+    --destructive-guard=*)  DESTRUCTIVE_GUARD_MODE="${1#--destructive-guard=}"; shift ;;
     --ceo-review-gate)     CEO_REVIEW_GATE_MODE="on"; shift ;;
     --no-ceo-review-gate)  CEO_REVIEW_GATE_MODE="off"; shift ;;
     --ceo-review-gate=*)   CEO_REVIEW_GATE_MODE="${1#--ceo-review-gate=}"; shift ;;
@@ -343,6 +356,7 @@ gstack_state_root_select; GSTACK_STATE_ROOT="$_gstack_sr_root"
 . "$SOURCE_GSTACK_DIR/bin/gstack-skill-name.sh" || { echo "$0: $SOURCE_GSTACK_DIR/bin/gstack-skill-name.sh is missing. fix: reinstall from a fresh clone" >&2; exit 1; }
 . "$SOURCE_GSTACK_DIR/bin/gstack-claude-root.sh" || { echo "$0: $SOURCE_GSTACK_DIR/bin/gstack-claude-root.sh is missing. fix: reinstall from a fresh clone" >&2; exit 1; }
 . "$SOURCE_GSTACK_DIR/bin/gstack-install-registry.sh" || { echo "$0: $SOURCE_GSTACK_DIR/bin/gstack-install-registry.sh is missing. fix: reinstall from a fresh clone (docs/ADDING_A_HOST.md)" >&2; exit 1; }
+. "$SOURCE_GSTACK_DIR/bin/gstack-lock.sh" || { echo "$0: $SOURCE_GSTACK_DIR/bin/gstack-lock.sh is missing. fix: reinstall from a fresh clone" >&2; exit 1; }
 . "$SOURCE_GSTACK_DIR/bin/gstack-render-claude.sh" || { echo "$0: $SOURCE_GSTACK_DIR/bin/gstack-render-claude.sh is missing. fix: reinstall from a fresh clone" >&2; exit 1; }
 . "$SOURCE_GSTACK_DIR/bin/gstack-host-renders.sh" || { echo "$0: $SOURCE_GSTACK_DIR/bin/gstack-host-renders.sh is missing. fix: reinstall from a fresh clone" >&2; exit 1; }
 SETUP_VERSION="$(cat "$SOURCE_GSTACK_DIR/VERSION" 2>/dev/null || echo unknown)"
@@ -604,7 +618,7 @@ EOF
     echo "Upgrade summary:"
   fi
   gstack_install_registry_render < "$_RF_SUMMARY"
-  _rf_disabled="$(gstack_disabled_normalize "$("$SOURCE_GSTACK_DIR/bin/gstack-config" get disabled_skills 2>/dev/null || true)")"
+  _rf_disabled="$(gstack_disabled_config "$("$SOURCE_GSTACK_DIR/bin/gstack-config" get disabled_skills 2>/dev/null || true)")"
   if [ "$_rf_disabled" != " " ]; then
     echo "  disabled skills (not registered on any host):$_rf_disabled"
   fi
@@ -844,6 +858,21 @@ _copy_runtime_skill_refs() {
   done
 }
 
+# _link_codex_skill_refs RENDER_SKILLS ROOT — the Codex form of the two copies
+# above plus gstack-upgrade's, which the preamble's upgrade flow reads. Codex
+# lists every real SKILL.md under its skills directory, so a real copy here is a
+# second entry beside gstack-<skill>/SKILL.md, and naming the skill then injects
+# nothing (GEVA-555, Codex 0.170). Codex skips a symlinked SKILL.md, so these are
+# links: each skill is listed once and the paths other skills read still resolve.
+_link_codex_skill_refs() {
+  local s
+  for s in gstack-upgrade office-hours plan-design-review; do
+    [ -f "$1/gstack-${s#gstack-}/SKILL.md" ] || continue
+    mkdir -p "$2/$s"
+    _link_or_copy "$1/gstack-${s#gstack-}/SKILL.md" "$2/$s/SKILL.md"
+  done
+}
+
 # ─── Real-file SKILL.md copies in host runtime roots (C3, #333) ──────────────
 # Codex skips a symlinked SKILL.md file, so the router and the nested SKILL.md
 # files in every host runtime root are real copies, rewritten on every run.
@@ -911,7 +940,7 @@ _record_skill_copies() {
 # marker) means we created the entry and may delete or refresh it whole; WEAK
 # (byte-identity with our source, or the two-line generated banner on a real
 # file) covers only that SKILL.md — never the directory — and a differing
-# weakly-proven file is moved to $GSTACK_STATE_ROOT/backups/skills/<ts>/
+# weakly-proven file is moved to $GSTACK_STATE_ROOT/backups/skills/<ts>.<random>/
 # before we install over it. An entry is OURS
 # when: it is a symlink resolving into the gstack payload / render dir (or any
 # path with a `gstack` segment, the convention cleanup and gstack-uninstall
@@ -991,13 +1020,18 @@ _claude_entry_owned_strongly() {
   return 1
 }
 # Weakly-proven real files we would otherwise overwrite are moved here (mv, so
-# the path is free for the link); the final summary prints one line.
-_SKILL_BACKUP_ROOT="$GSTACK_STATE_ROOT/backups/skills/$(date +%Y%m%dT%H%M%S)"
+# the path is free for the link); the final summary prints one line. The folder
+# is made on first use with mktemp, so two runs in the same second never share it.
+_SKILL_BACKUP_ROOT=""
 _BACKED_UP_SKILL_MDS=()
 _backup_skill_md() {
   # Returns non-zero when the file could NOT be moved: the caller must then
   # leave the entry untouched (a failed backup is never a license to overwrite).
   local file="$1" name="$2"
+  if [ -z "$_SKILL_BACKUP_ROOT" ]; then
+    mkdir -p "$GSTACK_STATE_ROOT/backups/skills" 2>/dev/null || return 1
+    _SKILL_BACKUP_ROOT="$(mktemp -d "$GSTACK_STATE_ROOT/backups/skills/$(date +%Y%m%dT%H%M%S).XXXXXX" 2>/dev/null)" || return 1
+  fi
   mkdir -p "$_SKILL_BACKUP_ROOT/$name" 2>/dev/null || return 1
   mv -f "$file" "$_SKILL_BACKUP_ROOT/$name/SKILL.md" 2>/dev/null || return 1
   _BACKED_UP_SKILL_MDS+=("$name")
@@ -1447,7 +1481,7 @@ fi
 # it keep working. Missing or empty = every skill enabled (#1206). Linkers test
 # membership inline with "${_DISABLED_SKILLS:- }", so a linker extracted on its
 # own (tests) behaves as "nothing disabled".
-_USER_DISABLED_SKILLS="$(gstack_disabled_normalize "$("$GSTACK_CONFIG" get disabled_skills 2>/dev/null || true)")"
+_USER_DISABLED_SKILLS="$(gstack_disabled_config "$("$GSTACK_CONFIG" get disabled_skills 2>/dev/null || true)")"
 # Retired skills, and the crew skills off a Capy machine
 # (GSTACK_UNREGISTERED_SKILLS), take the same no-entry path on every host; only
 # the user's own list is reported and passed to the router.
@@ -1842,19 +1876,20 @@ _deps_verified() {
 }
 
 # Checkout-local migration lock: a live holder means skip; a dead or missing
-# holder (killed setup) is reclaimed.
+# holder (killed setup) is reclaimed. gstack_lock_take (bin/gstack-lock.sh)
+# creates the pid file with O_EXCL: mkdir's exit status is not a lock on
+# Ubuntu 26.04's uutils mkdir.
 _deps_lock() {
   local lock="node_modules.gstack-migrate.lock" holder
-  if ! mkdir "$lock" 2>/dev/null; then
+  if ! gstack_lock_take "$lock" pid "$$"; then
     holder="$(cat "$lock/pid" 2>/dev/null || true)"
     case "$holder" in
       ''|*[!0-9]*|0) [ -z "$(find "$lock" -maxdepth 0 -mmin +5 2>/dev/null)" ] && [ -z "$holder" ] && return 1 ;;
       *) kill -0 "$holder" 2>/dev/null && return 1 ;;
     esac
     rm -rf "$lock"
-    mkdir "$lock" 2>/dev/null || return 1
+    gstack_lock_take "$lock" pid "$$" || return 1
   fi
-  echo "$$" > "$lock/pid"
 }
 
 _deps_unlock() { rm -rf node_modules.gstack-migrate.lock; }
@@ -1909,18 +1944,20 @@ _deps_migration_finish() {
 # install, which keeps its dev packages at bun.lock's versions.
 # Bun's --production implies a frozen lockfile, so when bun.lock is out of date
 # (a fork or a local edit) refresh it first, then install production-only again.
+# Installs run under umask 022, not setup's 077: Bun extracts into a package cache
+# that every Bun project of this user hardlinks from (#4288).
 install_runtime_deps() {
   local role out rc=0
   role="$(_deps_role)"
   if [ "$role" = "user" ] && _deps_migration_start; then
-    out="$( { bun_cmd install --production --frozen-lockfile || { bun_cmd install --lockfile-only && bun_cmd install --production --frozen-lockfile; }; } 2>&1 )" && _deps_verified || rc=$?
+    out="$( { umask 022; bun_cmd install --production --frozen-lockfile || { bun_cmd install --lockfile-only && bun_cmd install --production --frozen-lockfile; }; } 2>&1 )" && _deps_verified || rc=$?
     _deps_migration_finish "$rc" "$out" && return 0
   fi
   if [ "$role" = "contributor" ] || _deps_has_dev; then
-    bun_cmd install --frozen-lockfile 2>/dev/null || bun_cmd install
+    ( umask 022; bun_cmd install --frozen-lockfile 2>/dev/null || bun_cmd install )
     return
   fi
-  bun_cmd install --production --frozen-lockfile 2>/dev/null || { bun_cmd install --lockfile-only && bun_cmd install --production --frozen-lockfile; }
+  ( umask 022; bun_cmd install --production --frozen-lockfile 2>/dev/null || { bun_cmd install --lockfile-only && bun_cmd install --production --frozen-lockfile; } )
 }
 
 cleanup_copied_bun() {
@@ -2424,15 +2461,17 @@ elif ! ensure_playwright_browser; then
   _clear_playwright_quarantine
   _PW_LOCK="${TMPDIR:-/tmp}/gstack-playwright-install.lock"
   # Stale-lock self-heal: a SIGKILL'd prior setup leaves the lock dir behind
-  # forever (mkdir mutexes have no owner). If the recorded holder PID is dead,
-  # reclaim instead of telling the user to rmdir by hand.
+  # forever. If the recorded holder PID is dead, reclaim instead of telling the
+  # user to remove it by hand. The take is gstack_lock_take (bin/gstack-lock.sh),
+  # which creates the pid file with O_EXCL: mkdir's exit status is not a lock
+  # on Ubuntu 26.04's uutils mkdir.
   if [ -d "$_PW_LOCK" ]; then
     _PW_STALE=0; _PW_HOLDER=0
     _PW_LOCK_OLD=""
     [ -n "$(find "$_PW_LOCK" -maxdepth 0 -mmin +$(( _PW_INSTALL_TIMEOUT / 60 + 1 )) 2>/dev/null)" ] && _PW_LOCK_OLD=1
     if [ ! -f "$_PW_LOCK/pid" ]; then
-      # No holder recorded (killed between mkdir and echo, or mid-write by a
-      # live setup): nothing to probe, so only age can prove abandonment.
+      # No holder recorded (killed between mkdir and the pid write, or
+      # mid-write by a live setup): nothing to probe, so only age can prove abandonment.
       [ -n "$_PW_LOCK_OLD" ] && _PW_STALE=1
     else
       _PW_HOLDER=$(cat "$_PW_LOCK/pid" 2>/dev/null || true)
@@ -2461,7 +2500,7 @@ elif ! ensure_playwright_browser; then
         if { [ "$_PW_MOVED_PID" -gt 0 ] && [ "$_PW_MOVED_PID" != "$_PW_HOLDER" ] && kill -0 "$_PW_MOVED_PID" 2>/dev/null; } \
            || { [ ! -f "$_PW_LOCK.stale.$$/pid" ] && [ -z "$_PW_LOCK_OLD" ]; }; then
           # A new live holder, or a fresh lock whose holder has not written its
-          # pid yet (mkdir done, echo pending): not ours to reclaim.
+          # pid yet (mkdir done, pid write pending): not ours to reclaim.
           mv "$_PW_LOCK.stale.$$" "$_PW_LOCK" 2>/dev/null || true
         else
           rm -rf "$_PW_LOCK.stale.$$" 2>/dev/null || true
@@ -2469,8 +2508,7 @@ elif ! ensure_playwright_browser; then
       fi
     fi
   fi
-  if mkdir "$_PW_LOCK" 2>/dev/null; then
-    echo "$$" > "$_PW_LOCK/pid" 2>/dev/null || true
+  if gstack_lock_take "$_PW_LOCK" pid "$$"; then
     # Chain the earlier cleanup_copied_bun EXIT trap: `trap ... EXIT` REPLACES
     # the previous handler, so the lock trap must run both or any run taking
     # this path leaves .tmp-bun-bin behind.
@@ -2478,6 +2516,7 @@ elif ! ensure_playwright_browser; then
     # `bun x`, not `bunx`: a winget Bun ships no bunx (#3131).
     _PW_BUN="$(command -v "$BUN_CMD" 2>/dev/null || printf '%s' "$BUN_CMD")"
     (
+      umask 022
       cd "$SOURCE_GSTACK_DIR"
       if [ -n "$_PLAYWRIGHT_PLATFORM_OVERRIDE" ]; then
         PLAYWRIGHT_HOST_PLATFORM_OVERRIDE="$_PLAYWRIGHT_PLATFORM_OVERRIDE" bun_cmd x playwright install chromium
@@ -3159,6 +3198,15 @@ create_codex_runtime_root() {
   if [ -d "$gstack_dir/lib" ]; then
     _link_or_copy "$gstack_dir/lib" "$codex_gstack/lib"
   fi
+  # Codex hook shims: ${CODEX_HOME}/hooks.json names this stable path (GST-3172).
+  # They import the Claude Code hooks beside them (../../claude/hooks), which
+  # a symlink reaches through the checkout but a Windows copy does not, so the
+  # Claude hooks come along too; without them all three shims fail open there.
+  if [ -d "$gstack_dir/hosts/codex/hooks" ]; then
+    mkdir -p "$codex_gstack/hosts/codex" "$codex_gstack/hosts/claude"
+    _link_or_copy "$gstack_dir/hosts/codex/hooks" "$codex_gstack/hosts/codex/hooks"
+    _link_or_copy "$gstack_dir/hosts/claude/hooks" "$codex_gstack/hosts/claude/hooks"
+  fi
   if [ -d "$gstack_dir/browse/dist" ]; then
     _link_or_copy "$gstack_dir/browse/dist" "$codex_gstack/browse/dist"
   fi
@@ -3166,10 +3214,7 @@ create_codex_runtime_root() {
     _link_or_copy "$gstack_dir/browse/bin" "$codex_gstack/browse/bin"
   fi
   _link_runtime_dists "$gstack_dir" "$codex_gstack"
-  if [ -f "$agents_dir/gstack-upgrade/SKILL.md" ]; then
-    _copy_skill_md "$agents_dir/gstack-upgrade/SKILL.md" "$codex_gstack/gstack-upgrade/SKILL.md"
-  fi
-  _copy_runtime_skill_refs "$agents_dir" "$codex_gstack"
+  _link_codex_skill_refs "$agents_dir" "$codex_gstack"
   # ETHOS.md — referenced by "Search Before Building" in all skill preambles
   if [ -f "$gstack_dir/ETHOS.md" ]; then
     _link_or_copy "$gstack_dir/ETHOS.md" "$codex_gstack/ETHOS.md"
@@ -3962,6 +4007,7 @@ if [ "$INSTALL_CODEX" -eq 1 ]; then
   log "  codex skills: $CODEX_SKILLS"
   log "  model profile: $CODEX_GENERATION_MODEL ($CODEX_GENERATION_MODEL_SOURCE)"
   log "  model changes: rerun ./setup --host codex"
+  log "  reasoning effort: gstack's workflows do best at high; start Codex with codex -c model_reasoning_effort=high (setup leaves config.toml alone)"
   if [ "$MODEL_OVERRIDE_SET" -eq 1 ]; then
     log "  note: --model applies to this run only. To persist across upgrades,"
     log "  set model = \"$MODEL_OVERRIDE\" in \${CODEX_HOME:-~/.codex}/config.toml."
@@ -4334,16 +4380,18 @@ CANONICAL_GSTACK_ROOT="$(gstack_canonical_claude_root)"
 
 # Echo the canonical path for a hook (repo-relative arg); fails when the hook
 # is not executable at the canonical install — callers must skip + log.
-# A hook the parse gate below refused is never registered.
+# A hook the parse gate below refused is never registered. A second argument
+# names another stable root: the Codex runtime root for Codex's hooks.
 _HOOK_REFUSED=""
 _hook_refused() {
   case " $_HOOK_REFUSED " in *" $1 "*) return 0 ;; esac
   return 1
 }
 _hook_command_path() {
+  local root="${2:-$CANONICAL_GSTACK_ROOT}"
   _hook_refused "$1" && return 1
-  if [ -x "$CANONICAL_GSTACK_ROOT/$1" ]; then
-    printf '%s\n' "$CANONICAL_GSTACK_ROOT/$1"
+  if [ -x "$root/$1" ]; then
+    printf '%s\n' "$root/$1"
     return 0
   fi
   return 1
@@ -4545,6 +4593,9 @@ if [ -x "$DETECT_BIN" ]; then
           # main gen:skill-docs site had). Capture, show the tail, propagate.
           _GEN_USER_OUT=$(bun_cmd run gen:skill-docs:user --host claude --out-dir "$_GSTACK_RENDER_TMP" --link-root "$_GSTACK_RENDER_DIR" --model "$_GSTACK_OVERLAY" ${_DISABLED_CSV:+"--disabled-skills=$_DISABLED_CSV"} ${_PLAN_MODE_ARG:+"$_PLAN_MODE_ARG"} ${_LOADOUT_ARG:+"$_LOADOUT_ARG"} 2>&1)
           _GEN_USER_RC=$?
+          # The generator writes unprefixed name: fields; apply skill_prefix
+          # before the swap, as _render_install does (#4413).
+          [ "$_GEN_USER_RC" -ne 0 ] || "$SOURCE_GSTACK_DIR/bin/gstack-patch-names" "$_GSTACK_RENDER_TMP" "$SKILL_PREFIX" >/dev/null || _GEN_USER_RC=$?
           printf '%s\n' "$_GEN_USER_OUT" | tail -3
           exit "$_GEN_USER_RC"
         ); then
@@ -4986,6 +5037,7 @@ _skill_hook_gate() {
   if [ -n "$mode" ] && [ "$unrecognized" -eq 0 ]; then
     "$GSTACK_CONFIG" set "$key" "$decision" >/dev/null 2>&1 || true
   fi
+  if [ -n "${CODEX_HOOKS_FILE:-}" ]; then _codex_hook_gate "$key" "$decision" "$src"; fi
   [ -x "$SETTINGS_HOOK" ] || return 0
   if [ "$decision" = "off" ] || [ "$NO_TEAM_MODE" -eq 1 ]; then
     "$SETTINGS_HOOK" remove-source --source "$source" >/dev/null 2>&1 || true
@@ -5000,13 +5052,78 @@ _skill_hook_gate() {
       case "$out" in
         *unchanged*) : ;;
         *re-pointed*) log "  re-pointed $event hook to $cmd (previous registration held a stale path)" ;;
-        *) log "  registered $event hook: $what (on via $src; turn off: gstack-config set $key off, or ./setup --no-${key//_/-}; backup: settings.json.bak.<ts>)" ;;
+        *) log "  registered $event hook: $what (on via $src; turn off: gstack-config set $key off, or ./setup --no-${key//_/-}; backup: settings.json.bak.<ts>)"
+           if [ "$src" = "default" ]; then _HOOKS_ON_BY_DEFAULT="$_HOOKS_ON_BY_DEFAULT $key"; fi ;;
       esac
     else
       log "  warning: settings hook update failed: $(printf '%s\n' "$out" | head -1) — run $SETTINGS_HOOK manually"
     fi
   done
 }
+# ─── Codex hooks (GST-3172) ──────────────────────────────────────────────────
+# The same switches register three Codex hooks in ${CODEX_HOME:-~/.codex}/hooks.json
+# (docs/skill-routing-and-contracts.md#codex): skill_routing (UserPromptSubmit),
+# skill_contracts (Stop, GST-3173) and destructive_guard (PreToolUse on Bash), each in its own matcher group with
+# an explicit timeout (Codex's default is 600 s). gstack-settings-hook writes the
+# file in its Codex format: no tag keys (Codex skips a hooks.json with a key it
+# does not know, the user's hooks included), the user's groups left as they are,
+# a schema re-read before the rename, the usual lock, backup and rollback.
+# Commands point at the Codex runtime root, never a version folder: Codex asks
+# the user to trust a hook again whenever its command or timeout changes.
+# Setup never writes trust; Codex skips the hooks until the user trusts them.
+CODEX_HOOKS_FILE=""
+CODEX_HOOKS_READY=0
+CODEX_HOOKS_MIN="0.170.0"
+CODEX_SETTINGS_HOOK="$SOURCE_GSTACK_DIR/bin/gstack-settings-hook"
+_CODEX_HOOKS_CHANGED=0
+if [ "$INSTALL_CODEX" -eq 1 ] && [ "$CODEX_REPO_LOCAL" -eq 0 ] && [ -x "$CODEX_SETTINGS_HOOK" ]; then
+  CODEX_HOOKS_FILE="$(dirname "$CODEX_SKILLS")/hooks.json"
+  _CODEX_VERSION="$(codex --version 2>/dev/null | sed -n 's/^codex-cli \([0-9][0-9.]*\).*/\1/p' | head -1 || true)"
+  if [ -z "$_CODEX_VERSION" ]; then
+    log "  Codex hooks not registered: no codex on PATH to check (gstack's hooks need Codex $CODEX_HOOKS_MIN or newer). Install Codex, then re-run ./setup --host codex"
+  elif [ "$(printf '%s\n%s\n' "$CODEX_HOOKS_MIN" "$_CODEX_VERSION" | sort -t. -k1,1n -k2,2n -k3,3n | head -1)" != "$CODEX_HOOKS_MIN" ]; then
+    log "  Codex hooks not registered: Codex $_CODEX_VERSION is older than $CODEX_HOOKS_MIN, the first version they are tested on. Upgrade (npm install -g @openai/codex), then re-run ./setup --host codex"
+  else
+    CODEX_HOOKS_READY=1
+  fi
+fi
+CODEX_ROUTE_HOOK="$(_hook_command_path hosts/codex/hooks/codex-skill-route-hook "$CODEX_GSTACK" || true)"
+CODEX_GUARD_HOOK="$(_hook_command_path hosts/codex/hooks/codex-destructive-guard-hook "$CODEX_GSTACK" || true)"
+CODEX_CONTRACT_HOOK="$(_hook_command_path hosts/codex/hooks/codex-skill-contract-stop-hook "$CODEX_GSTACK" || true)"
+# _codex_hook_gate KEY DECISION SOURCE_OF_DECISION — called from _skill_hook_gate
+# with the decision it resolved, so both hosts follow one switch (D1).
+_codex_hook_gate() {
+  local key="$1" decision="$2" src="$3" event cmd source timeout matcher out
+  case "$key" in
+    skill_routing) event=UserPromptSubmit; cmd="$CODEX_ROUTE_HOOK"; source=gstack-skill-route; timeout=5; matcher="" ;;
+    destructive_guard) event=PreToolUse; cmd="$CODEX_GUARD_HOOK"; source=gstack-destructive-guard; timeout=10; matcher=Bash ;;
+    skill_contracts) event=Stop; cmd="$CODEX_CONTRACT_HOOK"; source=gstack-skill-contract; timeout=10; matcher="" ;;
+    *) return 0 ;;
+  esac
+  if [ "$decision" = "off" ] || [ "$NO_TEAM_MODE" -eq 1 ]; then
+    [ -f "$CODEX_HOOKS_FILE" ] || return 0
+    GSTACK_HOOKS_FORMAT=codex GSTACK_SETTINGS_FILE="$CODEX_HOOKS_FILE" "$CODEX_SETTINGS_HOOK" remove-source --source "$source" >/dev/null \
+      || log "  warning: could not remove gstack's Codex $event hook from $CODEX_HOOKS_FILE"
+    return 0
+  fi
+  [ "$CODEX_HOOKS_READY" -eq 1 ] || return 0
+  if [ -z "$cmd" ]; then
+    log "  Codex $event hook not registered: $CODEX_GSTACK/hosts/codex/hooks is missing or does not parse"
+    return 0
+  fi
+  if out=$(GSTACK_HOOKS_FORMAT=codex GSTACK_SETTINGS_FILE="$CODEX_HOOKS_FILE" "$CODEX_SETTINGS_HOOK" ensure-event --event "$event" \
+        --command "$cmd" --source "$source" --timeout "$timeout" ${matcher:+--matcher "$matcher"} 2>&1); then
+    case "$out" in
+      *unchanged*) : ;;
+      *) _CODEX_HOOKS_CHANGED=1
+         log "  registered Codex $event hook in $CODEX_HOOKS_FILE (on via $src; turn off: gstack-config set $key off, or ./setup --no-${key//_/-})" ;;
+    esac
+  else
+    log "  warning: Codex hooks not registered: $(printf '%s\n' "$out" | head -1)"
+  fi
+}
+
+_HOOKS_ON_BY_DEFAULT=""
 SKILL_ROUTE_BIN="$SOURCE_GSTACK_DIR/bin/gstack-skill-route"
 SKILL_ROUTE_HOOK="$(_hook_command_path hosts/claude/hooks/skill-route-hook || true)"
 SKILL_CONTRACT_HOOK="$(_hook_command_path hosts/claude/hooks/skill-contract-stop-hook || true)"
@@ -5016,6 +5133,38 @@ _skill_hook_gate skill_routing "$SKILL_ROUTING_MODE" GSTACK_SKILL_ROUTING UserPr
 _skill_hook_gate skill_contracts "$SKILL_CONTRACTS_MODE" GSTACK_SKILL_CONTRACTS Stop \
   "$SKILL_CONTRACT_HOOK" gstack-skill-contract 10 \
   "a contract skill that ends without its required outputs is blocked once"
+# /careful's destructive-command check in every session (GST-3110): the same
+# check-careful.sh, its ask and deny unchanged, without the model loading /careful.
+DESTRUCTIVE_GUARD_HOOK="$(_hook_command_path hosts/claude/hooks/destructive-guard-hook || true)"
+_skill_hook_gate destructive_guard "$DESTRUCTIVE_GUARD_MODE" GSTACK_DESTRUCTIVE_GUARD PreToolUse \
+  "$DESTRUCTIVE_GUARD_HOOK" gstack-destructive-guard 10 \
+  "destructive commands (rm -rf, DROP TABLE, force-push) ask before they run" 'Bash|PowerShell'
+# Codex skips a hook nobody trusted yet, silently, so say so once per run while
+# any of gstack's Codex hooks waits for trust; setup never writes trust itself.
+if [ "$CODEX_HOOKS_READY" -eq 1 ] && [ -f "$CODEX_HOOKS_FILE" ]; then
+  _CODEX_UNTRUSTED="$(GSTACK_HOOKS_FORMAT=codex GSTACK_SETTINGS_FILE="$CODEX_HOOKS_FILE" "$CODEX_SETTINGS_HOOK" trust-status 2>/dev/null | grep -c 'untrusted$' || true)"
+  if [ "${_CODEX_UNTRUSTED:-0}" -gt 0 ]; then
+    if [ "$_CODEX_HOOKS_CHANGED" -eq 1 ]; then
+      log "gstack added $_CODEX_UNTRUSTED Codex hook(s); trust them at Codex's startup prompt or in /hooks (Codex skips them until you do)."
+    else
+      log "gstack's $_CODEX_UNTRUSTED Codex hook(s) are not trusted yet; trust them at Codex's startup prompt or in /hooks (Codex skips them until you do)."
+    fi
+  fi
+fi
+# One notice, the first time a default turns these hooks on (an install that
+# predates the default, or a new one). An off you set earlier is kept: the
+# gate reads it before the default.
+_HOOKS_NOTICE_MARKER="$GSTACK_STATE_ROOT/.hooks-on-by-default-notice"
+if [ -n "$_HOOKS_ON_BY_DEFAULT" ] && [ "$QUIET" -eq 0 ] && [ ! -e "$_HOOKS_NOTICE_MARKER" ]; then
+  log ""
+  log "gstack's helper hooks are now on by default. This run turned on:$_HOOKS_ON_BY_DEFAULT"
+  log "  skill_routing: a one-line hint naming the gstack skill a prompt fits"
+  log "  skill_contracts: a skill with required steps (/review's specialist reviewers) is held once if it stops without them"
+  log "  destructive_guard: rm -rf, DROP TABLE, force-push and the like ask before they run"
+  log "  Turn one off: gstack-config set <name> off (takes effect on the next prompt), or ./setup --no-skill-routing,"
+  log "  --no-skill-contracts, --no-destructive-guard. Docs: docs/skill-routing-and-contracts.md"
+  mkdir -p "$GSTACK_STATE_ROOT" 2>/dev/null && : > "$_HOOKS_NOTICE_MARKER" 2>/dev/null || true
+fi
 # Both skill gates register HOOK_TIMEOUT_S from lib/skill-gates.ts, the longest
 # gate deadline plus a margin (GST-1615): Claude Code kills a hook at its
 # timeout and lets the stop through unchecked. Empty if bun cannot run, which

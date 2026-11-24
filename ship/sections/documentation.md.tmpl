@@ -12,7 +12,7 @@ Save the child handle. An exited child with missing output is stopped, but its a
 
 **Entry:** First entry runs
 `_EX=$(git rev-parse --git-path info/exclude 2>/dev/null) && mkdir -p "$(dirname "$_EX")" && { grep -qxF '/.gstack/tmp/' "$_EX" 2>/dev/null || echo '/.gstack/tmp/' >> "$_EX"; }`
-(the shared `.gstack/tmp` exclude), then `rm -f .gstack/tmp/docs-audit.json` (an
+(the shared `.gstack/tmp` exclude), then `rm .gstack/tmp/docs-audit.json 2>/dev/null || true` (an
 earlier run's record would pass as this run's) and launches the initial audit. On reentry, reuse only this invocation's validated audit or named-risk decision whose accepted
 base/input hashes still match; retain its actual status and scope. Otherwise use
 Blocked recovery, not an unconditional launch.
@@ -69,11 +69,11 @@ Reentry never resets the count or authorizes a launch.
    use recovery before another writer.
 2. **Check output.** Save the output, then run
    `~/.claude/skills/gstack/bin/gstack-docs-candidate result <output> --audit-id <audit-id> --out-dir <record dir>`.
-   It parses only the LAST nonempty line, trims whitespace around keys and requires
+   It takes the LAST nonempty line as the result, trims whitespace around keys and requires
    every field/type, exact audit id, schema and status invariant. `DOCS_RESULT: ok`
    saves `<audit-id>-result.json` and the section unchanged as `<audit-id>-documentation.md`;
    `DOCS_RESULT_INVALID` names each bad key and prints a `RETRY_NOTE:`, or `FORMAT_REPAIR:` when
-   only the line's shape is wrong: then, once and using no attempt, send `gstack-docs-candidate
+   only the line's shape is wrong, text follows it, or it drops an earlier blocked line (blocked carries over): then, once and using no attempt, send `gstack-docs-candidate
    repair-prompt <output> --audit-id <audit-id>`'s output to one fresh agent with no tools (never the writer child),
    and rerun `result` on its reply adding `--repair-of <output>`; a refusal prints `RETRY_NOTE:`. Also require
    the actual spawned marker above, as echoed in the child output; state files are
@@ -103,8 +103,8 @@ branch's copy (a PR cannot raise its own cap), prints one `DOCS_CAP: <path> <byt
 (`DOCS_CAP: none declared` without any) and exits 1 on any `over` or absent file: a
 blocked audit, repaired by trimming that file, never by raising the cap. Then save for Step 16 only post-child hashes (rerun the Prepare `snapshot`
 with only `--out <audit-id>-post.json` changed and `--pre <its Prepare snapshot>` added,
-plus `--carry <this run's earlier audit's -post.json>` on a re-audit so receipt write
-resets both audits' files; Step 16 `compare`s it; never type hashes), status, and keep the `<audit-id>-result.json` and private `<audit-id>-documentation.md`
+plus, on a re-audit, `--carry <the earlier audit's -post.json>`, or `--carry-stopped <its Prepare snapshot>` when it stopped before its post snapshot
+(each flag once), so receipt write resets both audits' files; Step 16 `compare`s it; never type hashes), status, and keep the `<audit-id>-result.json` and private `<audit-id>-documentation.md`
 that `result` wrote. That section file is the section's single source;
 reports and Step 19 insert it by command (`cat`) where they can, never retyped or edited.
 Save records once; cite files by path, never copying their content.
@@ -133,7 +133,9 @@ auto-commit or push unexpected child commits.
    result is such a correction: end the remaining attempt's prompt with its
    `RETRY_NOTE:` text verbatim.
    Repeat Prepare using current inputs and a fresh id/snapshot, run the remaining
-   attempt, then validate it through Parent processing.
+   attempt, then validate it through Parent processing. When the stopped audit saved no post
+   snapshot, the re-audit's post snapshot takes `--carry-stopped <the stopped audit's Prepare snapshot>` in place of
+   `--carry`, so receipt write resets the stopped audit's edits too.
 3. Otherwise STOP before commit/publication and do not launch another child.
    AskUserQuestion: stop for repair (recommended), or ship with the specific named
    documentation risk. Only an actual user exception counts, never a default,

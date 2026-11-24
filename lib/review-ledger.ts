@@ -18,6 +18,7 @@ import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { checkReviewedTree, isReviewedTreeLine, promptHash, type TreeCheck } from './review-brief';
+import { parseVerdict, withoutVerdictLines } from './review-verdict';
 
 export interface LedgerEvent { event: 'rendered' | 'sent' | 'output' | 'judgment' | 'judge' | 'program' | 'quarantined' | 'fetch-sweep'; [k: string]: unknown }
 export const readerKey = (role: string, name?: string) => (name ? `${role}/${name}` : role);
@@ -58,6 +59,17 @@ const HEADING = /^(?:#{1,6}\s|\*\*[^*]+\*\*:?$)/;
 const LIST_ITEM = /^(?:[-*+]|\d+[.)])\s+\S/;
 /** A numbered finding heading ("**1. …**", "### 2) …", GST-1031) or a finding lead that names its number ("**Finding 1 (FIXABLE): …**", GST-1657). */
 const NUMBERED_HEAD = /^(?:#{1,6}\s+|\*\*\s*)(?:\d+[.)]\s|Finding\s+\d+\b)/;
+/**
+ * A severity word that names something in the code under review rather than rating a finding (GSTA-711: "the redact-doc HIGH and
+ * scanner-failure branches", "runs after the HIGH branch"): in capitals, as code spells a constant, after "the" and at most one
+ * qualifier, and before a noun (after an optional "and X") that is not a word for a finding or its rating. CRITICAL never counts, so
+ * "reaches the CRITICAL write path" and "the HIGH and CRITICAL write paths" still block until judged: X is a name only when it is
+ * HIGH, MEDIUM or LOW. nameUses gives each such word's index; a line whose every label is one
+ * collects at INFORMATIONAL, kept on record without a severity it never stated.
+ */
+const RATING_NOUN = '(?:findings?|fix(?:es)?|issues?|severity|severities|risks?|priority|impact|bugs?|defects?|problems?|concerns?|blockers?|items?|notes?|regressions?|ones?|levels?|rating|labels?|bar|floor|threshold|confidence|vulnerabilit(?:y|ies)|chances?|likelihood|probability|exposures?)';
+const NAME_USE = new RegExp(`(?<![A-Za-z0-9])[Tt]he\\s+(?:[\\w.\\x60-]+\\s+)?(HIGH|MEDIUM|LOW)(?:\\s+(?:and|or)\\s+(?:(HIGH|MEDIUM|LOW)|[\\w.\\x60-]+))?\\s+(?!${RATING_NOUN}(?![\\w-]))[a-z][\\w-]*`, 'dg');
+const nameUses = (t: string) => new Set([...t.matchAll(NAME_USE)].flatMap(m => [m.indices![1]![0], m.indices![2]?.[0] ?? -1]));
 const stronger = (a: string, b: string) => ((rank(a) ?? 0) >= (rank(b) ?? 0) ? a : b);
 /** A prose voice's `Blocks: yes` (GSTA-167 normalizer v2): the finding is CRITICAL whatever its label; `Blocks: no` never lowers one. */
 const BLOCKS_YES = /(?<![A-Za-z0-9])Blocks:?\**:?\s*\**\s*yes(?![A-Za-z0-9])/i;
@@ -187,11 +199,13 @@ export interface MergedLine { id: string; reader: string; label: string; stated?
  * A native FIXABLE finding that states `Blocks: no` and one Severity field collects at that field on every class (GST-1031 ruling A);
  * one with no Blocks: no, no Severity field or only a FIXABLE field stays CRITICAL. fixableRaises false (a code or docs review with no
  * risk, error, history or floor reason, GST-987) also drops FIXABLE's raise from label headings and leads.
- * In a reply that says NO FINDINGS (GST-2122) a finding with no structure (JSON, lead label, label heading, numbered finding heading,
- * Severity or Blocks: yes field, the native voice's FIXABLE or INVESTIGATE, or a file:line on it or on the line it runs on from) collects
- * nothing; elsewhere it collects as above. A line led by a bold, unlabelled lead ("**1. Coverage:** …") is read for a closing summary after it.
+ * In a reply that says NO FINDINGS (GST-2122) a finding with no file:line in its prose or on the line it runs on from, and no structure
+ * (JSON, lead label, label heading, numbered finding heading, Severity or Blocks: yes field, the native voice's FIXABLE or INVESTIGATE),
+ * collects nothing. One with a file:line but no structure still collects, since it may name a real blocker. parseReply anchors a row
+ * there only by a field, lead label, heading or JSON: a file:line, a list item or the FIXABLE or INVESTIGATE tag does not (GST-2972: a
+ * reader confirming code names its lines). Elsewhere it collects as above. A line led by a bold, unlabelled lead ("**1. Coverage:** …") is read for a closing summary after it.
  */
-function parseLabelled(reader: string, output: string, fixableRaises: boolean): Array<{ label: string; raw: string; shaped: boolean }> {
+function parseLabelled(reader: string, output: string, fixableRaises: boolean): Array<{ label: string; raw: string; shaped: boolean; fielded: boolean; anchored: boolean }> {
   type Finding = { label: string; raw: string; fields: Set<string>; list: boolean; lead?: string; fixable?: boolean; heading?: boolean; item?: boolean; nested?: boolean; closed?: boolean; section?: boolean; context?: string };
   const out: Finding[] = [];
   let section: string | null = null;
@@ -204,6 +218,7 @@ function parseLabelled(reader: string, output: string, fixableRaises: boolean): 
   const named = (l: string) => (role === 'adversarial-native' && l.toUpperCase() === 'FIXABLE' ? 'CRITICAL' : l);
   const strongestOf = (labels: Array<string | undefined>) => labels.reduce<string | undefined>((a, b) => (a === undefined ? b : b === undefined ? a : stronger(a, b)), undefined);
   const strongest = (t: string) => strongestOf([...t.matchAll(ALL_LABELS)].map(m => named(m[1]!)));
+  const namesOnly = (t: string) => { const at = nameUses(t); const ms = [...t.matchAll(ALL_LABELS)]; return ms.length > 0 && ms.every(m => at.has(m.index!)); };
   const fieldOf = (t: string) => { const ls = [...t.matchAll(SEVERITY_FIELD)].flatMap(m => (m[1] ?? m[2]!).match(FIELD_LABELS)!); return ls.length === 1 && (fixableRaises || role !== 'adversarial-native' || rank(ls[0]!)) ? ls[0] : undefined; };
   const critical = (t: string) => BLOCKS_YES.test(t) || (fixableRaises && role === 'adversarial-native' && /(?<![A-Za-z0-9])FIXABLE(?![A-Za-z0-9])/.test(t));
   const leadOf = (t: string) => { const l = LEAD_LABEL.exec(t)?.[1]; return l === undefined || !fixableRaises ? l : named(l); };
@@ -213,7 +228,7 @@ function parseLabelled(reader: string, output: string, fixableRaises: boolean): 
     const summary = continued ? undefined : closingSummary(led && !ANY_LABEL.test(led[1]!) ? led[2]! : t);
     if (summary) return strongestOf([...summary.labels.map(named), summary.prose ? 'INFORMATIONAL' : undefined]);
     const field = fieldOf(t);
-    if (field === undefined) return strongest(t);
+    if (field === undefined) return namesOnly(t) && !critical(t) ? 'INFORMATIONAL' : strongest(t);
     return critical(t) ? 'CRITICAL' : strongestOf([leadOf(t), field])!;
   };
   const push = (label: string, raw: string, fields: string[] = [], lead?: string): Finding => { const f = { label, raw, fields: new Set(fields), list: LIST_ITEM.test(raw), lead }; out.push(f); return f; };
@@ -312,19 +327,58 @@ function parseLabelled(reader: string, output: string, fixableRaises: boolean): 
   const unblocked = (f: Finding) => fixableRaises || role !== 'adversarial-native' || !(f.fixable || f.label.toUpperCase() === 'FIXABLE' || /(?<![A-Za-z0-9])FIXABLE(?![A-Za-z0-9])/.test(f.raw)) || statesNoBlocks(f.raw);
   const relaxed = fixableRaises && role === 'adversarial-native' ? parseLabelled(reader, output, false) : undefined;
   const statesSeverity = (raw: string) => { const ls = [...raw.matchAll(SEVERITY_FIELD)].flatMap(m => (m[1] ?? m[2]!).match(FIELD_LABELS)!); return ls.length === 1 && !!rank(ls[0]); };
-  const shaped = (f: Finding) => f.section || f.heading || [...f.raw.split(' | '), f.context ?? ''].some(t => t.startsWith('{') || LEAD_LABEL.test(t) || META.test(t) || !!t.match(STATED_SEVERITY) || BLOCKS_YES.test(t)
-    || LOCUS.test(t) || PATH_LOCUS.test(t) || (role === 'adversarial-native' && /(?<![A-Za-z0-9])(?:FIXABLE|INVESTIGATE)(?![A-Za-z0-9])/i.test(t)));
+  const shaped = (f: Finding, tag = true, loci = true) => f.section || f.heading || [...f.raw.split(' | '), f.context ?? ''].some(t => t.startsWith('{') || LEAD_LABEL.test(t) || META.test(t) || !!t.match(STATED_SEVERITY) || BLOCKS_YES.test(t)
+    || (loci && (LOCUS.test(t) || PATH_LOCUS.test(t))) || (tag && role === 'adversarial-native' && /(?<![A-Za-z0-9])(?:FIXABLE|INVESTIGATE)(?![A-Za-z0-9])/i.test(t)));
   return out.map((f, i) => {
     const own = relaxed?.length === out.length && relaxed[i]!.raw === f.raw && statesNoBlocks(f.raw) && statesSeverity(f.raw) ? relaxed[i]!.label : undefined;
-    return { label: own ?? (unblocked(f) ? f.label : 'CRITICAL'), raw: f.raw, shaped: shaped(f) };
+    return { label: own ?? (unblocked(f) ? f.label : 'CRITICAL'), raw: f.raw, shaped: shaped(f), fielded: shaped(f, false, false), anchored: f.list || shaped(f, false, false) };
   });
 }
 
 export function parseFindings(reader: string, output: string, fixableRaises = true): Array<{ label: string; raw: string }> {
-  const clean = output.split('\n').some(l => /^NO FINDINGS\.?$/.test(l.trim()));
-  return parseLabelled(reader, output, fixableRaises).flatMap(({ label, raw, shaped }) => {
-    return shaped || !clean ? [{ label, raw }] : [];
-  });
+  return parseReply(reader, output, fixableRaises, false).findings.map(({ label, raw }) => ({ label, raw }));
+}
+
+export interface VerdictCheck { state: 'valid' | 'missing' | 'malformed'; parsed: number; declared?: number; agrees?: boolean; why?: string }
+export interface ReplyFinding { label: string; raw: string; summary?: true; synthetic?: true }
+const KIND_STATUS = '(?:noted|deferred|ruled|dismissed|lowered|downgraded|duplicate|folded)';
+const FINDING_KIND = new RegExp(`(?<![A-Za-z0-9])(?:${SEV_LIST}\\s+(?:findings?|duplicates?)|${KIND_STATUS}\\s+${SEV_LIST}|${SEV}(?:\\s*(?:,|/|\\bor\\b|\\band\\b|\\bnor\\b)\\s*${SEV})+)(?![A-Za-z0-9])(?!\\s*:)`, 'g');
+const blockingRow = (f: { label: string; raw: string }) => (rank(f.label) ?? 0) >= 4 && !statesNoBlocks(f.raw);
+
+/**
+ * A reply's findings, and with asked (its render carried the verdict ask, GST-2495) the check of its REVIEW_VERDICT line
+ * (lib/review-verdict.ts, docs/review-policy.md#verdict-line). A well-formed verdict line never parses as a finding, and a valid
+ * line lowers nothing by itself. Declared more than parsed adds CRITICAL rows, one per unmatched at= location and one for the
+ * rest; declared fewer marks each blocking row with no anchor (no list item, heading, field, lead label or JSON; a file:line in prose
+ * is not one, and in a NO FINDINGS reply a list item is not one either, GST-2972) and no Blocks: yes a summary candidate, whether a CRITICAL or P0 word or the native voice's FIXABLE raise made it block. It still
+ * blocks until lead judgment lowers it with a reason. A reply whose valid line declares blocking=0 marks the same way, at its own label,
+ * each single-line bullet with no structure, no file:line and no label beyond severities naming findings as a kind (`- a HIGH finding still
+ * refused;`, `- \`missing_verdict\` can't occur alongside P0 or P1 findings.`, #4518 and #4519), a list of severities (`P0 or P1`), or a
+ * status a finding already has (`noted CRITICAL duplicates`, `a deferred CRITICAL`, #4553): a scope list or passed check the lead
+ * may lower with a reason, though `- Two P0 findings remain unfixed.` has the same shape, so it still blocks until judged.
+ */
+export function parseReply(reader: string, output: string, fixableRaises = true, asked = false): { findings: ReplyFinding[]; verdict?: VerdictCheck } {
+  const verdict = asked ? parseVerdict(output) : undefined;
+  const text = asked ? withoutVerdictLines(output) : output;
+  const clean = text.split('\n').some(l => /^NO FINDINGS\.?$/.test(l.trim()));
+  const rows = parseLabelled(reader, text, fixableRaises).filter(r => r.shaped || !clean).map(r => clean ? { ...r, anchored: r.fielded } : r);
+  if (verdict?.state !== 'valid') {
+    const findings = rows.map(({ label, raw }) => ({ label, raw }));
+    return { findings, ...(verdict ? { verdict: { state: verdict.state, parsed: findings.filter(blockingRow).length, ...(verdict.state === 'malformed' ? { why: verdict.why } : {}) } } : {}) };
+  }
+  const n = verdict.blocking;
+  const parsed = rows.filter(blockingRow).length;
+  const kindOnly = (f: { raw: string; shaped: boolean }) => n === 0 && !f.shaped && /^[-*+]\s/.test(f.raw) && !f.raw.includes(' | ') && !ANY_LABEL.test(f.raw.replace(FINDING_KIND, ' '));
+  const findings: ReplyFinding[] = rows.map(f => ({ label: f.label, raw: f.raw, ...((n < parsed && blockingRow(f) && !f.anchored && !BLOCKS_YES.test(f.raw)) || kindOnly(f) ? { summary: true as const } : {}) }));
+  if (n > parsed) {
+    const loci = new Set(rows.filter(blockingRow).map(f => lineLocus(f.raw)));
+    const unmatched = verdict.at.map(a => a.replace(/^\.\//, '')).filter(a => !loci.has(a)).slice(0, n - parsed);
+    const rest = n - parsed - unmatched.length;
+    const note = `REVIEW_VERDICT declared blocking=${n}, but collect parsed ${parsed} blocking finding${parsed === 1 ? '' : 's'} in this reply`;
+    for (const a of unmatched) findings.push({ label: 'CRITICAL', raw: `${a}: ${note}; this declared blocker names this location`, synthetic: true });
+    if (rest > 0) findings.push({ label: 'CRITICAL', raw: `${note}; ${rest} declared blocker${rest === 1 ? '' : 's'} with no location named`, synthetic: true });
+  }
+  return { findings, verdict: { state: 'valid', parsed, declared: n, agrees: n === parsed } };
 }
 
 /**
@@ -361,19 +415,23 @@ const hasCleanMarker = (reader: string, output: string) => output.replace(/\r\n/
  * review: false. With unavailable (the outside voice only) the output is its failure text, recorded as missing coverage. With a
  * failed tree check (GST-482: the reply reviewed another checkout, or names none) nothing is merged and the output is no review.
  */
-export function collect(ledger: string, reader: string, output: string, mergedFile: string, outputFile?: string, unavailable?: string, tree?: TreeCheck, raises = true): { sha: string; lines: MergedLine[]; review: boolean } {
+export function collect(ledger: string, reader: string, output: string, mergedFile: string, outputFile?: string, unavailable?: string, tree?: TreeCheck, raises = true): { sha: string; lines: MergedLine[]; review: boolean; verdict?: VerdictCheck } {
   const sha = promptHash(output);
-  const prior = readLedger(ledger).filter(e => e.event === 'output' && e.reader === reader).length;
+  const events = readLedger(ledger);
+  const prior = events.filter(e => e.event === 'output' && e.reader === reader).length;
   const wrongTree = !unavailable && tree !== undefined && !tree.ok;
-  const lines = unavailable || wrongTree ? [] : parseFindings(reader, output, raises).map((f, i) => {
+  const reply = unavailable || wrongTree ? { findings: [] } : parseReply(reader, output, raises, lastRendered(events, reader)?.verdict === 1);
+  let parsedNo = 0, addedNo = 0;
+  const lines = reply.findings.map(f => {
     const s = stated(f.raw);
-    return { id: `${reader}#${prior ? `${prior + 1}.` : ''}${i + 1}`, reader, label: f.label, ...(s ? { stated: s } : {}), ...(summaryCandidate(f.raw) ? { summary_candidate: true as const } : {}), raw: f.raw, output_sha256: sha };
+    const id = `${reader}#${prior ? `${prior + 1}.` : ''}${f.synthetic ? `v${++addedNo}` : ++parsedNo}`;
+    return { id, reader, label: f.label, ...(s ? { stated: s } : {}), ...(f.summary || summaryCandidate(f.raw) ? { summary_candidate: true as const } : {}), raw: f.raw, output_sha256: sha };
   });
   const review = !unavailable && !wrongTree && (lines.length > 0 || hasCleanMarker(reader, output));
   fs.appendFileSync(mergedFile, lines.map(l => JSON.stringify(l) + '\n').join(''), { mode: 0o600 });
   appendEvent(ledger, { event: 'output', reader, sha256: sha, file: outputFile ? path.resolve(outputFile) : null, merged: path.resolve(mergedFile), ids: lines.map(l => l.id), review, ...(unavailable ? { unavailable } : {}), ...(raises ? {} : { fixable_raises: false }),
-    ...(tree && !unavailable ? { tree: tree.expected, reported_tree: tree.reported, tree_ok: tree.ok } : {}) });
-  return { sha, lines, review };
+    ...(tree && !unavailable ? { tree: tree.expected, reported_tree: tree.reported, tree_ok: tree.ok } : {}), ...('verdict' in reply && reply.verdict ? { verdict: reply.verdict } : {}) });
+  return { sha, lines, review, ...('verdict' in reply && reply.verdict ? { verdict: reply.verdict } : {}) };
 }
 /** The outside voice may fail without blocking (ship/sections/adversarial.md): its failure is recorded as unavailable coverage, never as a review. */
 export const mayBeUnavailable = (reader: string) => reader.split('/')[0] === 'outside-voice';
@@ -401,7 +459,7 @@ export function judge(merged: MergedLine[], judged: JudgedLine[]): Judgment {
     const from = rank(m.label) ?? 0;
     const to = rank(target.severity);
     if (to === null) continue;
-    if (to < from) (!j.duplicate_of && j.reason?.trim() && (summaryCandidate(m.raw) || statedLowering(m.reader, m.raw, to)) ? res.dismissed : res.downgraded).push(m.id);
+    if (to < from) (!j.duplicate_of && j.reason?.trim() && (m.summary_candidate === true || summaryCandidate(m.raw) || statedLowering(m.reader, m.raw, to)) ? res.dismissed : res.downgraded).push(m.id);
     else if (j.duplicate_of) res.folded.push(m.id);
     else if (to > from) { res.promoted.push(m.id); if (!j.reason?.trim()) res.unexplained.push(m.id); }
   }
@@ -472,6 +530,7 @@ export function ledgerBlockers(ledger: string): LedgerBlocker[] {
   const raws = new Map<string, string>();
   const readers = new Map<string, string>();
   const loci = new Map<string, string | null>();
+  const candidates = new Set<string>();
   const gone = quarantinedIds(events);
   for (const o of events.filter(e => e.event === 'output' && idsOf(e).some(id => !gone.has(id)))) {
     const lines = jsonLines(read(o.merged, `merged file of ${String(o.reader)}`), String(o.merged)) as MergedLine[];
@@ -480,6 +539,7 @@ export function ledgerBlockers(ledger: string): LedgerBlocker[] {
       ranks.set(id, rank(line.label) ?? 0);
       if (statesNoBlocks(line.raw)) unblocking.set(id, rank(line.label) ?? 0);
       raws.set(id, line.raw);
+      if (line.summary_candidate === true) candidates.add(id);
       readers.set(id, String(o.reader));
       loci.set(id, lineLocus(line.raw));
     }
@@ -490,7 +550,7 @@ export function ledgerBlockers(ledger: string): LedgerBlocker[] {
     if (promptHash(text) !== verdict.judged_sha256) fail(`judged set ${String(verdict.judged)} changed since judge`);
     for (const j of jsonLines(text, String(verdict.judged)) as JudgedLine[]) {
       if (j.duplicate_of) { ranks.delete(j.id); continue; }
-      const dismissed = !!j.reason?.trim() && (summaryCandidate(raws.get(j.id) ?? '') || statedLowering(readers.get(j.id) ?? '', raws.get(j.id) ?? '', rank(j.severity) ?? 0));
+      const dismissed = !!j.reason?.trim() && (candidates.has(j.id) || summaryCandidate(raws.get(j.id) ?? '') || statedLowering(readers.get(j.id) ?? '', raws.get(j.id) ?? '', rank(j.severity) ?? 0));
       ranks.set(j.id, dismissed ? rank(j.severity) ?? 0 : Math.max(ranks.get(j.id) ?? 0, rank(j.severity) ?? 0));
       if (!loci.has(j.id)) loci.set(j.id, lineLocus(j.reason ?? ''));
     }
@@ -521,12 +581,13 @@ const collectedIds = (events: LedgerEvent[]) => {
   return events.filter(e => e.event === 'output').flatMap(idsOf).filter(id => !gone.has(id));
 };
 
-export interface VerifyRow { kind: 'BRIEF' | 'OUTPUT' | 'JUDGE' | 'FETCH'; reader: string; status: string; detail: string }
+export interface VerifyRow { kind: 'BRIEF' | 'OUTPUT' | 'JUDGE' | 'FETCH' | 'VERDICT'; reader: string; status: string; detail: string }
 
 /** Replay every check from a finished run's ledger: briefs dispatched as rendered, outputs merged as returned, judgment without loss. */
-export function verify(ledger: string): { rows: VerifyRow[]; clean: boolean; briefs: number; voided: number; unavailable: number } {
+export function verify(ledger: string): { rows: VerifyRow[]; clean: boolean; briefs: number; voided: number; unavailable: number; verdicts: { asked: number; agree: number } } {
   const events = readLedger(ledger);
   const rows: VerifyRow[] = [];
+  const verdicts: VerifyRow[] = [];
   const short = (s: unknown) => (typeof s === 'string' ? s.slice(0, 12) : '-');
   // Each render opens one dispatch of its reader (a pass); its sends and outputs run until that reader's next render.
   const renders = events.flatMap((e, i) => (e.event === 'rendered' ? [i] : []));
@@ -594,8 +655,13 @@ export function verify(ledger: string): { rows: VerifyRow[]; clean: boolean; bri
       notes.push(typeof o.file === 'string' ? 'output_file_missing' : 'output_file_unrecorded');
       differs.push(...ids);
     } else if (promptHash(text) === o.sha256) {
-      const parsed = parseFindings(reader, text, o.fixable_raises !== false);
-      const off = ids.filter((id, k) => { const m = lines.find(l => l.id === id); return !m || m.reader !== reader || parsed[k]?.label !== m.label || parsed[k]?.raw !== m.raw; });
+      const asked = render?.verdict === 1;
+      const reply = parseReply(reader, text, o.fixable_raises !== false, asked);
+      const parsed = reply.findings;
+      const off = ids.filter((id, k) => { const m = lines.find(l => l.id === id); return !m || m.reader !== reader || parsed[k]?.label !== m.label || parsed[k]?.raw !== m.raw
+        || !!(parsed[k]!.summary || summaryCandidate(m.raw)) !== (m.summary_candidate === true); });
+      if (reply.verdict) verdicts.push({ kind: 'VERDICT', reader: p?.label ?? reader, status: reply.verdict.state === 'valid' ? (reply.verdict.agrees ? 'AGREES' : 'DISAGREES') : reply.verdict.state.toUpperCase(),
+        detail: `declared=${reply.verdict.declared ?? reply.verdict.state} parsed=${reply.verdict.parsed}${reply.verdict.why ? ` why=${JSON.stringify(reply.verdict.why)}` : ''}` });
       if (unavailableOutput(o) && parsed.length) { status = 'MISMATCH'; notes.push('unavailable_output_has_findings'); }
       else if (!unavailableOutput(o)) {
         if (off.length) { status = 'MISMATCH'; notes.push(`merged_line_differs=${JSON.stringify(off)}`); differs.push(...off); }
@@ -651,5 +717,7 @@ export function verify(ledger: string): { rows: VerifyRow[]; clean: boolean; bri
     rows.push({ kind: 'FETCH', reader: `${String(s.pass)}/${String(s.stage)}#${String(s.attempt)}`, status: s.verdict === 'violation' ? (resolved ? 'RESOLVED' : 'VIOLATION') : String(s.verdict).toUpperCase(), detail: `found=${found.length}${found.length ? ` paths=${JSON.stringify(found.map(x => x.path))}` : ''}${s.partial ? ` partial=${JSON.stringify(s.partial)}` : ''}` });
   }
   const clean = episodes.length > 0 && rows.every(r => ['MATCH', 'OK', 'VOIDED', 'UNAVAILABLE', 'SUPERSEDED', 'CLEAN', 'PARTIAL', 'RESOLVED'].includes(r.status));
-  return { rows, clean, briefs: episodes.length, voided, unavailable: rows.filter(r => r.kind === 'BRIEF' && r.status === 'UNAVAILABLE').length };
+  rows.push(...verdicts);
+  return { rows, clean, briefs: episodes.length, voided, unavailable: rows.filter(r => r.kind === 'BRIEF' && r.status === 'UNAVAILABLE').length,
+    verdicts: { asked: verdicts.length, agree: verdicts.filter(r => r.status === 'AGREES').length } };
 }

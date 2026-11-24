@@ -1,23 +1,31 @@
 /**
- * gstack-checks: the inner build-and-verify loop behind /verify (GST-116).
+ * gstack-checks: the inner build-and-verify loop behind /build-check (GST-116).
  *
  * detect: the repo's non-test checks (a CLAUDE.md gstack:verify: line, else its
  * Health Stack section, else manifests). Read-only.
  * run: those checks plus the tests pregate's own selector picks, run locally
  * under pregate's supervision. Tests come from lib/pregate only: there is no
- * second selector, so a /verify selection is the pregate selection. It never
+ * second selector, so a /build-check selection is the pregate selection. It never
  * writes .gstack/tmp/pregate.json or clears an obligation.
  * Consent: run executes nothing until the exact command set (checks, the pregate
  * runner and every selection manifest command) is trusted for this repo, or the
  * caller passes --allow-repo-commands.
  * status: reads the last run's ledger; READY_FOR_SHIP only when every check
  * passed at the current tree and command set. It runs nothing.
+ * quick: the pass `/build-check quick` runs, for example right before a commit
+ * (GST-3150). Same checks and selection as run, but it never asks for consent:
+ * an untrusted command set or a missing policy source ends it with one `VERIFY skipped: <reason>` line, and a not-run result
+ * (ENV, UNMAPPED, TOO_BROAD) is named, never a red. A TIMEOUT is a red: a check
+ * that never finished proved nothing. The checks share one deadline, and the
+ * test stage starts with what is left (its runner can still run past it).
  */
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { slugFromEnvironment } from './bin-context';
+import { spawnSync } from './spawn-sync';
 import { resolveStateRoot } from './state-root';
+import { gbrainConfigDir } from './gbrain-exec';
 import { wtreeFingerprint } from './script-invocation';
 import type { PregateConfig } from './pregate/config';
 import { buildContext, defaultUserConfigPath, describeRefusal, withFingerprint } from './pregate/context';
@@ -133,7 +141,7 @@ export interface HealthDimensions { checks: Array<{ dimension: string; command: 
 /**
  * /health Step 1, in the directory /health runs from: a Health Stack section row for row (test rows kept; a section with no
  * rows still turns auto-detection off), else /health's own presence rules,
- * which may use a tool found on PATH (unlike /verify's declared-only manifestChecks). Reads files and PATH; runs nothing.
+ * which may use a tool found on PATH (unlike /build-check's declared-only manifestChecks). Reads files and PATH; runs nothing.
  * test/health-detect-no-loss.test.ts holds these rules to the shell block they replaced.
  */
 export function healthDimensions(root: string, env: NodeJS.ProcessEnv = process.env): HealthDimensions {
@@ -151,6 +159,8 @@ export function healthDimensions(root: string, env: NodeJS.ProcessEnv = process.
   try { testScript = pkgText?.includes('"test"') ? JSON.parse(pkgText).scripts?.test : undefined; } catch { /* an unreadable package.json declares nothing */ }
   const listDir = (dir: string) => { try { return fs.readdirSync(dir); } catch { return []; } };
   const shellFiles = ['.', 'scripts', 'bin'].some(dir => listDir(path.join(root, dir)).some(f => f.endsWith('.sh')));
+  const gbrainDir = gbrainConfigDir(env);
+  const gbrainConfigLabel = env.GBRAIN_HOME?.trim() ? '$GBRAIN_HOME/.gbrain/config.json' : '~/.gbrain/config.json';
   const found: Array<[string, string, string] | false> = [
     has('tsconfig.json') && ['typecheck', 'tsc --noEmit', 'tsconfig.json'],
     (has('biome.json') || has('biome.jsonc')) && ['lint', 'biome check .', 'biome.json'],
@@ -163,7 +173,7 @@ export function healthDimensions(root: string, env: NodeJS.ProcessEnv = process.
     which('knip') && ['deadcode', 'knip', 'PATH'],
     !!pkgText?.includes('"knip"') && ['deadcode', 'npx knip', 'package.json'],
     which('shellcheck') && shellFiles && ['shell', 'shellcheck', 'PATH, *.sh in the root, scripts/ or bin/'],
-    which('gbrain') && !!env.HOME && fs.existsSync(path.join(env.HOME, '.gbrain', 'config.json')) && ['gbrain', 'timeout 5s gbrain doctor --json', 'PATH, ~/.gbrain/config.json'],
+    which('gbrain') && !!env.HOME && !!gbrainDir && fs.existsSync(path.join(gbrainDir, 'config.json')) && ['gbrain', 'timeout 5s gbrain doctor --json', `PATH, ${gbrainConfigLabel}`],
   ];
   const checks = found.filter((c): c is [string, string, string] => !!c).map(([dimension, command, source]) => ({ dimension, command, source }));
   const reasons: Record<string, string> = {
@@ -172,7 +182,7 @@ export function healthDimensions(root: string, env: NodeJS.ProcessEnv = process.
     test: typeof testScript === 'string' && /[\r\n]/.test(testScript) ? 'the package.json test script spans lines; list it in a CLAUDE.md Health Stack section' : 'no package.json test script, pytest in pyproject.toml, Cargo.toml or go.mod',
     deadcode: 'knip is not on PATH or in package.json',
     shell: which('shellcheck') ? 'no *.sh file in the root, scripts/ or bin/' : 'shellcheck is not on PATH',
-    gbrain: 'gbrain is not on PATH or ~/.gbrain/config.json is absent',
+    gbrain: gbrainDir ? `gbrain is not on PATH or ${gbrainConfigLabel} is absent` : 'GBRAIN_HOME is relative or has a ".." segment, which gbrain refuses',
   };
   return { checks, missing: HEALTH_DIMENSIONS.filter(d => !checks.some(c => c.dimension === d)).map(dimension => ({ dimension, reason: reasons[dimension] })) };
 }
@@ -203,17 +213,32 @@ function trustRows(store: string): Array<[string, string]> {
   return (read(store) ?? '').split('\n').filter(Boolean).map(l => l.split('\t') as [string, string]).filter(r => r.length === 2);
 }
 
+/** Trust belongs to the repository, so every registered worktree of it shares one row (#4407); any other folder, and rows from before that, are keyed by the checkout folder. */
+function trustKeys(root: string): string[] {
+  const folder = realRoot(root);
+  const env = { ...process.env };
+  for (const name of ['GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE']) delete env[name];
+  const git = (args: string[]) => spawnSync('git', args, { cwd: root, env, encoding: 'utf8', timeout: 10_000 });
+  const common = git(['rev-parse', '--path-format=absolute', '--git-common-dir']);
+  const dir = common.status === 0 ? common.stdout.trim() : '';
+  if (!path.isAbsolute(dir) || dir.includes('\n')) return [folder];
+  const list = git(['--git-dir', dir, 'worktree', 'list', '--porcelain']);
+  const registered = list.status === 0 && list.stdout.split('\n').some(l => l.startsWith('worktree ') && realRoot(l.slice('worktree '.length)) === folder);
+  return registered ? [realRoot(dir), folder] : [folder];
+}
+
 export function isTrusted(root: string, set: string, env: NodeJS.ProcessEnv = process.env): boolean {
-  const key = realRoot(root);
-  return trustRows(trustStore(env)).some(([p, h]) => p === key && h === set);
+  const keys = trustKeys(root);
+  return trustRows(trustStore(env)).some(([p, h]) => keys.includes(p) && h === set);
 }
 
 /** Record root -> command-set hash (0600, atomic, one row per repo) and log the grant beside the verify-gate grants. */
 export function recordTrust(root: string, set: string, checks: readonly Check[], config: Pick<PregateConfig, 'runner' | 'selection'>, env: NodeJS.ProcessEnv = process.env): void {
   const store = trustStore(env);
-  const key = realRoot(root);
+  const keys = trustKeys(root);
+  const key = keys[0];
   fs.mkdirSync(path.dirname(store), { recursive: true });
-  const rows = trustRows(store).filter(([p]) => p !== key).concat([[key, set]]);
+  const rows = trustRows(store).filter(([p]) => !keys.includes(p)).concat([[key, set]]);
   const tmp = `${store}.tmp.${process.pid}`;
   fs.writeFileSync(tmp, rows.map(r => r.join('\t')).join('\n') + '\n', { mode: 0o600 });
   fs.renameSync(tmp, store);
@@ -234,7 +259,7 @@ export function readLedger(file: string): Ledger | null {
   try { return JSON.parse(text) as Ledger; } catch { return null; }
 }
 
-/** A pregate lanes result as a /verify verdict. Only a pass (or a pass whose platform lanes are owed remotely) is green. */
+/** A pregate lanes result as a /build-check verdict. Only a pass (or a pass whose platform lanes are owed remotely) is green. */
 export function testVerdict(r: CheckResult): Pick<Outcome, 'verdict' | 'detail' | 'notCovered'> {
   const detail = r.detail ?? '';
   const notCovered = (r.remote ?? []).filter(o => !o.receipt).map(o => o.lane).sort();
@@ -247,11 +272,12 @@ export function testVerdict(r: CheckResult): Pick<Outcome, 'verdict' | 'detail' 
   return { verdict: 'INCOMPLETE', detail };
 }
 
-export interface RunOptions { root: string; only?: string[]; timeoutMs: number; env?: NodeJS.ProcessEnv }
+/** deadline (epoch ms) bounds the whole run: each check gets the time left, and one that cannot start before it is a TIMEOUT. */
+export interface RunOptions { root: string; only?: string[]; timeoutMs: number; deadline?: number; env?: NodeJS.ProcessEnv }
 export interface Loaded { ctx: PregateContext; checks: Check[]; set: string }
 const basisOf = (ctx: PregateContext) => sha256(JSON.stringify([ctx.baseRef, ctx.baseSha, ctx.configLabel, ctx.configDigest ?? '']));
 
-/** The pregate context /verify runs under: the base policy, tests local whatever the core count, no remote gate, quiet progress. */
+/** The pregate context /build-check runs under: the base policy, tests local whatever the core count, no remote gate, quiet progress. */
 export function load(root: string, base: string | undefined, timeoutMs: number, env: NodeJS.ProcessEnv = process.env): Loaded | { refused: string } {
   const b = resolveBaseBranch(root, base);
   const loaded = buildContext({ repoRoot: root, base: b, policyFrom: 'base', allowRepoCommands: true, timeoutMs, cores: Number.MAX_SAFE_INTEGER, testBackend: 'local', remote: null, userConfigPath: defaultUserConfigPath(root), env, progress: () => {} });
@@ -294,8 +320,10 @@ export async function runChecks(l: Loaded, o: RunOptions): Promise<{ outcomes: O
   const dir = path.join(path.dirname(file), 'logs');
   fs.mkdirSync(dir, { recursive: true });
   const outcomes: Outcome[] = [];
-  for (const check of l.checks) if (want(check.name)) outcomes.push(await runCommand(l.ctx, check, dir, o.timeoutMs));
-  if (want(TESTS)) outcomes.push(await runTests(l.ctx));
+  const left = () => Math.min(o.timeoutMs, (o.deadline ?? Infinity) - Date.now());
+  const spent = (name: string): Outcome => ({ name, verdict: 'TIMEOUT', ms: 0, detail: 'not started: the run\'s time budget ran out', lines: [] });
+  for (const check of l.checks) if (want(check.name)) outcomes.push(left() > 0 ? await runCommand(l.ctx, check, dir, left()) : spent(check.name));
+  if (want(TESTS)) outcomes.push(left() > 0 ? await runTests({ ...l.ctx, timeoutMs: Math.min(l.ctx.timeoutMs, left()) }) : spent(TESTS));
   const after = wtreeFingerprint({ cwd: o.root, env: o.env });
   const moved = 'error' in after || after.tree !== l.ctx.wtree;
   const final = moved ? outcomes.map(x => (x.verdict === 'PASS' ? { ...x, verdict: 'INCOMPLETE' as Verdict, detail: 'the working tree changed during the run; rerun' } : x)) : outcomes;
@@ -309,6 +337,17 @@ export async function runChecks(l: Loaded, o: RunOptions): Promise<{ outcomes: O
   fs.writeFileSync(tmp, JSON.stringify(ledger, null, 2) + '\n', { mode: 0o600 });
   fs.renameSync(tmp, file);
   return { outcomes: final, ledger };
+}
+
+/** The quick pass's last line: FAIL on a red, PASS when something passed and nothing is red, else skipped. */
+export function quickLine(outcomes: readonly Outcome[]): { line: string; red: Outcome[] } {
+  const red = outcomes.filter(o => o.verdict === 'FAIL' || o.verdict === 'ZERO_RUN' || o.verdict === 'INCOMPLETE' || o.verdict === 'TIMEOUT');
+  const passed = outcomes.filter(o => o.verdict === 'PASS');
+  const notRun = outcomes.filter(o => o.verdict !== 'PASS' && !red.includes(o)).map(o => `${o.name} ${o.verdict}`);
+  const secs = (outcomes.reduce((sum, o) => sum + o.ms, 0) / 1000).toFixed(1);
+  if (red.length) return { red, line: `VERIFY FAIL: ${red.map(o => `${o.name} ${o.verdict === 'FAIL' ? o.detail : o.verdict}`).join(', ')}${red[0].log ? `; log ${red[0].log}` : ''}` };
+  if (!passed.length) return { red, line: `VERIFY skipped: nothing ran to a result (${notRun.join(', ') || 'no checks'})` };
+  return { red, line: `VERIFY PASS: ${passed.map(o => o.name).join(', ')} in ${secs}s${notRun.length ? ` (not run: ${notRun.join(', ')})` : ''}` };
 }
 
 /** READY_FOR_SHIP only when the ledger is for this tree and command set and every check and the tests passed. */

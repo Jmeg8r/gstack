@@ -59,12 +59,14 @@ describe('UI text and SVGs stay code (R51: the docs paths are deferred to an all
 });
 
 describe('round 2 never ships an unread gate edit', () => {
-  // Value: protects=a gate-class edit after round 1 always gets the owner's eyes; fails_when=a round-2 or fix-check gate edit
-  //   returns done; seam=nextStep
-  test('a gate edit in round 2 or in the fix-check stops for the owner; a plain below-floor fix there finishes', () => {
-    expect(nextStep({ fullPasses: 2, last: 'full', fixedBelow: true, touchedGate: true })).toMatchObject({ step: 'stop', reason: expect.stringContaining('gate-class') });
+  // Value: protects=a gate-class edit after round 1 is always read again or goes to the owner (GST-3562 A: round 2's gate edit
+  //   gets the read-only full review of the final head, a gate edit after it stops); fails_when=a round-2 or fix-check gate
+  //   edit returns done; seam=nextStep
+  test('a gate edit in round 2 gets the read-only full review, one after it or in a fix-check stops for the owner; a plain below-floor fix on a light no-runtime range finishes', () => {
+    expect(nextStep({ fullPasses: 2, last: 'full', fixedBelow: true, touchedGate: true })).toMatchObject({ step: 'full', reason: expect.stringContaining('read-only final review (R51)') });
+    expect(nextStep({ fullPasses: 3, last: 'full', fixedBelow: true, touchedGate: true }).step).toBe('stop');
     expect(nextStep({ fullPasses: 1, last: 'fix-check', touchedGate: true })).toMatchObject({ step: 'stop', reason: expect.stringContaining('gate-class') });
-    expect(nextStep({ fullPasses: 2, last: 'full', fixedBelow: true }).step).toBe('done');
+    expect(nextStep({ fullPasses: 2, last: 'full', fixedBelow: true, rangeRuntimeLines: 0 }, 'light').step).toBe('done');
   });
 });
 
@@ -274,6 +276,77 @@ describe('GST-850: security reaches outbound URLs, archives, path traversal and 
     for (const line of ["const u = new URL('https://example.com');", 'const here = new URL(import.meta.url);', 'tar -czf out.tgz dir', "const root = path.join(import.meta.dir, '..');",
       'const m = re.exec(line);', "ENV.fetch('HOME')", 'git fetch origin main'])
       expect(risk(['src/run.ts'], { 'src/run.ts': [line] })).toEqual([]);
+  });
+});
+
+describe('GST-3041: Swift networking is security, SwiftUI is not', () => {
+  // Value: protects=a Swift diff that adds an outbound HTTP client still reaches the full panel now that .swift no longer fails closed;
+  //   fails_when=URLSession, URLRequest, NWConnection or Alamofire reads light, or an ordinary SwiftUI view raises a class; seam=matchRisk
+  test.each([
+    'let (data, _) = try await URLSession.shared.data(for: request)', 'let session = URLSession(configuration: .ephemeral)',
+    'var request = URLRequest(url: endpoint)', 'let conn = NWConnection(host: host, port: 443, using: .tls)', 'import Alamofire', 'AF.request(url).responseDecodable(of: Item.self) { _ in }',
+  ])('%s is security', line => {
+    expect(risk(['App/Client.swift'], { 'App/Client.swift': [line] })).toEqual(['security']);
+  });
+  test('an ordinary SwiftUI view is not security', () => {
+    for (const line of ['struct ReviewView: View {', '  var body: some View { Text("Saved") }', 'let url = URL(string: "https://example.com")!', '@State private var request = ""'])
+      expect(risk(['App/ReviewView.swift'], { 'App/ReviewView.swift': [line] })).toEqual([]);
+  });
+});
+
+describe('GST-3052: Swift user-data access, permission requests and on-device storage plan full; plain SwiftUI does not', () => {
+  // Value: protects=an iOS diff that reads health or calendar data, asks for a privacy permission, or writes, deletes, protects
+  //   or sets how long user files live on the device reaches the full panel now that .swift no longer fails closed;
+  //   fails_when=any line below reads light, an ordinary SwiftUI or UserDefaults line raises a class, or a non-Swift path
+  //   naming these APIs (this module's own patterns) raises one; why_new=GST-3052: ghome#10, #14 and #31 planned light;
+  //   seam=matchRisk; no_claim=what the full panel finds
+  test.each([
+    'SFSpeechRecognizer.requestAuthorization { status in done(status == .authorized) }',
+    'let granted = await AVAudioApplication.requestRecordPermission()',
+    'AVAudioSession.sharedInstance().requestRecordPermission { ok in done(ok) }',
+    'try await health.requestAuthorization(toShare: [], read: readTypes)',
+    'let ok = try await events.requestFullAccessToEvents()',
+    'events.requestAccess(to: .event) { ok, _ in done(ok) }',
+    'locations.requestWhenInUseAuthorization()',
+    'AVCaptureDevice.requestAccess(for: .audio) { _ in }',
+    'PHPhotoLibrary.requestAuthorization(for: .readWrite) { _ in }',
+  ])('%s is security', line => {
+    expect(risk(['App/Talk/Dictation.swift'], { 'App/Talk/Dictation.swift': [line] })).toEqual(['security']);
+  });
+  test.each([
+    'import HealthKit', 'private let health = HKHealthStore()',
+    'let query = HKSampleQuery(sampleType: sleep, predicate: nil, limit: 50, sortDescriptors: nil) { _, _, _ in }',
+    'let stats = HKStatisticsCollectionQuery(quantityType: steps, quantitySamplePredicate: nil, options: .cumulativeSum, anchorDate: start, intervalComponents: day)',
+    'import EventKit', 'private let events = EKEventStore()', 'return events.calendars(for: .event).map(Self.summary)',
+    'let found = events.events(matching: events.predicateForEvents(withStart: from, end: to, calendars: nil))',
+    'try blob.write(to: notesURL, options: [.atomic, .completeFileProtection])', 'try text.write(to: fileURL, atomically: true, encoding: .utf8)',
+    'try? FileManager.default.removeItem(at: draftFile)', 'try files.removeItem(atPath: path)', 'try FileManager.default.trashItem(at: old, resultingItemURL: nil)',
+    'guard FileManager.default.createFile(atPath: spill.path, contents: Data(count: size)) else { throw SpillError.create }',
+    'let handle = try FileHandle(forWritingTo: spill)', 'let handle = try FileHandle(forUpdating: spill)', 'try handle.write(contentsOf: page)',
+    'try files.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: path)', 'let mode = NSFileProtectionCompleteUntilFirstUserAuthentication',
+    'let shared = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: "group.example.app")',
+    'values.isExcludedFromBackup = true',
+    'static let recordingRetentionDays = 7', 'let keepDays: Int = 30', 'try archive.prune(olderThan: cutoff)',
+  ])('%s is data', line => {
+    expect(risk(['Packages/Core/Sources/Core/Notes/Store.swift'], { 'Packages/Core/Sources/Core/Notes/Store.swift': [line] })).toEqual(['data']);
+  });
+  test('ordinary SwiftUI, UserDefaults, reads and type mentions raise no class', () => {
+    for (const line of [
+      'import SwiftUI', 'struct HealthCard: View {', '  var body: some View { Text(event.title) }', '@AppStorage("speaksAnswers") private var speaksAnswers = true',
+      'let on = UserDefaults.standard.bool(forKey: "speaksAnswers")', 'defaults.set(encoded, forKey: Self.key)', 'didSet { defaults?.set(speaksAnswers, forKey: Self.speaksKey) }',
+      'switch SFSpeechRecognizer.authorizationStatus() {', 'func tint(of calendar: EKCalendar) -> Color { Color(cgColor: calendar.cgColor) }',
+      'let bytes = try Data(contentsOf: url)', 'let scratch = FileManager.default.temporaryDirectory', 'print(line, to: &log)', 'stream.write(to: &output)',
+      'let expiresAt = token.expiresAt', 'let settled = true', 'let subtitle = "Today"', 'func requestAccessToken() async throws -> String',
+    ]) expect(risk(['App/Home/HealthCard.swift'], { 'App/Home/HealthCard.swift': [line] })).toEqual([]);
+  });
+  test('a product file named *Test.swift is still read, and a call split across lines still matches', () => {
+    expect(risk(['App/Hearing/HearingTest.swift'], { 'App/Hearing/HearingTest.swift': ['guard await AVAudioApplication.requestRecordPermission() else { return }'] })).toEqual(['security']);
+    for (const lines of [['try FileManager.default.removeItem(', '  at: draftFile', ')'], ['try blob.write(', '  to: notesURL,', '  options: .atomic', ')'], ['let handle = try FileHandle(', '  forWritingTo: spill', ')']])
+      expect(risk(['App/Notes/Store.swift'], { 'App/Notes/Store.swift': lines })).toEqual(['data']);
+  });
+  test('the Swift rules read only .swift paths outside XCTest targets', () => {
+    for (const p of ['lib/review-risk.ts', 'docs/ios.md', 'Sources/Bridge.m', 'Tests/AppTests/StoreTests.swift', 'Packages/Core/Tests/CoreTests/Support.swift', 'App/StoreTests.swift'])
+      expect(risk([p], { [p]: ['const r = /\\bHKHealthStore\\b/;', 'SFSpeechRecognizer.requestAuthorization { _ in }', 'try FileManager.default.removeItem(at: url)'] })).toEqual([]);
   });
 });
 

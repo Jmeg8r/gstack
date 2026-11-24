@@ -1,13 +1,6 @@
 
 import { FREE_TEXT_WRITE_RULE, freeTextFileBash, freeTextFileUse } from '../free-text-file';
 
-export function generateFailureRouting(): string {
-  return `**Failures: check the cause, then fix it test-first.** A failing test, error or stack trace shows where a failure surfaces, not its root cause.
-
-- **Cause supplied** (the user names a specific cause and a narrow fix): make one read-only check of the evidence it rests on, such as the named file, test or log. If that confirms the cause, make the fix and run the focused test that covers it. If it does not, leave the suggested fix alone: reproduce the failure with a focused failing test, trace it to the root cause, fix that and rerun the test.
-- **Cause unknown:** make one read-only triage pass over the supplied evidence and the directly implicated test and code. Do not reproduce, test hypotheses or search wider. If that pass establishes the root cause and a narrow fix, make the fix and run the focused test that covers it. If the cause or scope is still unclear, write or run a focused test that fails on the bug before any edit, trace the failure to its root cause, fix that and rerun the test. If the intended behavior is unclear, ask the user.`;
-}
-
 export function generateTestFailureTriage(): string {
   return `## Test Failure Ownership Triage
 
@@ -99,11 +92,12 @@ Then post with your platform from Step 0 (\`github\` or \`gitlab\`). Substitute 
 
 \`\`\`bash
 ${freeTextFileUse([{ variable: 'TITLE_FILE', placeholder: '<title-file-name>' }, { variable: 'BODY_FILE', placeholder: '<body-file-name>' }], 'gh issue create --title \\"\\$(cat $TITLE_FILE)\\" --body-file $BODY_FILE')}
+[ "\${GSTACK_CAPY:-}" = 1 ] && { echo "Not sent: on Capy, gh signs in as the owner's own GitHub account. Hand $TITLE_FILE and $BODY_FILE to whoever owns the work instead (docs/troubleshooting.md#host-publish)." >&2; exit 0; }
 case "<platform>" in
   github) gh issue create --title "$(cat "$TITLE_FILE")" --body-file "$BODY_FILE" --assignee "<github-username>" ;;
   gitlab) glab issue create -t "$(cat "$TITLE_FILE")" -d "$(cat "$BODY_FILE")" -a "<gitlab-username>" ;;
   *) echo "Not sent: no GitHub or GitLab remote. Files: $TITLE_FILE $BODY_FILE" >&2; false ;;
-esac && rm -f "$TITLE_FILE" "$BODY_FILE"
+esac && rm "$TITLE_FILE" "$BODY_FILE"
 \`\`\`
 
 - If neither CLI is available or \`--assignee\`/\`-a\` fails (user not in org, etc.), create the issue without assignee and note who should look at it in the body.

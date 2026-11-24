@@ -12,14 +12,29 @@ const SKIP = new Set(['node_modules', '.git', 'dist']);
 
 /**
  * Retired skills: no host registers them, and setup removes an earlier
- * install's gstack-owned entry. plan-eng-review's source stays as /autoplan's
- * eng-phase methodology (GST-1698); external hosts get it beside
- * gstack-autoplan/SKILL.md as <name>.md, since Codex and Copilot register every
- * nested SKILL.md. investigate was cut after a no-gain eval and its source is
- * gone (GST-1717). setup and gstack-relink read the same list from
- * GSTACK_RETIRED_SKILLS in bin/gstack-install-registry.sh.
+ * install's gstack-owned entry. investigate was cut after a no-gain eval and
+ * its source is gone (GST-1717). verify is now build-check (#4593): the old
+ * name hid Claude Code's built-in /verify, so an upgrade removes gstack's old
+ * entry and leaves a user's own verify skill. setup and gstack-relink read the same list
+ * from GSTACK_RETIRED_SKILLS in bin/gstack-install-registry.sh.
  */
-export const RETIRED_SKILLS = ['plan-eng-review', 'investigate'];
+export const RETIRED_SKILLS = ['investigate', 'verify'];
+
+/**
+ * Old skill name → new name. A user's disabled_skills entry under the old name
+ * still turns off the renamed skill (#4593). Same map as GSTACK_RENAMED_SKILLS
+ * in bin/gstack-install-registry.sh.
+ */
+export const RENAMED_SKILLS: Readonly<Record<string, string>> = { verify: 'build-check' };
+
+/**
+ * Review skills /autoplan reads as a phase methodology from its own directory
+ * on external hosts: each renders a second time beside gstack-autoplan/SKILL.md
+ * as <name>.md, so /autoplan's phase does not depend on the standalone skill
+ * staying installed (GST-1698; the standalone /plan-eng-review returned in
+ * GST-2726).
+ */
+export const AUTOPLAN_SIBLING_METHODOLOGIES = ['plan-eng-review'];
 
 /**
  * The gstack-on-Capy skills (crew/README.md): registered only on a Capy

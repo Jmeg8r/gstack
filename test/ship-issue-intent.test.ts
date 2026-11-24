@@ -9,7 +9,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { splitAgentNotes } from '../lib/agent-notes';
 import { EXIT } from '../lib/headless-artifacts';
-import { lineSources, mentionsIn, promotionCandidates, relatedPrs, renderIssueLines, resolveLinks, selectFlakes, type ClosingPr, type IssueRow } from '../lib/issue-links';
+import { lineSources, mentionsIn, ownRepoMentions, promotionCandidates, relatedPrs, renderIssueLines, resolveLinks, selectFlakes, type ClosingPr, type IssueRow } from '../lib/issue-links';
 import { cleanup, commit, ghShim, makeFixtureRepo, runBin, type FixtureRepo } from './helpers/pregate-fixture';
 
 const repos: FixtureRepo[] = [];
@@ -32,6 +32,15 @@ describe('issue intent (pure)', () => {
   // meaning; fails_when=the bare-#N rule reads the numbers as this repository's issues (Refs lines and fix-#N prompts for issues that do not exist here), or
   // a closure, reference, filler or version word in the parentheses is taken for a repository name (the issue then vanishes from Refs and from the fix-#N
   // offer as a phantom cross-repo reference); why_new=the intent tests cover owner/repo#N as the only cross form; seam=none; no_claim=none beyond protects
+  // Value: protects=/ship's Review-Finding trailer names a review ledger entry (p1/red-team#3) or a fingerprint, never an issue, so it adds no
+  //   Refs line to the PR body (#4371); fails_when=the cross-repo owner/repo#N rule reads the ledger id as an issue in repository p1/red-team;
+  //   seam=mentionsIn; no_claim=none beyond protects
+  test('a Review-Finding trailer is not an issue reference; the rest of the message still is (#4371)', () => {
+    const m = mentionsIn('fix: pre-landing review fixes (owner/other#9)\n\nReview-Finding: p1/red-team#3 reader=red-team\nreview-finding: p2/adversarial-native#3 reader=codex\nReview-Finding: lib/x.ts:10:correctness reader=core\n\nFixes #14\n');
+    expect(m.map(x => [x.repo ? `${x.repo}#${x.issue}` : `#${x.issue}`, x.intent])).toEqual([['owner/other#9', 'refs'], ['#14', 'fixes']]);
+    expect(renderIssueLines(resolveLinks(mentionsIn('fix\n\nReview-Finding: p1/red-team#3 reader=red-team\n'), [], () => true))).toEqual([]);
+  });
+
   test('a parenthesised named reference is a cross-repo reference, never a same-repo Refs or promotion candidate', () => {
     const named = mentionsIn('ship-queue: screen verdict from the run (gbrain #7625, #7606)\n\nPorts the fix from (gbrain PR #7630) and (acme/tools issue #4).\n');
     expect(named.map(x => [x.repo ?? '', x.issue, x.intent])).toEqual([['gbrain', 7625, 'refs'], ['gbrain', 7606, 'refs'], ['gbrain', 7630, 'refs'], ['acme/tools', 4, 'refs']]);
@@ -45,6 +54,27 @@ describe('issue intent (pure)', () => {
     expect(mentionsIn('v1.2.3 (#301) release notes').map(x => [x.repo ?? '', x.issue])).toEqual([['', 301]]);
     expect(mentionsIn('Fixes #12').map(x => [x.repo ?? '', x.issue, x.intent])).toEqual([['', 12, 'fixes']]);
     expect(mentionsIn('same line (gbrain #7625) and #13 here').map(x => [x.repo ?? '', x.issue])).toEqual([['gbrain', 7625], ['', 13]]);
+  });
+
+  // Value: protects=several named references in one parenthesis, "(founderstar #837, harness-evals #393)", are each a cross-repo reference to their own
+  // name, never this repository's #837 and #393, while "(see #12, #13)", "mentions #12" and "Fixes #14" keep their meaning; owner/repo#N naming this
+  // repository is its own issue (a Fixes trailer closes it) and another repository's never closes here; fails_when=a list of named references falls
+  // through to the bare-#N rule (GST-2967: wrong Refs lines and fix-#N offers for issues the commit never meant), or this repository's full form stays a
+  // cross-repo Refs line; why_new=the named-reference test covers one name per parenthesis only; seam=none; no_claim=prose outside parentheses
+  test('a list of named references is cross-repo; this repository\'s owner/repo#N is its own issue (GST-2967)', () => {
+    const listed = mentionsIn('docs audit: stop halting on prose (founderstar #837, harness-evals #393)\n\nSee #12 (gbrain #7625; acme/tools issue #4).\n');
+    expect(listed.map(x => [x.repo ?? '', x.issue, x.intent])).toEqual([['founderstar', 837, 'refs'], ['harness-evals', 393, 'refs'], ['gbrain', 7625, 'refs'], ['acme/tools', 4, 'refs'], ['', 12, 'refs']]);
+    const links = resolveLinks(listed, [], () => true);
+    expect(links).toEqual({ fixes: [], refs: [12], flakes: [], cross: ['acme/tools#4', 'founderstar#837', 'gbrain#7625', 'harness-evals#393'], unreadable: [] });
+    expect(promotionCandidates(listed, links).map(c => c.issue)).toEqual([12]);
+    expect(mentionsIn('retry (see #12, #13) and (closing #14; #15)').map(x => [x.repo ?? '', x.issue])).toEqual([['', 12], ['', 13], ['', 14], ['', 15]]);
+    expect(mentionsIn('mentions #12 only').map(x => [x.repo ?? '', x.issue])).toEqual([['', 12]]);
+    const own = ownRepoMentions(mentionsIn('Refs garrytan/gstack#40, same as #40, and owner/other#9\n\nFixes garrytan/gstack#41\nFixes owner/other#42\n'), 'garrytan/GStack');
+    expect(own.map(x => [x.repo ?? '', x.issue, x.intent])).toEqual([['', 40, 'refs'], ['owner/other', 9, 'refs'], ['', 41, 'fixes'], ['owner/other', 42, 'fixes']]);
+    const ownLinks = resolveLinks(own, [], () => true);
+    expect(ownLinks).toEqual({ fixes: [41], refs: [40], flakes: [], cross: ['owner/other#42', 'owner/other#9'], unreadable: [] });
+    expect(renderIssueLines(ownLinks)).toEqual(['Fixes #41', 'Refs #40', 'Refs owner/other#42', 'Refs owner/other#9']);
+    expect(ownRepoMentions(mentionsIn('Fixes garrytan/gstack#41'), undefined).map(x => [x.repo ?? '', x.issue])).toEqual([['garrytan/gstack', 41]]);
   });
 
   test('resolution: explicit --issue is closure, unreadable closure becomes Refs, a flake issue is never a plain Ref', () => {
@@ -77,6 +107,30 @@ describe('gstack-issue-links (bin)', () => {
     expect(JSON.parse(receipt.out).issues).toEqual({ fixes: [14, 16], refs: [12, 13, 15], flakes: [{ issue: 40, run: '123456' }] });
   });
 
+
+  // Value: protects=each reference line on stderr names the commit its mention came from; fails_when=entries after the first keep git log's
+  //   trailing newline, so the older commit's label reads `commit :` with an empty id (#4378); why_new=the CLI tests ran one commit, whose entry
+  //   has no leading newline; seam=none; no_claim=none beyond protects
+  test('labels a mention in an older commit with that commit, not an empty id', () => {
+    const repo = fixture();
+    const older = commit(repo, { 'lib/util.js': "exports.add = (a, b) => a + b + 0;\n" }, 'tidy\n\nRefs #11\n').slice(0, 12);
+    const newer = commit(repo, { 'lib/util.js': "exports.add = (a, b) => a + b + 1;\n" }, 'tidy again\n\nRefs #12\n').slice(0, 12);
+    const env = ghShim(repo, { issues: { '11': { title: 't', body: 'b', comments: [] }, '12': { title: 'u', body: 'c', comments: [] } } });
+    const r = runBin(repo, 'gstack-issue-links', ['--base', 'main'], env);
+    expect(r.status).toBe(EXIT.ok);
+    expect(r.err).toContain(`reference #11 ← commit ${older}: Refs #11`);
+    expect(r.err).toContain(`reference #12 ← commit ${newer}: Refs #12`);
+    expect(r.err).not.toContain('commit :');
+  });
+
+  test('a named-reference list in a commit is cross-repo, and Fixes owner/repo#N for this repository closes it (GST-2967)', () => {
+    const repo = fixture();
+    commit(repo, { 'lib/util.js': "exports.add = (a, b) => a + b + 0;\n" }, 'docs audit: stop halting on prose (founderstar #837, harness-evals #393)\n\nFixes owner/repo#14\n');
+    const env = ghShim(repo, { issues: { '14': { title: 't', body: 'b', comments: [] } } });
+    const r = runBin(repo, 'gstack-issue-links', ['--base', 'main', '--no-auto-links'], env);
+    expect(r).toMatchObject({ status: EXIT.ok, out: 'Fixes #14\nRefs founderstar#837\nRefs harness-evals#393\n' });
+    expect(r.err).toContain('closure #14 ← commit ');
+  });
   test('no mentions prints ISSUE_LINKS: none with exit 0; a bare mention never closes; bad flags are usage', () => {
     const repo = fixture();
     commit(repo, { 'lib/util.js': "exports.add = (a, b) => a + b + 0;\n" }, 'tidy\n\nmentions #12 only\n');

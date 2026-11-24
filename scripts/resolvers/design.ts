@@ -4,6 +4,7 @@ import { FREE_TEXT_WRITE_RULE, freeTextFileBash } from './free-text-file';
 import { binaryAssignment } from './runtime-root';
 import { usesLazySections } from './sections';
 import { AI_SLOP_BLACKLIST, OPENAI_HARD_REJECTIONS, OPENAI_LITMUS_CHECKS, CC_BACKGROUND_DEFAULT_SINCE, FOREGROUND_IF_AVAILABLE, BACKGROUND_RECOVERY } from './constants';
+import { CODEX_SUBAGENT_CALL } from '../../hosts/codex';
 import { OVERUSED_FONTS_DISPLAY, BANNED_FONTS, FONTS_BODY_UI_OK, FONTS_MONO_OK, FONTS_VERIFIED_FREE, HANDOFF_COMMANDS, selectCatalog, catalogEntries, renderCatalog, detectorSlopEntries, judgmentTellEntries } from '../../lib/design-catalog';
 import { SENTINEL, DETECT_EXIT_ECHO, DETECT_LIMITS } from '../../lib/design-detect-contract';
 import { DOM_DUMP_FILE } from '../../lib/dom-dump-script';
@@ -244,9 +245,9 @@ Persist it into this run's directory, size-capped and redaction-checked: a HIGH 
 \`\`\`bash
 _D="<ASIDE_DIR or $_TMP>/{page}.dom.html"; _REPORT="<REPORT_DIR from Setup>"; _RUN="<RUN_ID from Setup>"
 if [ ! -s "$_D" ]; then echo "${SENTINEL.DOM_DUMP_MISSING}: {page} (the dump script wrote nothing)"
-elif [ "$(wc -c < "$_D")" -gt ${DETECT_LIMITS.domDumpBytes} ]; then echo "${SENTINEL.DOM_DUMP_TOO_LARGE}: {page} $(wc -c < "$_D")"; rm -f "$_D"
-elif ${toShellPath(ctx.paths.binDir)}/gstack-redact --from-file "$_D" --max-bytes ${DETECT_LIMITS.domDumpBytes} >/dev/null 2>&1; _RC=$?; [ "$_RC" -ne 0 ] && [ "$_RC" -ne 2 ]; then echo "${SENTINEL.DOM_DUMP_REDACTION_BLOCKED}: {page} redact-exit=$_RC"; rm -f "$_D"
-else mkdir -p "$_REPORT/dom/$_RUN" && cp "$_D" "$_REPORT/dom/$_RUN/" && chmod 600 "$_REPORT/dom/$_RUN/{page}.dom.html" && rm -f "$_D" && echo "${SENTINEL.DOM_DUMP_OK}: {page}"; fi
+elif [ "$(wc -c < "$_D")" -gt ${DETECT_LIMITS.domDumpBytes} ]; then echo "${SENTINEL.DOM_DUMP_TOO_LARGE}: {page} $(wc -c < "$_D")"; rm "$_D"
+elif ${toShellPath(ctx.paths.binDir)}/gstack-redact --from-file "$_D" --max-bytes ${DETECT_LIMITS.domDumpBytes} >/dev/null 2>&1; _RC=$?; [ "$_RC" -ne 0 ] && [ "$_RC" -ne 2 ]; then echo "${SENTINEL.DOM_DUMP_REDACTION_BLOCKED}: {page} redact-exit=$_RC"; rm "$_D"
+else mkdir -p "$_REPORT/dom/$_RUN" && cp "$_D" "$_REPORT/dom/$_RUN/" && chmod 600 "$_REPORT/dom/$_RUN/{page}.dom.html" && rm "$_D" && echo "${SENTINEL.DOM_DUMP_OK}: {page}"; fi
 \`\`\`
 
 After the LAST page's dump, scan the run directory once (source mode scanned in Setup instead):
@@ -619,7 +620,7 @@ ${outsideVoiceInvocation(ctx, { timeoutMs: 300000, reasoningEffort: 'medium', pu
 
 ${outsideVoiceProvenance(ctx, 'design-sketch')}
 
-2. **${outsideVoiceFor(ctx).nativeLabel} subagent** (via Agent tool, ${FOREGROUND_IF_AVAILABLE} — subagents default to background since ${CC_BACKGROUND_DEFAULT_SINCE}; ${BACKGROUND_RECOVERY}):
+2. **${outsideVoiceFor(ctx).nativeLabel} subagent** (${ctx.host === 'codex' ? `via ${CODEX_SUBAGENT_CALL}` : `via Agent tool, ${FOREGROUND_IF_AVAILABLE} — subagents default to background since ${CC_BACKGROUND_DEFAULT_SINCE}; ${BACKGROUND_RECOVERY}`}):
 "For this product approach, what design direction would you recommend? What aesthetic, typography, and interaction patterns fit? What would make this approach feel inevitable to the user? Be specific — font names, hex colors, spacing values. Do not fall back on these defaults: a cream ground with a high-contrast serif and terracotta accent; near-black with one neon accent and glowing edges; italic accent words inside headlines; numbered 01 / 02 / 03 section labels; tiny tracked monospace labels; pill-shaped buttons. If your first idea is one of these, name it and choose again."
 
 Present ${outsideVoiceFor(ctx).label} output under \`${outsideVoiceFor(ctx).label.toUpperCase()} SAYS (design sketch):\` and subagent output under \`${outsideVoiceFor(ctx).nativeLabel.toUpperCase()} SUBAGENT (design direction):\`.
@@ -795,7 +796,7 @@ Prompt (include the actual plan/product/frontend source context, not only file p
 
 ${outsideVoiceInvocation(ctx, { timeoutMs: 300000, reasoningEffort, ...(isDesignConsultation ? { purpose: 'design-direction' as const } : {}), ...(isPlanDesignReview ? { role: 'plan-review' as const } : {}) })}
 
-2. **${outsideVoiceFor(ctx).nativeLabel} design subagent** (Agent tool, ${FOREGROUND_IF_AVAILABLE}; await its result. ${BACKGROUND_RECOVERY}):
+2. **${outsideVoiceFor(ctx).nativeLabel} design subagent** (${ctx.host === 'codex' ? `via ${CODEX_SUBAGENT_CALL}` : `Agent tool, ${FOREGROUND_IF_AVAILABLE}; await its result. ${BACKGROUND_RECOVERY}`}):
 "${subagentPrompt}"
 
 **Error handling (all non-blocking):**
@@ -1116,7 +1117,7 @@ _IMG=$(jq -r --arg v "<VARIANT>" '.[($v | explode[0]) - 65] // empty' "$_DESIGN_
 if [ -n "$_IMG" ]; then
   FEEDBACK_FILE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.gstack/tmp/<feedback-file-name>"
   [ -s "$FEEDBACK_FILE" ] || { echo "Not saved: $FEEDBACK_FILE is missing or empty. Write the feedback, then rerun this block." >&2; exit 1; }
-  jq -n --arg approved_variant "<VARIANT>" --arg approved_path "$(basename "$_IMG")" --rawfile feedback "$FEEDBACK_FILE" --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg screen "${screen}" --arg branch "$(git branch --show-current 2>/dev/null)" '$ARGS.named | .feedback |= rtrimstr("\\n")' > "$_DESIGN_DIR/approved.json" && rm -f "$FEEDBACK_FILE"
+  jq -n --arg approved_variant "<VARIANT>" --arg approved_path "$(basename "$_IMG")" --rawfile feedback "$FEEDBACK_FILE" --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg screen "${screen}" --arg branch "$(git branch --show-current 2>/dev/null)" '$ARGS.named | .feedback |= rtrimstr("\\n")' > "$_DESIGN_DIR/approved.json" && rm "$FEEDBACK_FILE"
   echo "APPROVED_IMAGE: $_IMG"
 else
   echo "NO_BOARD_IMAGE: <VARIANT> is not on this board; reselect from the board"
