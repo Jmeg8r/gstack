@@ -311,9 +311,9 @@ now names HEAD with a `carry` object holding the `git range-diff` evidence, and
 `ship-run.json` gains `carried_from` and `carry_reason`; the `review_loop`
 counters are kept, because the reviewed product diff is unchanged or its only
 difference passed a scoped review. `CARRY: current` means nothing moved.
-`CARRY: refused (RECEIPT_CARRY_SCOPED_REVIEW)` means the base edited context
-next to reviewed hunks. Carry without `--dry-run` writes the packet the
-refusal names (a dry run writes none), one fix-check reviewer reads it, and a
+`CARRY: refused (RECEIPT_CARRY_SCOPED_REVIEW)` means the base merge spliced
+lines into reviewed hunks (moved context next to unchanged hunks carries). Carry without `--dry-run` writes the packet the
+refusal names (a dry run writes none), one scoped reader reads it, and a
 clean record reruns carry with `--scoped-review <record.json>`
 ([troubleshooting](troubleshooting.md#receipt-carry-scoped-review)). `CARRY: refused (RECEIPT_CARRY_PRODUCT_CHANGED)`,
 `(RECEIPT_CARRY_TREE_MISMATCH)` or `(RECEIPT_CARRY_REFUSED)` with the refused
@@ -386,6 +386,11 @@ owner's own words: nothing a person wrote leaves without their click (GST-1243).
   wherever it appears whole; from 8 words, any 8 consecutive words of it are a
   quote too. Replies of 1 or 2 words ("yes", "do it") are not scanned for:
   they are codes or grammar, and the field itself is already dropped. A quote
+  under the plan's `### Owner's words` heading is redacted at any length
+  wherever it appears inside quote marks (padding just inside them included, and the same after entities, JSON escapes and invisible characters are decoded), and the reason on its
+  `leave out:` line wherever it follows `leave out:`, `leave it out for now:`
+  or `reason to leave it out:`, in any case; a bare mention of a short quote's
+  words outside quote marks stays. A quote
   extends over the neighboring words that also belong to that reply, and the
   marker replaces the original characters from its first word to its last.
 - **Echoes stay.** Words the owner repeated from text recorded before the reply,
@@ -610,8 +615,14 @@ The example above is the full run. The first `next` also takes `--kind`:
    one-voice challenge keeps it. An earlier round's open challenge stays until
    answered or marked fixed (`resolves`). `### Day one` and `### What it won't
    do yet` add `day_one` and `cut` approval items (a missing day-one page on a
-   UI plan, each `assumed` row, each cut that drops a day-one row or quoted
-   owner line) and one `cuts` auto item for the rest.
+   UI plan, each `assumed` row, each cut that drops a day-one row) and one
+   `cuts` auto item for the rest. A first version (a `### Day one` section or
+   `--first-version`) letters every cut instead, and adds `owner_words` items
+   for a missing Owner's words section or a quote with no time or line. Each
+   quote this version doesn't fully do (its line says `choice`, a cut drops it,
+   or a reviewer's `narrows_quote` finding says the plan narrows it) is one
+   `owner_choice` approval item: a) build it, recommended unless the line says
+   `leave out: <reason>`, b) leave it out ([first-use-check.md](first-use-check.md#the-owners-words-and-the-day-one-table)).
 4. **Answer the gate** with the reply grammar and the revision you read:
    ```bash
    $AP answer --out <dir> --gate-rev 1 --reply "rec" --by human            # every recommendation, plan changes included (APPLY: ...; amend_pending)
@@ -957,7 +968,7 @@ predictions with his answers.
 - **The record.** `shadow/ceo-only.r<rev>.jsonl`, one row per gate item: the
   frozen item, `item_class` (`challenge2`, `challenge1`, `disagree`, `agent`,
   `cap_deferred`, `cap_blocker`, `cap_delta`, `finding`, `proposal`,
-  `confirm_direction`, `day_one`, `cut`, `cuts`, `p1`), `ceo_eligible`
+  `confirm_direction`, `day_one`, `cut`, `cuts`, `owner_words`, `owner_choice`, `p1`), `ceo_eligible`
   (false for a `finding` item, which a CEO-only run leaves to the owner), the
   prediction, `rule_pick` (the driver's keep-direction pick, the free
   baseline), `rec_hash`, the plan and prompt hashes, the model, the gstack
@@ -988,8 +999,9 @@ predictions with his answers.
 gate, interactive or unattended: one page built from `gate.json`,
 `decisions.jsonl` and `findings.jsonl` (`BRIEF_INPUT_MISSING` when one is
 absent). It opens with the `URGENT, outside this plan` block, then the
-plan's `### Day one` table, its `### What it won't do yet` cuts and the
-owner's words it follows (each only when the plan has it), then a
+owner's words it follows with each quote's line, the plan's `### Day one`
+table and its remaining `### What it won't do yet` cuts (each only when the
+plan has it; a cut that drops a quote is asked beside that quote), then a
 plain-language summary (phases closed, findings accepted, how many decisions
 take their default, the cycle time; `--summary <file>` or `<dir>/summary.md`
 replaces the generated sentence with the run's own), then the numbered

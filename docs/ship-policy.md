@@ -1329,6 +1329,12 @@ first (`pr`, `head`, `version`, `base`), then the evidence (`gate`, `ci`,
 `carry`, `no_stop`), validated
 against the `ship-receipt` schema (`gstack-artifact schema ship-receipt`) and
 read back by `gstack-ship-receipt read`, `result`, `carry` and the queue.
+Since GST-3562 (H), write and the queue's binding check need none of the
+`docs`, `review_loop`, `issues` or budget records to bind a receipt at its head;
+of the old records only the targeted reader's (`--review-targeted`) is still
+required, when Step 9's plan named a targeted class. Keep passing
+`--review-loop`: the next /ship run counts the PR's earlier rounds from it
+(`gstack-ship-receipt history`). A receipt that still carries the old records binds.
 
 **`version`.** The version source at HEAD: the path `.gstack/version-path`
 pins, else `VERSION`, else `package.json#version`. A repository with none of
@@ -1403,7 +1409,8 @@ checked-out HEAD, when the receipt records `gstack_version` without
 `class` one of the four no-stop defaults. /ship passes the branch's
 `gstack-no-stop` ledger here ([review-policy.md#no-stop](review-policy.md#no-stop)).
 
-**`review_loop_exception`.** The owner's acceptance of a stop after a
+**`review_loop_exception`.** Deprecated with fix-check grants (GST-3562 A; write
+still takes one for a stop before it, and the next release removes it). The owner's acceptance of a stop after a
 fix-check edit under frozen scope (#3559), from `write --review-loop-exception
 <json|@file>`: `{ accepted_by, date, via, reason, fix_check: { head, findings[, files] } }`.
 It needs `--review-loop` with `fix_checks` of 1 or more, a `fix_check.head`
@@ -1801,15 +1808,17 @@ construction:
    pass. `NO FINDINGS` is the expected reviewer result for a clean range, never a
    failed review.
 3. **Two rounds is the cap** (R51), stepped by the
-   [transition table](review-policy.md#transitions); a full pass, a
-   [scoped pass](review-policy.md#scoped-pass) and a fix-check each count as a round. A pass that applied no edits
+   [transition table](review-policy.md#transitions); a full pass counts as a
+   round, and /ship plans neither a fix-check nor a [scoped pass](review-policy.md#scoped-pass): any code change
+   after round 1 gets a full round 2, with no exception (GST-3562 A and part 3). A pass that applied no edits
    continues to Step 10: the loop ships with its deferred and noted items named in
    the PR body. A blocking finding still open after the last allowed step stops
-   the run and names the finding (path, severity, problem) for the owner instead
-   of a third round. A fix applied in the last allowed round gets one read-only
+   the run and names the finding (path, severity, problem) for the lane's Captain
+   instead of a third round: the PR ships with its open notes or the Captain rules. A fix applied in the last allowed round gets one read-only
    full review of the final head with no fix round (GST-3562 A); a fix after it
-   stops for the owner. A grant no longer buys a fix-check at the cap; one
-   answering the stop after a round-2 fix-check still does, until a later release.
+   stops for the Captain. Fix-check and round grants are deprecated: one recorded
+   before GST-3562 still answers its stop for one release, and the next release
+   removes them.
 
 <a id="what-ends-a-run"></a>
 **What ends a /ship run (GST-3260).** Preflight opens the run in the checkout's
@@ -2216,15 +2225,17 @@ that doesn't carry each of those lines word for word.
 
 **When the route still says behavior at the round cap.** `finish`'s behavior
 STOP tells the lane to plan the inserted Step 9 with `gstack-review-plan
---post-review` (plus `--pass`, `--last` and `--fix-checks` as the loop left
+--post-review` (plus `--pass` and `--last` as the loop left
 them). Edits after the review bound plan as a fix to a gate-class path, never
 as a note. The exception is a range after the last fix-check whose edits are
 only release stamps and docs (`docsChangeSince`): it plans `NEXT: done`, or
 `NEXT: targeted` for a docs claim on a targeted-class diff, with no grant
 ([review-policy.md](review-policy.md#transitions), GST-1702). Below the round cap that's a pass on the range (a fix-check under
 the lean panel before GST-3562; a full pass on the range since). At the cap it gets
-one read-only full review of the whole PR diff (GST-3562 A), never `done`, and a
-grant buys no fix-check there. When the last step was a
+one read-only full review of the whole PR diff (GST-3562 A), never `done`; any
+other edit after review costs the next round. The rest of this paragraph and the
+chain below serve only grants recorded before GST-3562 (deprecated, removed next
+release). When the last step was a
 fix-check, pass `--range-base` at that fix-check's commit: a new grant at a
 stop head after it plans the next link of the chain below (GST-1676), and the
 last link's own grant is refused. So `finish` never asks for a step the
@@ -2353,13 +2364,14 @@ receipt when the base moves:
 | What changed since /ship | The receipt |
 |---|---|
 | a merge of the base, product diff unchanged (tests, release metadata, registered outputs the pregate's regen check proved) | carries; no review reruns |
-| a merge of the base that edited lines next to the branch's unchanged hunks (the branch's +/- lines identical and in the same places) | carries after one fix-check reviewer reads the hunks and comes back clean (`RECEIPT_CARRY_SCOPED_REVIEW`, then `carry --scoped-review <record.json>`) |
+| a merge of the base that edited lines next to the branch's unchanged hunks (the branch's +/- lines, file modes and symlink targets identical and in the same places) | carries with no reader; CI on the merged head is the check (reason `base context moved next to unchanged own lines`, GST-3562) |
+| a merge of the base that spliced lines into one of the branch's hunks (the base replaced the very lines the branch replaces and the merge kept both, GST-2975) | carries after one scoped reader reads the hunks and comes back clean (`RECEIPT_CARRY_SCOPED_REVIEW`, then `carry --scoped-review <record.json>`) |
 | a merge of the base that only re-records the harness pin of a product file (`scripts/harness-pins/<file>.json`; a pinned test or metadata file's pin stays product): at both heads the pin is a regular file (not a symlink), both pinned files resolve, the pin's `blob` is its file's blob, its other fields are the reviewed ones, and `scripts/harness-version.json`'s version and patterns did not move; the pinned file itself still counts as product | carries (reason `regenerated outputs`, GSTA-749) |
 | a merge of the base whose resolution changed product code, or moved the branch's lines elsewhere | a fresh /ship (`RECEIPT_CARRY_PRODUCT_CHANGED`) |
 | a rebase or force-push onto a tree the receipt covers, product diff against the new base unchanged | carries (`carry.ancestry: rewritten`) |
 | any other rebase or force-push | a fresh /ship (`RECEIPT_CARRY_TREE_MISMATCH`) |
 | a stacked PR whose parent landed (squash or merge), retargeted to the base with the base merged in, HEAD's product diff exactly the one reviewed against the parent branch | carries (reason `stack parent <branch> landed`) |
-| a stacked PR whose receipt was written against the base, after its parent landed and the base was merged in, HEAD's product diff exactly the reviewed range from the parent's head | carries (reason `stack parent <sha12> landed`); base context next to the child's hunks is `RECEIPT_CARRY_SCOPED_REVIEW` |
+| a stacked PR whose receipt was written against the base, after its parent landed and the base was merged in, HEAD's product diff exactly the reviewed range from the parent's head | carries (reason `stack parent <sha12> landed`); base context next to the child's unchanged hunks carries too, and a spliced hunk is `RECEIPT_CARRY_SCOPED_REVIEW` |
 | a stamp on the branch's own rows in a stamp file the branch also changed as product: every changed line at a branch-added position, the file's mode unchanged, the base not touching it, the rest of the product diff unchanged | carries (reason `a stamp on the branch's own rows (<file>)`) |
 | a stamp file the branch changes, against each head's base, by no more than a stamp (back at the base's content after a changelog-fragment conversion, or only its version field moved), whatever else the base changed in it | carries (reason `release metadata`, GST-1210) |
 
@@ -2398,7 +2410,8 @@ every path whose content at the reviewed head is the base's (a base merge the
 child made before its receipt brought it in) unless HEAD changed it against the
 base (GST-1214): an equal
 patch-id carries with reason `stack parent <sha12> landed`, base context next
-to the child's unchanged hunks is `RECEIPT_CARRY_SCOPED_REVIEW`, and any other
+to the child's unchanged hunks carries too, a spliced hunk is
+`RECEIPT_CARRY_SCOPED_REVIEW`, and any other
 difference refuses with `RECEIPT_CARRY_PRODUCT_CHANGED`. When merging the commit
 into the current base conflicts because the base edited the landed lines
 afterwards, the base commits since the fork that touched every path of its
@@ -2494,7 +2507,7 @@ along the receipt's own history, `rewritten` once any hop was a rebase;
 skill=ship status=complete` line, and its summary line ends with
 `carried_from=<old12>`. `CARRY: current` means the receipt already names HEAD;
 `--dry-run` prints `CARRY: would carry …` and writes nothing. When the only
-difference is base context next to the branch's unchanged hunks and none of
+difference is a hunk the base merge spliced and none of
 carry's other checks would refuse, `--dry-run` refuses
 `RECEIPT_CARRY_SCOPED_REVIEW` without writing the packet; carry without
 `--dry-run` writes it.
@@ -2502,9 +2515,10 @@ carry's other checks would refuse, `--dry-run` refuses
 A changed product path, or a product patch-id that differs, is
 [`RECEIPT_CARRY_PRODUCT_CHANGED`](troubleshooting.md#receipt-carry-product-changed)
 (exit 3; the refusal names the paths), except when the only difference is
-base context next to the branch's unchanged hunks, which is
+base context next to the branch's unchanged hunks, which carries with no
+reader (GST-3562), or a hunk the base merge spliced, which is
 [`RECEIPT_CARRY_SCOPED_REVIEW`](troubleshooting.md#receipt-carry-scoped-review)
-until one fix-check reviewer clears the packet; a working tree with uncommitted
+until one scoped reader clears the packet; a working tree with uncommitted
 changes is [`RECEIPT_CARRY_REFUSED`](troubleshooting.md#receipt-carry-refused).
 A `RECEIPT_CARRY_PRODUCT_CHANGED` on linear history against the reviewed base
 whose range-diff, plus the diff of the changed product paths, is at most 400
@@ -2543,7 +2557,7 @@ generated skill file whose only branch-side difference after a base merge is
 that id compares as unchanged. A reviewed line that the base also replaced,
 where the current line is the base's new line plus exactly the tokens the
 branch added to the reviewed line (both sides appended an entry to one
-expected-value list), is base context: it goes to the one scoped reader, never
+expected-value list), is a spliced hunk: it goes to the one scoped reader, never
 through silently. A resolution that drops, invents or rewrites anything on the
 branch's own lines stays a changed path.
 
@@ -2574,7 +2588,7 @@ review loop or Step 14.5's docs audit for a carried receipt:
    carry` is eligibility only; a refusal continues the full ship, except
    `RECEIPT_CARRY_SCOPED_REVIEW`, for which `gstack-ship-preflight` prints
    `NEXT: carry route`: fix what the base merge broke, commit and push, run carry
-   without `--dry-run` to write the packet, have one fix-check reviewer read it,
+   without `--dry-run` to write the packet, have one scoped reader read it (without asking; not a review round),
    then carry with `--scoped-review <record.json>` and `--pregate`. A blocking
    finding continues the full ship.
 2. Fix what the base merge broke (the CHANGELOG, the size caps the policy
