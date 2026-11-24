@@ -20,11 +20,13 @@
  * (`~/.capy/drive/captain-<name>/approvals/<slug>/<branch key>.jsonl`, which every
  * crew thread can read), else to the private project-user Drive folder
  * (`<drive>/approvals/<slug>/<branch key>.jsonl`). GSTACK_APPROVALS_MIRROR=0
- * turns the mirror off. Reads take the union of both. Every field passes the
- * secret scanner before anything is written.
+ * turns the mirror off. Reads take the union of both. A fixture (bun test, or a
+ * state root or repository in the temp directory) only mirrors inside the temp
+ * directory, links resolved. Every field passes the secret scanner before
+ * anything is written.
  */
 import { createHash } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { spawnSync } from './spawn-sync';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -35,6 +37,7 @@ import { firstTitle } from './markdown-sections';
 import { scan, type Finding } from './redact-engine';
 import type { ResultCodeName } from './result-codes';
 import { resolveStateRoot } from './state-root';
+import { isSecurityFinding, REDACTED_FINDING, REDACTED_REASON, REDACTED_WORDS } from './security-findings';
 
 export const OUTCOMES = ['approved', 'rejected', 'pending', 'standing'] as const;
 export type Outcome = typeof OUTCOMES[number];
@@ -50,7 +53,8 @@ export interface ApprovalRow {
 }
 export type MirrorSource = 'GSTACK_APPROVALS_DIR' | 'captain drive' | 'project-user drive';
 /** `mirror` is written and read; `read_also` are the other mirror roots' copies, read so a row mirrored under an earlier rule stays visible. */
-export interface StoreLocation { file: string; mirror?: string; mirror_source?: MirrorSource; read_also?: string[]; branch: string; slug: string; ephemeral: boolean }
+/** `mirror_refused` names a mirror a fixture would have written outside its temp root; the write then fails and nothing reaches that Drive. */
+export interface StoreLocation { file: string; mirror?: string; mirror_source?: MirrorSource; read_also?: string[]; mirror_refused?: string; branch: string; slug: string; ephemeral: boolean }
 export interface RecordError { code: ResultCodeName; message: string }
 export type Env = NodeJS.ProcessEnv;
 
@@ -72,6 +76,26 @@ function contained(root: string, file: string): boolean {
   return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
 }
 
+/** Where a path really lands: the nearest existing ancestor with its links resolved, plus the rest of the path. */
+function resolvedTarget(p: string): string {
+  const rest: string[] = [];
+  for (let cur = path.resolve(p); ; cur = path.dirname(cur)) {
+    try { return path.join(fs.realpathSync(cur), ...rest.reverse()); } catch { if (path.dirname(cur) === cur) return path.resolve(p); rest.push(path.basename(cur)); }
+  }
+}
+
+/**
+ * Why this run is a fixture, or undefined: under bun test, or with its state root or repository in the temp directory.
+ * A fixture's mirror must resolve inside that temp root, so a test or a probe in a scratch repository never writes
+ * the owner's real Drive (GST-3027: a review probe wrote approvals/fx/qa-fixture-*.jsonl into a project-user Drive).
+ */
+function fixtureReason(env: Env, stateRoot: string, toplevel: string | undefined, tmpRoot: string): string | undefined {
+  if (env.NODE_ENV === 'test') return 'running under bun test';
+  if (contained(tmpRoot, resolvedTarget(stateRoot))) return `the state root ${stateRoot} is a temporary fixture`;
+  if (toplevel && contained(tmpRoot, resolvedTarget(toplevel))) return `the repository ${toplevel} is a temporary fixture`;
+  return undefined;
+}
+
 /** Where this branch's record lives, and its mirror. */
 export function locate(o: { cwd: string; env: Env; branch?: string }): StoreLocation | RecordError {
   let branch = o.branch?.trim();
@@ -87,21 +111,30 @@ export function locate(o: { cwd: string; env: Env; branch?: string }): StoreLoca
   if (!contained(stateRoot, file)) return { code: 'APPROVAL_RECORD_INVALID', message: `record path escapes the state root: ${file}` };
   // Every mirror root this machine can see, best first; the first is written, the rest are read so a
   // row mirrored before the Captain created approvals/ (or under an explicit directory) stays visible.
-  const roots: Array<[MirrorSource, string]> = [];
+  let toplevel: string | undefined | null = null;
+  const repoTop = () => { if (toplevel === null) { const top = git(o.cwd, ['rev-parse', '--show-toplevel']); toplevel = top.status === 0 ? top.stdout.trim() : undefined; } return toplevel; };
+  let roots: Array<[MirrorSource, string]> = [];
   if (o.env.GSTACK_APPROVALS_DIR) roots.push(['GSTACK_APPROVALS_DIR', o.env.GSTACK_APPROVALS_DIR]);
   if (o.env.GSTACK_CAPY === '1' && o.env.GSTACK_APPROVALS_MIRROR !== '0') {
     const captain = captainApprovalsDir(o.env);
     if (captain) roots.push(['captain drive', captain]);
-    const top = git(o.cwd, ['rev-parse', '--show-toplevel']);
-    const folder = capyDriveFolder(o.env, top.status === 0 ? path.basename(top.stdout.trim()) : undefined);
+    const folder = capyDriveFolder(o.env, repoTop() ? path.basename(repoTop()!) : undefined);
     if (folder) roots.push(['project-user drive', path.join(path.dirname(folder), 'approvals')]);
   }
   const rel = path.join(slug, `${branchKey(branch)}.jsonl`);
   for (const [, root] of roots) if (!contained(root, path.join(root, rel))) return { code: 'APPROVAL_RECORD_INVALID', message: `mirror path escapes ${root}` };
-  const [chosen, ...rest] = roots;
+  let mirror_refused: string | undefined;
+  if (roots.length) {
+    const tmpRoot = resolvedTarget(os.tmpdir());
+    const fixture = fixtureReason(o.env, stateRoot, repoTop(), tmpRoot);
+    const escapes = ([, root]: [MirrorSource, string]) => !contained(tmpRoot, resolvedTarget(path.join(root, rel)));
+    if (fixture && escapes(roots[0]!)) mirror_refused = `mirror ${path.join(roots[0]![1], rel)} (${roots[0]![0]}) resolves to ${resolvedTarget(path.join(roots[0]![1], rel))}, outside the temp root ${tmpRoot}, and ${fixture}; a fixture never writes a real Drive, so point HOME or GSTACK_APPROVALS_DIR inside the fixture or set GSTACK_APPROVALS_MIRROR=0 (the local row is kept)`;
+    if (fixture) roots = roots.filter(r => !escapes(r));
+  }
+  const [chosen, ...rest] = mirror_refused ? [undefined, ...roots] : roots;
   return {
-    file, mirror: chosen ? path.join(chosen[1], rel) : undefined, mirror_source: chosen?.[0], read_also: rest.map(([, root]) => path.join(root, rel)),
-    branch, slug, ephemeral: o.env.GSTACK_EPHEMERAL === '1',
+    file, mirror: chosen ? path.join(chosen[1], rel) : undefined, mirror_source: chosen?.[0], read_also: rest.map(r => path.join(r![1], rel)),
+    ...(mirror_refused ? { mirror_refused } : {}), branch, slug, ephemeral: o.env.GSTACK_EPHEMERAL === '1',
   };
 }
 
@@ -153,10 +186,24 @@ function validDate(d: string): boolean {
 
 export interface NewRow { ask: string; words: string; by: string; scope: string; pending?: string; outcome?: string; date?: string; source?: string }
 
-/** An autoplan run id as gstack-autoplan mints it: the run directory's name, a hyphen, then a 14-digit time stamp. */
-const MINTED_RUN_ID = /^[A-Za-z0-9._-]{1,64}-\d{14}$/;
-/** The part of a minted run id the exemption covers: the 14-digit stamp and, when the name ends in a thread code, its digits. */
-const RUN_ID_STAMP = /(?:(?<!\d)\d{1,6}-)?\d{14}$/;
+/**
+ * An autoplan run id as gstack-autoplan mints it: the run directory's name, a hyphen, six random letters (since GST-3015), a hyphen, then a
+ * 14-digit time stamp; or as interactive /autoplan minted it before #4402: the branch name, a hyphen, then a YYYYMMDD-HHMMSS stamp that is
+ * a real calendar time.
+ */
+const MINTED_RUN_ID = /^[A-Za-z0-9._-]{1,64}-(?:\d{14}|\d{4}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])-(?:[01]\d|2[0-3])[0-5]\d[0-5]\d)$/;
+/** The part of a minted run id the exemption covers: the stamp and, when the name ends in a thread code or issue number, its digits. */
+const RUN_ID_STAMP = /(?:(?<!\d)\d{1,6}-)?(?:\d{14}|\d{8}-\d{6})$/;
+
+/**
+ * A fix-check round grant's scope as gstack-approvals round-grant writes it (lib/review-round-grant.ts): its stop= token is the
+ * /ship run id, often a PR number, a dash and a short sha (`507-7192673`), which pii.phone.e164 reads as a phone number
+ * (harness-evals #507). Only a phone finding that starts inside that token of the scope field is skipped; the reason, the words
+ * and every other field, a grant-shaped excerpt pasted into them included, are scanned as usual.
+ */
+const GRANT_STOP_SCOPE = /^review_round_grant [0-9a-f]{40} pr=[1-9]\d* kind=fix-check stop=([\w.:-]{1,120}) findings=\S+$/;
+/** A rendered table row whose Covers cell, the one before Still pending, is a whole GRANT_STOP_SCOPE. */
+const GRANT_STOP_ROW = /^\| .* \| (review_round_grant [0-9a-f]{40} pr=[1-9]\d* kind=fix-check stop=)([\w.:-]{1,120}) findings=[^\s|]+ \| (?:[^|\\]|\\.)* \|$/d;
 
 /**
  * Validate and secret-scan one row; the error names the field and rule, never the text. `runId` (import only) is a
@@ -181,7 +228,10 @@ export function buildRow(input: NewRow, branch: string, now = new Date(), runId?
     const at = runId && MINTED_RUN_ID.test(runId.id) ? runId.at[k as 'ask' | 'source'] : undefined;
     const stamp = at === undefined ? 0 : RUN_ID_STAMP.exec(runId!.id)![0].length;
     const inRunId = (f: Finding) => at !== undefined && (f.id === 'pii.phone.e164' || f.id === 'pii.cc') && f.line === 1 && f.col - 1 >= at + runId!.id.length - stamp && f.col - 1 < at + runId!.id.length;
-    const hits = s.findings.filter(f => (f.severity === 'HIGH' || f.severity === 'MEDIUM') && !inRunId(f));
+    const stop = k === 'scope' ? GRANT_STOP_SCOPE.exec(v) : null;
+    const stopAt = stop ? v.indexOf(' stop=') + ' stop='.length : -1;
+    const inStopRun = (f: Finding) => !!stop && f.id === 'pii.phone.e164' && f.line === 1 && f.col - 1 >= stopAt && f.col - 1 < stopAt + stop[1]!.length;
+    const hits = s.findings.filter(f => (f.severity === 'HIGH' || f.severity === 'MEDIUM') && !inRunId(f) && !inStopRun(f));
     if (s.oversize || hits.length) return { code: 'APPROVAL_RECORD_SECRET', message: `field ${k}: ${s.oversize ? 'oversize input' : [...new Set(hits.map(f => f.id))].join(', ')}` };
   }
   const id = 'a-' + createHash('sha256').update([fields.source, date, fields.ask, fields.words, fields.by].join('\u0000')).digest('hex').slice(0, 12);
@@ -189,6 +239,7 @@ export function buildRow(input: NewRow, branch: string, now = new Date(), runId?
 }
 
 function writeMirror(loc: StoreLocation, rows: ApprovalRow[]): RecordError | undefined {
+  if (loc.mirror_refused) return { code: 'APPROVAL_RECORD_WRITE_FAILED', message: loc.mirror_refused };
   if (!loc.mirror) return undefined;
   try {
     fs.mkdirSync(path.dirname(loc.mirror), { recursive: true, mode: 0o700 });
@@ -292,6 +343,14 @@ export function pathLabels(text: string): string {
   });
 }
 
+/** A ruled_note or gate_disposition row for a security-class finding, as the full table may show it: no fingerprint, reason or owner words (GST-3076). */
+function publicRow(r: ApprovalRow): ApprovalRow {
+  const fp = /^(?:ruled_note|gate_disposition) (\S+) /.exec(r.scope)?.[1];
+  if (!fp || !isSecurityFinding(fp)) return r;
+  const ask = r.ask.indexOf(': ') < 0 ? r.ask : r.ask.slice(0, r.ask.indexOf(': '));
+  return { ...r, ask: `${ask.replace(fp, REDACTED_FINDING)}: ${REDACTED_REASON}`, scope: r.scope.replace(fp, REDACTED_FINDING), words: REDACTED_WORDS };
+}
+
 export function renderRecord(read: ReadResult, loc: StoreLocation, o: { heading?: boolean; mode?: 'full' | 'redacted' } = {}): string {
   const head = o.heading === false ? [] : ['## Approvals', ''];
   if (o.mode === 'redacted' && read.rows.length) {
@@ -302,17 +361,52 @@ export function renderRecord(read: ReadResult, loc: StoreLocation, o: { heading?
   if (read.state === 'unavailable') return [...head, `Record unavailable on this machine: no approval record for branch ${cell(loc.branch)} here, and the state root is ephemeral with no Drive mirror, so this is not proof that nothing was approved.`, ''].join('\n');
   if (!read.rows.length) return [...head, `No approvals recorded for branch ${cell(loc.branch)}.`, ''].join('\n');
   const lines = [APPROVALS_TABLE_HEADER, '|---|---|---|---|---|---|'];
-  for (const r of read.rows) {
+  for (const row of read.rows) {
+    const r = publicRow(row);
     const outcome = r.outcome === 'standing' ? 'standing approval' : r.outcome;
     lines.push(`| ${r.date} | ${cell(pathLabels(r.ask))} | “${cell(r.words, 280)}” (${cell(r.by)}) | ${outcome} | ${cell(pathLabels(r.scope))} | ${cell(pathLabels(r.pending))} |`);
   }
   return [...head, ...lines, '', `Source: gstack-approvals record for ${cell(loc.branch)} ${APPROVALS_FOOTER_END}`, ''].join('\n');
 }
 
-interface DecisionLike { id?: string; title?: string; status?: string; chosen?: string | null; recommended?: string | null; gate_rev?: number; answered_at?: string; answered_by?: string; reply?: string; owner_reply?: string; answer_words?: string; words_by?: string; carried_from?: string; label?: string; chosen_text?: string;
+/**
+ * Where a rendered Approvals table shows a fix-check grant's stop= run id (GST-3246): the 1-based line and column span of that token in
+ * each row whose Covers cell is a whole GRANT_STOP_SCOPE, inside a table that opens with APPROVALS_TABLE_HEADER and its rule line and
+ * closes on renderRecord's Source footer. gstack-post skips a pii.phone.e164 finding only inside such a span, so the same digits in any
+ * other cell, in prose or in a table without that footer still report.
+ */
+export function approvalsGrantStopSpans(text: string): Array<{ line: number; from: number; to: number }> {
+  const lines = text.split('\n');
+  const spans: Array<{ line: number; from: number; to: number }> = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i] !== APPROVALS_TABLE_HEADER || lines[i + 1] !== '|---|---|---|---|---|---|') continue;
+    let end = i + 2;
+    while (end < lines.length && lines[end]!.startsWith('| ')) end++;
+    const footer = lines[end + 1] ?? '';
+    if (lines[end] !== '' || !footer.startsWith('Source: gstack-approvals record for ') || !footer.endsWith(APPROVALS_FOOTER_END)) continue;
+    for (let j = i + 2; j < end; j++) {
+      const m = GRANT_STOP_ROW.exec(lines[j]!);
+      if (m) spans.push({ line: j + 1, from: m.indices![2]![0] + 1, to: m.indices![2]![1] });
+    }
+    i = end + 1;
+  }
+  return spans;
+}
+
+interface DecisionLike { id?: string; run?: string; title?: string; status?: string; chosen?: string | null; recommended?: string | null; gate_rev?: number; answered_at?: string; answered_by?: string; reply?: string; owner_reply?: string; answer_words?: string; words_by?: string; carried_from?: string; label?: string; chosen_text?: string;
   carried_gate_from?: string; carried_gate_rev?: number; carried_answered_by?: string; carried_under?: string; carry_check?: string }
 
 const stripRef = (t: string) => t.replace(/\s*\[[^\]]*\]\s*$/, '').trim();
+
+/**
+ * The run id an autoplan run directory answers to: run.json's, else the newest run its gate rows carry (an interactive
+ * /autoplan writes no run.json and appends every run to the same directory, #4402), else the directory name.
+ */
+export function autoplanRunId(runDir: string, run: Record<string, any>, rows: readonly { run?: unknown }[]): string {
+  if (run.run ?? run.id) return String(run.run ?? run.id);
+  const newest = [...rows].reverse().find(r => typeof r.run === 'string' && r.run.length > 0)?.run;
+  return typeof newest === 'string' ? newest : path.basename(runDir);
+}
 
 /**
  * Rows for every answered gate in an autoplan run: one row per answer event (gate_rev, time, answerer), covering
@@ -337,8 +431,9 @@ export function importAutoplan(runDir: string, branch: string, by?: string): App
   const plan = reviewedPlan(runDir, run);
   const planTitle = firstTitle(plan.text) ?? 'the plan';
   const planSha = plan.sha;
-  const runId = String(run.run ?? run.id ?? path.basename(runDir));
-  const answered = rows.filter(r => r.status && r.status !== 'pending' && r.answered_at && !r.carried_from);
+  const runId = autoplanRunId(runDir, run, rows);
+  const own = (run.run ?? run.id) || !rows.some(r => r.run === runId) ? rows : rows.filter(r => r.run === runId);
+  const answered = own.filter(r => r.status && r.status !== 'pending' && r.answered_at && !r.carried_from);
   if (!answered.length) return { code: 'APPROVAL_IMPORT_UNANSWERED', message: `no answered gate in ${runDir}` };
   const groups = new Map<string, DecisionLike[]>();
   for (const r of answered) {
@@ -353,7 +448,7 @@ export function importAutoplan(runDir: string, branch: string, by?: string): App
     const outcome: Outcome = !p1 ? 'pending' : p1.chosen === 'a' || p1.chosen === 'b' ? 'approved' : p1.chosen === 'e' ? 'rejected' : 'pending';
     const items = group.filter(r => r !== p1);
     const changed = items.filter(r => r.chosen && r.recommended && r.chosen !== r.recommended);
-    const stillPending = rows.filter(r => r.gate_rev === rev && r.status === 'pending');
+    const stillPending = own.filter(r => r.gate_rev === rev && r.status === 'pending');
     const answerer = first.answered_by ?? 'unknown';
     const carried = p1?.carried_gate_from ? p1 : undefined;
     const relayed = carried?.carried_answered_by && carried.carried_answered_by !== 'human' ? `, relayed by ${carried.carried_answered_by}` : '';

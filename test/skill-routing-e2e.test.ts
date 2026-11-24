@@ -73,7 +73,7 @@ if (evalsEnabled && process.env.EVALS_TIER) {
 function installSkills(tmpDir: string) {
   const skillDirs = [
     '', // root gstack SKILL.md
-    'qa', 'qa-only', 'ship', 'review', 'plan-ceo-review', 'autoplan',
+    'qa', 'qa-only', 'ship', 'review', 'plan-ceo-review', 'plan-eng-review', 'autoplan',
     'plan-design-review', 'design-review', 'design-consultation', 'retro',
     'document-release', 'office-hours', 'browse', 'setup-browser-cookies',
     'gstack-upgrade', 'humanizer',
@@ -95,7 +95,8 @@ function installSkills(tmpDir: string) {
 
   // The names-only catalog keeps new CLI built-ins from changing the candidate
   // set. Descriptions still choose the skill; no request-to-skill answer key.
-  // The routing instruction is the one gstack ships (bin/gstack-skill-start),
+  // The routing instruction is the one gstack offered for CLAUDE.md
+  // (test/fixtures/claude-md-skill-routing.md),
   // without its per-skill rule list. These journey tests exist to catch skill
   // DESCRIPTION regressions (their touchfiles key on */SKILL.md.tmpl): with a
   // lookup table in context, a badly regressed frontmatter description still
@@ -241,7 +242,7 @@ describeE2E('Skill Routing E2E — Developer Journey', () => {
       spawnSync('git', ['commit', '-m', 'initial'], { cwd: tmpDir, stdio: 'pipe', timeout: 5000 });
 
       const testName = 'journey-plan-eng';
-      const expectedSkill = 'autoplan';
+      const expectedSkill = 'plan-eng-review';
       const result = await runSkillTest({
         prompt: "I wrote up a plan for the waitlist app in plan.md. Can you take a look at the architecture and make sure I'm not missing any edge cases or failure modes before I start coding?",
         workingDirectory: tmpDir,

@@ -2,7 +2,8 @@
 /**
  * gstack-brain-context-load — V1 retrieval surface (Lane C).
  *
- * Called from the gstack preamble at every skill start. Reads the active skill's
+ * Called from bin/gstack-skill-start when the active skill's SKILL.md declares
+ * `gbrain.context_queries:` and gbrain is configured. Reads the active skill's
  * `gbrain.context_queries:` frontmatter (Layer 2) or falls back to a generic
  * salience block (Layer 1). Dispatches each query by kind:
  *
@@ -540,7 +541,8 @@ async function main(): Promise<void> {
   }
 
   const failures = results.filter((r) => r.failed);
-  if (!args.quiet && failures.length > 0 && gbrainAvailable() && existsSync(join(gbrainConfigDir(), "config.json"))) {
+  const configDir = gbrainConfigDir();
+  if (!args.quiet && failures.length > 0 && gbrainAvailable() && configDir && existsSync(join(configDir, "config.json"))) {
     const reasons = [...new Set(failures.map((r) => r.reason))].join("; ");
     console.error(`brain context: ${failures.length}/${results.length} queries failed (${reasons})`);
   }

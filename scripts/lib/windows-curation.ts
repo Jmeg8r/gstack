@@ -112,6 +112,10 @@ export const KNOWN_WINDOWS_INCOMPATIBLE: Array<{ file: string; reason: string }>
     reason: 'executes registered native documentation callbacks with their real Linux inotify write observer before the model boundary',
   },
   {
+    file: 'test/docsync-stopped-audit-snapshot.test.ts',
+    reason: 'spawns the installed bin/gstack-docs-candidate shebang script directly (Windows CreateProcess does not parse shebangs)',
+  },
+  {
     file: 'test/setup-gbrain-fixture.test.ts',
     reason: 'the fixture invokes real POSIX detector/verifier helpers through executable shebang wrappers',
   },
@@ -309,14 +313,26 @@ export const KNOWN_WINDOWS_INCOMPATIBLE: Array<{ file: string; reason: string }>
     file: 'test/gstack-ship-receipt.test.ts',
     reason: 'spawns bin/gstack-ship-receipt and bin/gstack-artifact (shebangs) plus a #!/bin/sh gh shim through test/helpers/restamp-fixture.ts',
   },
+  {
+    file: 'test/ship-receipt-voice-blockers.test.ts',
+    reason: 'spawns bin/gstack-review-scope and bin/gstack-ship-receipt (shebangs) through test/helpers/restamp-fixture.ts runBin, like test/gstack-ship-receipt.test.ts',
+  },
   // Field list 2, W1 (shared merge queue): same fixture helpers, same shebang spawns.
   {
     file: 'test/gstack-ship-queue.test.ts',
     reason: 'spawns bin/gstack-ship-queue (shebang) and a #!/bin/sh gh shim through test/helpers/restamp-fixture.ts and test/helpers/ship-queue-fixture.ts',
   },
   {
+    file: 'test/ship-queue-trial-fetch.test.ts',
+    reason: 'spawns bin/gstack-ship-queue (shebang), a #!/bin/sh gh shim and a #!/bin/sh upload-pack wrapper through test/helpers/restamp-fixture.ts and test/helpers/ship-queue-fixture.ts, as test/ship-queue-ready-fresh-base.test.ts does',
+  },
+  {
     file: 'test/ship-queue-ready-fresh-base.test.ts',
     reason: 'spawns bin/gstack-ship-queue (shebang) and a #!/bin/sh gh shim through test/helpers/restamp-fixture.ts and test/helpers/ship-queue-fixture.ts (windows-scoped-shard, run 42720453184)',
+  },
+  {
+    file: 'test/ship-queue-ready-pr-base.test.ts',
+    reason: 'spawns bin/gstack-ship-queue (shebang) and a #!/bin/sh gh shim through test/helpers/restamp-fixture.ts and test/helpers/ship-queue-fixture.ts, as test/ship-queue-ready-fresh-base.test.ts does',
   },
   {
     file: 'crew/test/release-gate-workflow.test.ts',
@@ -409,6 +425,14 @@ export const KNOWN_WINDOWS_INCOMPATIBLE: Array<{ file: string; reason: string }>
     reason: 'drives bin/gstack-ship-release, gstack-evidence, gstack-ci-carry and gstack-pregate (shebangs) through test/helpers/ship-bin-fixture.ts like test/ship-release.test.ts; windows-latest fails every bin case at the first spawn (windows-scoped-shard, run 41607840098)',
   },
   {
+    file: 'test/ship-preflight-carry-stop.test.ts',
+    reason: 'drives bin/gstack-ship-preflight, gstack-ci-carry, gstack-evidence and gstack-pregate (shebangs) through test/helpers/ship-bin-fixture.ts like test/ship-ci-carry.test.ts, which windows-latest fails at the first bin spawn (windows-scoped-shard, run 41607840098)',
+  },
+  {
+    file: 'test/ship-preflight-carry-bound-and-deps.test.ts',
+    reason: 'drives bin/gstack-ship-preflight, gstack-ship-release, gstack-ci-carry, gstack-evidence and gstack-pregate (shebangs) through test/helpers/ship-bin-fixture.ts like test/ship-preflight-carry-stop.test.ts, which windows-latest fails at the first bin spawn (windows-scoped-shard, run 41607840098)',
+  },
+  {
     file: 'test/ship-rereview-triggers.test.ts',
     reason: 'drives bin/gstack-ship-release, gstack-docs-candidate and gstack-wtree (shebangs) through test/helpers/ship-bin-fixture.ts like test/ship-release.test.ts; windows-latest fails every bin case at the first spawn (windows-free-shard 6, run 41193336209)',
   },
@@ -437,12 +461,52 @@ export const KNOWN_WINDOWS_INCOMPATIBLE: Array<{ file: string; reason: string }>
     reason: 'drives bin/gstack-ship-release, gstack-evidence, gstack-ship-policy and gstack-pregate (shebangs) through test/helpers/ship-bin-fixture.ts like test/ship-accept-head-policy.test.ts, which windows-latest fails at the first bin spawn (windows-scoped-shard, run 41607840098)',
   },
   {
+    file: 'test/ship-accept-base-moved.test.ts',
+    reason: 'drives bin/gstack-ship-release, gstack-ci-carry, gstack-evidence and gstack-pregate (shebangs) through test/helpers/ship-bin-fixture.ts like test/ship-accept-record-timeout.test.ts, which windows-latest fails at the first bin spawn (windows-scoped-shard, run 41607840098)',
+  },
+  {
     file: 'test/ship-mechanical-retake.test.ts',
     reason: 'drives bin/gstack-ship-release, gstack-review-plan, gstack-ship-receipt, gstack-docs-candidate and gstack-wtree (shebangs) through test/helpers/ship-bin-fixture.ts like test/ship-finish-stack-parent.test.ts; windows-latest fails every case at the first bin spawn (windows-scoped-shard, run 42156939158)',
   },
   {
     file: 'test/ship-receipt-carry-mixed.test.ts',
     reason: 'drives bin/gstack-ship-receipt, gstack-ship-release, gstack-docs-candidate and gstack-wtree (shebangs) through test/helpers/ship-bin-fixture.ts like test/ship-mechanical-retake.test.ts; windows-latest fails every case at the first bin spawn (windows-scoped-shard, run 42167292675)',
+  },
+  {
+    file: 'test/ship-base-side-masks.test.ts',
+    reason: 'drives bin/gstack-ship-release, gstack-docs-candidate and gstack-wtree (shebangs) through test/helpers/ship-bin-fixture.ts like test/ship-rereview-triggers.test.ts; windows-latest fails every case at the first bin spawn (windows-scoped-shard, run 41950236362)',
+  },
+  {
+    file: 'test/capy-host-publish.test.ts',
+    reason: 'drives bin/gstack-ship-receipt, gstack-post, gstack-approvals and gstack-review-log (shebangs) plus a #!/bin/sh gh shim through test/helpers/ship-bin-fixture.ts and restamp-fixture.ts, like test/round-cap-granted-stop.test.ts',
+  },
+  {
+    file: 'test/ship-run-record.test.ts',
+    reason: 'drives bin/gstack-ship-preflight, gstack-ship-run, gstack-ship-receipt, gstack-approvals, gstack-review-log, gstack-lease and gstack-skill-end (shebangs) through test/helpers/ship-bin-fixture.ts like test/round-cap-granted-stop.test.ts; a bin spawn fails on windows-latest the same way (first-bin-spawn failure class of test/ship-uid-sidecar.test.ts)',
+  },
+  {
+    file: 'test/fix-check-hunks-restamp.test.ts',
+    reason: 'runs bin/gstack-review-dispatch (a shebang) and a git fixture like test/review-pass-program.test.ts; a bin spawn fails on windows-latest the same way (first-bin-spawn failure class of test/ship-uid-sidecar.test.ts)',
+  },
+  {
+    file: 'test/fix-check-clearing.test.ts',
+    reason: 'drives bin/gstack-ship-receipt, gstack-approvals, gstack-review-log, gstack-review-plan, gstack-review-scope, gstack-review-read and gstack-ship-release (shebangs) through test/helpers/ship-bin-fixture.ts like test/round-cap-granted-stop.test.ts; a bin spawn fails on windows-latest the same way (first-bin-spawn failure class of test/ship-uid-sidecar.test.ts)',
+  },
+  {
+    file: 'test/round-cap-ruling-path.test.ts',
+    reason: 'drives bin/gstack-ship-receipt, gstack-approvals, gstack-review-log, gstack-review-plan, gstack-review-scope, gstack-ship-run and gstack-ship-release (shebangs) through test/helpers/ship-bin-fixture.ts like test/fix-check-clearing.test.ts, and reads /proc for run owners; a bin spawn fails on windows-latest the same way (first-bin-spawn failure class of test/ship-uid-sidecar.test.ts)',
+  },
+  {
+    file: 'test/ship-receipt-claim-fail-closed.test.ts',
+    reason: 'drives bin/gstack-ship-preflight, gstack-ship-receipt, gstack-approvals and gstack-review-log (shebangs) through test/helpers/ship-bin-fixture.ts like test/round-cap-granted-stop.test.ts; a bin spawn fails on windows-latest the same way (first-bin-spawn failure class of test/ship-uid-sidecar.test.ts)',
+  },
+  {
+    file: 'test/ship-receipt-write-keeps-earlier-runs.test.ts',
+    reason: 'puts a #!/bin/sh gh shim on a PATH it joins for bin/gstack-ship-receipt write; windows-latest cannot launch an extensionless shell script, like the gh shim in test/ship-queue-land.test.ts',
+  },
+  {
+    file: 'test/round-cap-granted-stop.test.ts',
+    reason: 'drives bin/gstack-ship-receipt, gstack-approvals, gstack-review-plan, gstack-review-log, gstack-review-scope and gstack-ship-release (shebangs) through test/helpers/ship-bin-fixture.ts like test/ship-finish-fixed-links.test.ts; a bin spawn fails on windows-latest the same way (first-bin-spawn failure class of test/ship-uid-sidecar.test.ts)',
   },
   {
     file: 'test/ship-uid-sidecar.test.ts',
@@ -463,6 +527,26 @@ export const KNOWN_WINDOWS_INCOMPATIBLE: Array<{ file: string; reason: string }>
   {
     file: 'test/ship-finish-fixed-links.test.ts',
     reason: 'drives bin/gstack-ship-release, gstack-approvals, gstack-review-log, gstack-docs-candidate and gstack-wtree (shebangs) through test/helpers/ship-bin-fixture.ts like test/ship-finish-ruled-notes.test.ts; windows-latest fails every case at the first bin spawn (windows-free-shard 3, run 42593329215)',
+  },
+  {
+    file: 'test/review-pass-program.test.ts',
+    reason: 'split from test/review-pass.test.ts, which Windows never ran (its POSIX mode-bit check): runs bin/gstack-review-dispatch (a shebang) and bash git fixtures through test/helpers/review-pass-harness.ts',
+  },
+  {
+    file: 'test/review-pass-program-steps.test.ts',
+    reason: 'split from test/review-pass.test.ts, which Windows never ran (its POSIX mode-bit check): runs bin/gstack-review-dispatch (a shebang) and bash git fixtures through test/helpers/review-pass-harness.ts',
+  },
+  {
+    file: 'test/review-pass-shared-machine.test.ts',
+    reason: 'split from test/review-pass.test.ts, which Windows never ran (its POSIX mode-bit check): runs bin/gstack-review-dispatch (a shebang) and bash git fixtures through test/helpers/review-pass-harness.ts',
+  },
+  {
+    file: 'test/review-pass-step11.test.ts',
+    reason: 'split from test/review-pass.test.ts, which Windows never ran (its POSIX mode-bit check): runs bin/gstack-review-dispatch (a shebang) and bash git fixtures through test/helpers/review-pass-harness.ts',
+  },
+  {
+    file: 'test/review-pass-voice-failures.test.ts',
+    reason: 'split from test/review-pass.test.ts, which Windows never ran (its POSIX mode-bit check): runs bin/gstack-review-dispatch (a shebang) and bash git fixtures through test/helpers/review-pass-harness.ts',
   },
 ];
 

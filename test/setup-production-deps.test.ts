@@ -40,11 +40,11 @@ function sliceFunction(source: string, name: string): string {
   return source.slice(start + 1, end + 3);
 }
 
-/** install_runtime_deps and the helpers it calls, sliced out of setup in definition order. */
+/** install_runtime_deps and the helpers it calls, sliced out of setup in definition order, after the lock helper setup sources. */
 function depsFunctions(setup: string): string {
   const names = ['bun_cmd', '_deps_role', '_deps_has_dev', '_deps_verified', '_deps_lock', '_deps_unlock', '_deps_recover',
     '_deps_migration_start', '_deps_migration_finish', 'install_runtime_deps'];
-  return names.map((n) => (n === '_deps_unlock' ? setup.split('\n').find((l) => l.startsWith('_deps_unlock() {'))! + '\n' : sliceFunction(setup, n))).join('\n');
+  return `. ${JSON.stringify(path.join(ROOT, 'bin', 'gstack-lock.sh'))}\n` + names.map((n) => (n === '_deps_unlock' ? setup.split('\n').find((l) => l.startsWith('_deps_unlock() {'))! + '\n' : sliceFunction(setup, n))).join('\n');
 }
 
 /** A git repository marked as a contributor's checkout (what bin/dev-setup writes). */
@@ -130,6 +130,32 @@ describe.skipIf(process.platform === 'win32')('setup installs production depende
     expect(failed.status).toBe(4);
     expect(failed.stdout).not.toContain('AFTER');
     expect(stub3.calls()).toEqual(['install --frozen-lockfile', 'install']);
+  });
+
+  // #4288: setup runs under umask 077 for its own state and logs. Bun extracts
+  // packages into its shared cache with the caller's umask, and later installs of
+  // unrelated projects hardlink those files, so the installs run under 022.
+  test('install_runtime_deps installs under umask 022 on every branch while setup keeps 077 (#4288)', () => {
+    const umaskBun = (base: string) => {
+      const log = path.join(base, 'umasks');
+      const bun = path.join(base, 'umask-bun');
+      fs.writeFileSync(bun, `#!/usr/bin/env bash\numask >> ${JSON.stringify(log)}\nexec ${JSON.stringify(stubBun(base).bun)} "$@"\n`, { mode: 0o755 });
+      return { bun, umasks: () => fs.readFileSync(log, 'utf-8').trim().split('\n') };
+    };
+    const run = (base: string, env: Record<string, string>) => {
+      const stub = umaskBun(base);
+      const r = runBashScript(`umask 077\n${script(stub.bun, 'install_runtime_deps')}\necho "after=$(umask)"\n`, { cwd: base, env: { ...process.env, ...env } });
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.stdout).toContain('after=0077');
+      return stub.umasks();
+    };
+    expect(run(tempBase(), { FROZEN_RC: '0' })).toEqual(['0022']);
+    expect(run(tempBase(), { FROZEN_RC: '1' })).toEqual(['0022', '0022', '0022']);
+    const contributor = tempBase();
+    markContributor(contributor);
+    fs.mkdirSync(path.join(contributor, 'node_modules', 'typescript'), { recursive: true });
+    expect(run(contributor, { FROZEN_RC: '1' })).toEqual(['0022', '0022']);
+    expect(setup).toMatch(/\(\n\s+umask 022\n\s+cd "\$SOURCE_GSTACK_DIR"\n\s+if \[ -n "\$_PLAYWRIGHT_PLATFORM_OVERRIDE" \]/);
   });
 
   test('every bun install in setup goes through install_runtime_deps', () => {

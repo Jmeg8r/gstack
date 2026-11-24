@@ -254,9 +254,11 @@ by rename, prune) and reclaim (reread, then delete only the record judged
 stale) run under one lock in the lease directory, a `.lock` directory whose
 `owner` file names its holder's pid and start identity, so a renewal is never
 deleted and a live lease never disappears from a concurrent scan. The lock is a
-directory because `mkdir` is atomic on every host, while Git Bash on Windows
-cannot `ln -s` to a target that does not exist (#3330). A taker publishes a
-claim before its `mkdir` and renames it in as the owner after, so an ownerless
+directory taken with `gstack_lock_take` (`bin/gstack-lock.sh`), which creates
+the `owner` file with O_EXCL, because `mkdir`'s exit status is no lock on
+Ubuntu 26.04's uutils `mkdir` and Git Bash on Windows cannot `ln -s` to a
+target that does not exist (#3330). A taker publishes a claim before its
+`mkdir` and removes it only after its owner file is written, so an ownerless
 lock is broken only once no claimant lives and the lock is at least 2 s old
 and unchanged while checked, which keeps a taker between its two steps safe.
 A claim that records no start identity is abandoned after 2 minutes, so a
@@ -536,7 +538,8 @@ When the session starts from the Drive skill (a bootstrapper outside the
 checkout), the file also exports `GSTACK_PREFERENCES_FILE`, the path of
 `preferences.yaml` beside that skill's SKILL.md, which the `GSTACK_LAUNCH` line
 leaves out; `gstack-models resolve --role agent` reads it
-([your model preference](model-policy.md#your-model-preference)).
+([your model preference](model-policy.md#your-model-preference)), and
+`gstack-telemetry-tier` reads its Capy telemetry opt-in ([privacy](privacy.md)).
 The file is part of the ok verdict: a passing run that cannot write it exits 1
 with `gstack: fail launch-file — could not write the launch file <path>; fix:
 make <dir> writable, or set GSTACK_STATE_ROOT to a writable directory

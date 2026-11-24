@@ -9,7 +9,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { buildRow, locate, type ApprovalRow } from '../lib/approval-record';
-import { exemptReason, finishPlan, landPlan, parsePlanLine, planMode, planRecordId, publicPlanLine, readyPlan, resolvePlan } from '../lib/plan-record';
+import { exemptReason, finishPlan, finishPlanLine, landPlan, parsePlanLine, planMode, planRecordId, publicPlanLine, readyPlan, recordFinishPlan, resolvePlan } from '../lib/plan-record';
 import { planBinding } from '../lib/ship-audit';
 import { loadReady, persist, repoIdentity } from '../crew/lib/ship-queue-train-record';
 
@@ -40,6 +40,41 @@ function fixture(files: Record<string, Array<Partial<ApprovalRow> & { ask: strin
   }
   return { cwd, env, ids };
 }
+
+describe('an interactive /autoplan run cited by its directory (#4402)', () => {
+  // Value: protects=a Plan line naming an interactive run's directory (no run.json) resolves through the run id its gate
+  //   rows carry, the id the import now records; fails_when=the path token still resolves to the shared directory name
+  //   "autoplan" and finds no row; why_new=path tokens were only resolved through run.json or the directory name; seam=none
+  test('a path token resolves through the run its decision rows carry', () => {
+    const id = 'feature-x-20261122-104500';
+    const f = fixture({ b: [{ ask: `Approve the plan (autoplan run ${id}, 1 decisions)`, source: `autoplan:${id}@gate_rev=1` }] });
+    const run = path.join(f.cwd, '.gstack', 'tmp', 'autoplan');
+    fs.mkdirSync(run, { recursive: true });
+    fs.writeFileSync(path.join(run, 'decisions.jsonl'), JSON.stringify({ run: id, id: `${id}-p1`, status: 'approved', gate_rev: 1 }) + '\n');
+    const r = resolvePlan(parsePlanLine('Plan: approved: .gstack/tmp/autoplan'), { cwd: f.cwd, env: f.env });
+    expect(r.ok ? 'resolved' : r.failure.message).toBe('resolved');
+  });
+
+  // Value: protects=a Plan line naming a shared interactive folder that holds more than one run resolves to no run, so a later /autoplan in
+  //   the same checkout, or an approval imported before #4402 under the shared id "autoplan", never turns an unchanged PR body's citation into
+  //   another plan's approval, while the run id still resolves;
+  //   fails_when=the folder token follows whichever run was written last; why_new=the case above holds a single run; seam=none
+  test('a path token whose folder holds several runs resolves to none of them; the run id still does', () => {
+    const a = 'feature-x-autoplan-20261122-104500', b = 'feature-y-autoplan-20261122-114500';
+    const f = fixture({ b: [{ ask: `Approve the plan (autoplan run ${a}, 1 decisions)`, source: `autoplan:${a}@gate_rev=1` }, { ask: `Approve the plan (autoplan run ${b}, 1 decisions)`, source: `autoplan:${b}@gate_rev=1` }],
+      old: [{ ask: 'Approve the plan (autoplan run autoplan, 1 decisions)', source: 'autoplan:autoplan@gate_rev=1' }] });
+    const run = path.join(f.cwd, '.gstack', 'tmp', 'autoplan');
+    fs.mkdirSync(run, { recursive: true });
+    fs.writeFileSync(path.join(run, 'decisions.jsonl'), [a, b].map(id => JSON.stringify({ run: id, id: `${id}-p1`, status: 'approved', gate_rev: 1 })).join('\n') + '\n');
+    const byFolder = resolvePlan(parsePlanLine('Plan: approved: .gstack/tmp/autoplan'), { cwd: f.cwd, env: f.env });
+    expect(byFolder.ok ? 'resolved' : byFolder.failure.code).toBe('PLAN_UNRESOLVED');
+    const byId = resolvePlan(parsePlanLine(`Plan: approved: ${a}`), { cwd: f.cwd, env: f.env });
+    expect(byId.ok ? 'resolved' : byId.failure.message).toBe('resolved');
+    fs.writeFileSync(path.join(run, 'decisions.jsonl'), JSON.stringify({ run: a, id: `${a}-p1`, status: 'approved', gate_rev: 1 }) + '\n{"run": "torn');
+    const torn = resolvePlan(parsePlanLine('Plan: approved: .gstack/tmp/autoplan'), { cwd: f.cwd, env: f.env });
+    expect(torn.ok ? 'resolved' : torn.failure.code).toBe('PLAN_UNRESOLVED');
+  });
+});
 
 describe('parsePlanLine', () => {
   test('reads approved, exempt and required, tolerating spacing and bold, and ignores fenced text', () => {
@@ -407,3 +442,50 @@ describe('public repos: the record-keyed Plan line and the machine-local key (GS
     expect(config('get', 'plan_record').stdout.trim()).toBe('warn');
   });
 });
+
+describe('bug-fix exemption wording and the plan finish recorded (GSTA-649, GSTA-617)', () => {
+  // Value: protects=a stated bug-fix exemption resolves whatever its wording, and a PR whose body has no Plan line takes the line
+  //   /ship finish resolved on this checkout, which land then accepts; fails_when=ready warns PLAN_EXEMPT_UNKNOWN or
+  //   PLAN_RECORD_MISSING after finish recorded Plan: exempt: bug fix; seam=exemptReason, finishPlan, readyPlan, landPlan
+  test('bug fix variants are the bug fix exemption', () => {
+    for (const r of ['bug fix with failing-first tests', 'Bugfix', 'bug-fix: retry backoff', 'bug fixes (R65)']) expect(exemptReason(r)).toBe('bug fix');
+    expect(exemptReason('bugfixing everything')).toBeNull();
+  });
+  // Value: protects=the READY note, which rides a public notes ref, never carries finish's raw --plan text: an approved line keeps only
+  //   the opaque record id, an exempt line only its listed reason; fails_when=a local run path, a row id or a note in parentheses
+  //   reaches the note's plan record; why_new=#4529 final review (GST-1955 family); seam=readyPlan's finish fallback, landPlan
+  test('the plan record finish supplies is redacted before it reaches the READY note (#4529)', () => {
+    const f = fixture({ y: [{ ask: 'R41 A1: cut a skill' }] });
+    const env = { ...f.env, GSTACK_PLAN_RECORD: 'require' };
+    const rowId = f.ids['R41 A1: cut a skill']!;
+    const approved = readyPlan({ cwd: f.cwd, env, body: 'Fixes a thing.', changed: ['lib/x.ts'], finishLine: `Plan: approved: ${rowId}` });
+    expect(approved.record).toMatchObject({ line: `Plan: approved (record ${planRecordId(rowId)})`, ref: planRecordId(rowId), state: 'approved', from: 'finish' });
+    expect(JSON.stringify(approved.record)).not.toContain(rowId);
+    expect(landPlan({ env, record: approved.record, body: 'Fixes a thing.' }).failure).toBeUndefined();
+    const exempt = readyPlan({ cwd: f.cwd, env, body: 'Fixes a thing.', changed: ['lib/x.ts'], finishLine: 'Plan: exempt: bug fix (see /home/user/.capy/work/ship-4529/run)' });
+    expect(exempt.record).toMatchObject({ line: 'Plan: exempt: bug fix', reason: 'bug fix', from: 'finish' });
+    expect(JSON.stringify(exempt.record)).not.toContain('/home/user');
+    const own = readyPlan({ cwd: f.cwd, env, body: `Plan: approved: ${rowId}`, changed: ['lib/x.ts'] });
+    expect(own.record).toMatchObject({ line: `Plan: approved: ${rowId}`, row_id: rowId });
+  });
+  test('ready reads the Plan line finish resolved when the body has none, and land accepts it', () => {
+    const f = fixture();
+    const env = { ...f.env, GSTACK_PLAN_RECORD: 'require' };
+    spawnSync('git', ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.com', 'commit', '-q', '--allow-empty', '-m', 'seed'], { cwd: f.cwd, timeout: 30_000 });
+    const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: f.cwd, encoding: 'utf8', timeout: 30_000 }).stdout.trim();
+    const fin = finishPlan(f.cwd, 'main', 'Plan: exempt: bug fix', env);
+    expect(fin.line).toBe('PLAN: exempt bug fix');
+    recordFinishPlan(f.cwd, fin.record);
+    const ready = readyPlan({ cwd: f.cwd, env, body: 'Fixes a thing.', changed: ['lib/x.ts'], finishLine: finishPlanLine(f.cwd, 'capy/feature', head) });
+    expect(ready.failure).toBeUndefined();
+    expect(ready.record).toMatchObject({ line: 'Plan: exempt: bug fix', state: 'exempt', reason: 'bug fix', from: 'finish' });
+    expect(ready.line).toContain("from /ship finish's plan record");
+    expect(landPlan({ env, record: ready.record, body: 'Fixes a thing.' }).failure).toBeUndefined();
+    expect(finishPlanLine(f.cwd, 'other-branch', head)).toBeUndefined();
+    expect(finishPlanLine(f.cwd, 'capy/feature', '0'.repeat(40))).toBeUndefined();
+    expect(readyPlan({ cwd: f.cwd, env, body: 'Plan: exempt: flaky', changed: ['lib/x.ts'], finishLine: finishPlanLine(f.cwd, 'capy/feature', head) }).record).toMatchObject({ reason: 'flaky' });
+    recordFinishPlan(f.cwd, undefined);
+    expect(finishPlanLine(f.cwd, 'capy/feature', head)).toBeUndefined();
+  });
+});
+

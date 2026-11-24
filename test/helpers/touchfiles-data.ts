@@ -205,7 +205,7 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
   // include question-tuning.ts and generate-ask-user-format.ts because the
   // AUTO_DECIDE preamble injection lives there and changes can flip the
   // regression test outcome between 'asked' and 'auto_decided'.
-  'plan-ceo-review-plan-mode':    [ 'ETHOS.md','bin/gstack-state-root.sh', 'lib/state-root.ts', 'test/helpers/plan-count-fixture.ts',
+  'plan-ceo-review-plan-mode':    [ 'ETHOS.md', 'bin/gstack-skill-load', 'scripts/resolvers/load-injection.ts','bin/gstack-state-root.sh', 'lib/state-root.ts', 'test/helpers/plan-count-fixture.ts',
     
     
     'test/fixtures/auto-decide-recommendation-361c.json',
@@ -307,13 +307,13 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
   'test/fixtures/native-auto-decide-ag.json', 'test/helpers/native-auto-decide.ts',  'test/fixtures/auto-decide-current-declaration-6aef.json',  'test/fixtures/auto-decide-explanatory-mode-043a.json', 'test/fixtures/auto-decide-explanatory-mode-749df.json', 'bin/gstack-skill-start', 'bin/gstack-skill-end', 'office-hours/**', 'ETHOS.md', 'scripts/resolvers/preamble/generate-completion-status.ts', 'scripts/resolvers/question-tuning.ts', 'scripts/resolvers/preamble/generate-ask-user-format.ts', 'scripts/resolvers/preamble.ts', 'scripts/resolvers/preamble-hoist.ts', 'test/helpers/claude-pty-runner.ts', 'test/helpers/pty/**',  'test/fixtures/design-ui-boxed-question.json', 'test/helpers/hermetic-skill-runtime.ts',  'test/helpers/pty-trust-dialog.ts',  'test/skill-e2e-office-hours-auto-mode.test.ts', 'test/helpers/plan-mode-evidence.ts',  'test/fixtures/eng-d2-truncated-border-0bcd.json',   'test/fixtures/eng-d1-clipped-elision-1579.json', 'test/fixtures/eng-d2-planning-prelude-4d.json', 'test/fixtures/ceo-approach-z-call.json', 'test/fixtures/ceo-approach-z-screen.txt',
      'test/fixtures/pty-companion-cli.ts', 'lib/fs-atomic.ts',    'test/helpers/plan-skill-questions.ts', 'test/fixtures/eng-auq-validation-error.json', 'test/fixtures/bash-directory-permission.json', 'test/fixtures/design-tasks-bash-permission.json',  'test/fixtures/read-permission.json',  'test/fixtures/ceo-split-e5-numbered-description-491.json',  'test/helpers/plan-skill-question-events.ts',  'test/helpers/plan-skill-question-hook-scope.ts', 'test/helpers/skill-census.ts',  'test/helpers/auto-decision-state.ts', 'test/helpers/autoplan-artifact-digest.ts', 'test/helpers/autoplan-artifact-permission.ts', 'test/helpers/autoplan-artifact-recorder.ts', 'test/helpers/dx-selected-navigation.ts', 'test/helpers/e2e-gate.ts', 'test/helpers/eng-cache-writer-decision.ts', 'test/helpers/owned-claude-transcript.ts', 'test/helpers/plan-count-artifacts.ts', 'test/helpers/plan-count-file-permission.ts', 'test/helpers/plan-count-fixture.ts', 'test/helpers/plan-count-pending-exit.ts', 'test/helpers/plan-count-pending-question.ts', 'test/helpers/plan-count-transcript.ts', 'test/helpers/plan-floor-review.ts', 'test/helpers/plan-floor-target.ts', 'test/helpers/plan-scope-selection.ts', 'test/helpers/plan-seed-submission.ts', 'test/helpers/pty-screen.ts', 'bin/gstack-context-recovery'],
   'office-hours-phase4-fork':     [ 'ETHOS.md','bin/gstack-state-root.sh', 'lib/state-root.ts', 'bin/gstack-skill-start', 'bin/gstack-skill-end', 'office-hours/**', 'scripts/resolvers/preamble/generate-ask-user-format.ts', 'scripts/resolvers/preamble/generate-completion-status.ts', 'scripts/resolvers/preamble.ts', 'scripts/resolvers/preamble-hoist.ts', 'scripts/resolvers/question-tuning.ts', 'test/helpers/llm-judge.ts', 'test/skill-e2e-office-hours-phase4.test.ts', 'bin/gstack-context-recovery' ],
-  'llm-judge-recommendation':     ['codex/**', 'test/helpers/llm-judge.ts', 'test/llm-judge-recommendation.test.ts', 'scripts/resolvers/preamble/generate-ask-user-format.ts', 'codex/SKILL.md.tmpl', 'scripts/resolvers/review-dashboard.ts', 'scripts/resolvers/plan-gates.ts', 'scripts/resolvers/spec-review.ts', 'scripts/resolvers/outside-voice-steps.ts', 'scripts/resolvers/review-scope.ts', 'scripts/resolvers/outside-voice.ts'],
+  'llm-judge-recommendation':     ['codex/**', 'test/helpers/llm-judge.ts', 'test/llm-judge-recommendation.test.ts', 'test/fixtures/judge-recommendation/**', 'scripts/resolvers/preamble/generate-ask-user-format.ts', 'codex/SKILL.md.tmpl', 'scripts/resolvers/review-dashboard.ts', 'scripts/resolvers/plan-gates.ts', 'scripts/resolvers/spec-review.ts', 'scripts/resolvers/outside-voice-steps.ts', 'scripts/resolvers/review-scope.ts', 'scripts/resolvers/outside-voice.ts'],
   // v1.21+ AUTO_DECIDE preserve eval (periodic). Verifies the Tool resolution
   // fix doesn't trip the legitimate /plan-tune opt-in path: when the user has
   // written a never-ask preference, AUQ should still auto-decide rather than
   // surfacing the question. Touches the question-tuning + preference
   // infrastructure plus the resolvers that own the AUTO_DECIDE preamble.
-  'auto-decide-preserved':        [ 'ETHOS.md','bin/gstack-ceo-mode-handoff', 'test/fixtures/auto-decide-handoff-line-e354.json', 'test/fixtures/auto-decide-handoff-before-log-37182865432.json', 'bin/gstack-state-root.sh', 'lib/state-root.ts', 'lib/claude-public-transcript.ts', 'lib/claude-journal-records.ts', 'lib/claude-owned-journal.ts',
+  'auto-decide-preserved':        [ 'ETHOS.md', 'bin/gstack-skill-load', 'scripts/resolvers/load-injection.ts','bin/gstack-ceo-mode-handoff', 'test/fixtures/auto-decide-handoff-line-e354.json', 'test/fixtures/auto-decide-handoff-before-log-37182865432.json', 'bin/gstack-state-root.sh', 'lib/state-root.ts', 'lib/claude-public-transcript.ts', 'lib/claude-journal-records.ts', 'lib/claude-owned-journal.ts',
     
     'test/fixtures/auto-decide-recommendation-361c.json',
     
@@ -614,9 +614,9 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
   'retro-base-branch': ['bin/gstack-state-root.sh', 'lib/state-root.ts', 'bin/gstack-retro-metrics', 'lib/retro-friction.ts', 'retro/**', 'test/skill-e2e-retro.test.ts'],
 
   // CSO
-  'cso-full-audit':   ['bin/gstack-state-root.sh', 'lib/state-root.ts', 'cso/**', 'lib/cso/**', 'lib/redact-engine.ts', 'lib/redact-patterns.ts',   'test/skill-e2e-cso.test.ts'],
-  'cso-diff-mode':    ['bin/gstack-state-root.sh', 'lib/state-root.ts', 'cso/**', 'lib/cso/**', 'lib/redact-engine.ts', 'lib/redact-patterns.ts',   'test/skill-e2e-cso.test.ts'],
-  'cso-infra-scope':  ['bin/gstack-state-root.sh', 'lib/state-root.ts', 'cso/**', 'lib/cso/**', 'lib/redact-engine.ts', 'lib/redact-patterns.ts',   'test/skill-e2e-cso.test.ts'],
+  'cso-full-audit':   ['bin/gstack-state-root.sh', 'lib/state-root.ts', 'cso/**', 'lib/cso/**', 'lib/redact-engine.ts', 'lib/redact-patterns.ts',   'test/skill-e2e-cso.test.ts', 'test/helpers/cso-e2e-report.ts'],
+  'cso-diff-mode':    ['bin/gstack-state-root.sh', 'lib/state-root.ts', 'cso/**', 'lib/cso/**', 'lib/redact-engine.ts', 'lib/redact-patterns.ts',   'test/skill-e2e-cso.test.ts', 'test/helpers/cso-e2e-report.ts'],
+  'cso-infra-scope':  ['bin/gstack-state-root.sh', 'lib/state-root.ts', 'cso/**', 'lib/cso/**', 'lib/redact-engine.ts', 'lib/redact-patterns.ts',   'test/skill-e2e-cso.test.ts', 'test/helpers/cso-e2e-report.ts'],
 
   // Learnings
   'write-skill-add-lesson': ['write-skill/**', 'bin/gstack-skill-bill', 'lib/skill-bill.ts', 'lib/context-bill.ts', 'test/skill-e2e-write-skill.test.ts'],
@@ -644,15 +644,15 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
   // test/skill-e2e-context-skills.test.ts. These are periodic-tier because
   // each one spawns claude -p and costs ~$0.20-$0.40. Collectively they
   // verify the thing the /checkpoint → /context-save rename was for.
-  'context-save-routing':                  [ 'context-save/**', 'scripts/resolvers/preamble.ts', 'scripts/resolvers/preamble-hoist.ts', 'test/skill-e2e-context-skills.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/helpers/context-restore-fragment.ts'],
-  'context-save-then-restore-roundtrip':   ['bin/gstack-state-root.sh', 'lib/state-root.ts', 'context-save/**', 'context-restore/**', 'bin/gstack-slug', 'bin/gstack-remote-identity.sh', 'test/skill-e2e-context-skills.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/helpers/context-restore-fragment.ts'],
-  'context-restore-fragment-match':        [ 'context-restore/**', 'test/skill-e2e-context-skills.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/helpers/context-restore-fragment.ts'],
-  'context-restore-provenance-order':      ['context-save/**', 'context-restore/**', 'test/skill-e2e-context-skills.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/helpers/context-restore-fragment.ts'],
-  'context-restore-empty-state':           [ 'context-restore/**', 'test/skill-e2e-context-skills.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/helpers/context-restore-fragment.ts'],
-  'context-restore-list-delegates':        [ 'context-restore/**', 'test/skill-e2e-context-skills.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/helpers/context-restore-fragment.ts'],
-  'context-restore-legacy-compat':         [ 'context-restore/**', 'test/skill-e2e-context-skills.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/helpers/context-restore-fragment.ts'],
-  'context-save-list-current-branch':      [ 'context-save/**', 'test/skill-e2e-context-skills.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/helpers/context-restore-fragment.ts'],
-  'context-save-list-all-branches':        [ 'context-save/**', 'test/skill-e2e-context-skills.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/helpers/context-restore-fragment.ts'],
+  'context-save-routing':                  [ 'context-save/**', 'scripts/resolvers/preamble.ts', 'scripts/resolvers/preamble-hoist.ts', 'test/skill-e2e-context-skills.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/fixtures/claude-md-skill-routing.md', 'test/helpers/context-restore-fragment.ts'],
+  'context-save-then-restore-roundtrip':   ['bin/gstack-state-root.sh', 'lib/state-root.ts', 'context-save/**', 'context-restore/**', 'bin/gstack-slug', 'bin/gstack-remote-identity.sh', 'test/skill-e2e-context-skills.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/fixtures/claude-md-skill-routing.md', 'test/helpers/context-restore-fragment.ts'],
+  'context-restore-fragment-match':        [ 'context-restore/**', 'test/skill-e2e-context-skills.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/fixtures/claude-md-skill-routing.md', 'test/helpers/context-restore-fragment.ts'],
+  'context-restore-provenance-order':      ['context-save/**', 'context-restore/**', 'test/skill-e2e-context-skills.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/fixtures/claude-md-skill-routing.md', 'test/helpers/context-restore-fragment.ts'],
+  'context-restore-empty-state':           [ 'context-restore/**', 'test/skill-e2e-context-skills.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/fixtures/claude-md-skill-routing.md', 'test/helpers/context-restore-fragment.ts'],
+  'context-restore-list-delegates':        [ 'context-restore/**', 'test/skill-e2e-context-skills.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/fixtures/claude-md-skill-routing.md', 'test/helpers/context-restore-fragment.ts'],
+  'context-restore-legacy-compat':         [ 'context-restore/**', 'test/skill-e2e-context-skills.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/fixtures/claude-md-skill-routing.md', 'test/helpers/context-restore-fragment.ts'],
+  'context-save-list-current-branch':      [ 'context-save/**', 'test/skill-e2e-context-skills.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/fixtures/claude-md-skill-routing.md', 'test/helpers/context-restore-fragment.ts'],
+  'context-save-list-all-branches':        [ 'context-save/**', 'test/skill-e2e-context-skills.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/fixtures/claude-md-skill-routing.md', 'test/helpers/context-restore-fragment.ts'],
 
   // Document-release
   'document-release': [ 'test/helpers/outside-voice-evidence.ts', 'bin/gstack-version-bump', 'document-release/**', 'test/skill-e2e-workflow.test.ts', 'test/fixtures/coverage-audit-fixture.ts', 'test/helpers/coverage-audit.ts', 'test/helpers/coverage-audit-evidence.ts', 'test/helpers/office-hours-attempt.ts'],
@@ -867,24 +867,24 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
   'scrape-match-path': [
     'scrape/**', 'browse/src/browser-skills.ts', 'browse/src/browser-skill-commands.ts',
     'browser-skills/hackernews-frontpage/**',
-    'test/skill-e2e-skillify.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/helpers/skill-body-narration.ts'
+    'test/skill-e2e-skillify.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/fixtures/claude-md-skill-routing.md', 'test/helpers/skill-body-narration.ts'
   ],
   'scrape-prototype-path': [
     'scrape/**', 'browse/src/browser-skills.ts', 'browse/src/browser-skill-commands.ts',
-    'test/skill-e2e-skillify.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/helpers/skill-body-narration.ts'
+    'test/skill-e2e-skillify.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/fixtures/claude-md-skill-routing.md', 'test/helpers/skill-body-narration.ts'
   ],
   'skillify-happy-path': [
     'skillify/**', 'scrape/**', 'browse/src/browser-skill-write.ts',
     'browse/src/browser-skills.ts', 'browse/src/browser-skill-commands.ts',
-    'test/skill-e2e-skillify.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/helpers/skill-body-narration.ts'
+    'test/skill-e2e-skillify.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/fixtures/claude-md-skill-routing.md', 'test/helpers/skill-body-narration.ts'
   ],
   'skillify-provenance-refusal': [
     'skillify/**', 'browse/src/browser-skill-write.ts',
-    'test/skill-e2e-skillify.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/helpers/skill-body-narration.ts'
+    'test/skill-e2e-skillify.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/fixtures/claude-md-skill-routing.md', 'test/helpers/skill-body-narration.ts'
   ],
   'skillify-approval-reject': [
     'skillify/**', 'scrape/**', 'browse/src/browser-skill-write.ts',
-    'test/skill-e2e-skillify.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/helpers/skill-body-narration.ts'
+    'test/skill-e2e-skillify.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/fixtures/claude-md-skill-routing.md', 'test/helpers/skill-body-narration.ts'
   ],
 
   // Skill routing — journey-stage tests (depend on ALL skill descriptions)
@@ -892,7 +892,7 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
     
     
     "test/fixtures/plan-scope-recovery-av.json",
-    "test/fixtures/design-scope-checkpoint-at.json", '*/SKILL.md.tmpl', 'SKILL.md.tmpl', 'scripts/gen-skill-docs.ts', 'test/skill-routing-e2e.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts',
+    "test/fixtures/design-scope-checkpoint-at.json", '*/SKILL.md.tmpl', 'SKILL.md.tmpl', 'scripts/gen-skill-docs.ts', 'test/skill-routing-e2e.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/fixtures/claude-md-skill-routing.md',
     
 
      "scripts/resolvers/preamble/generate-preamble-bash.ts", "scripts/resolvers/preamble/generate-completion-status.ts"
@@ -901,7 +901,7 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
     
     
     "test/fixtures/plan-scope-recovery-av.json",
-    "test/fixtures/design-scope-checkpoint-at.json", '*/SKILL.md.tmpl', 'SKILL.md.tmpl', 'scripts/gen-skill-docs.ts', 'test/skill-routing-e2e.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts',
+    "test/fixtures/design-scope-checkpoint-at.json", '*/SKILL.md.tmpl', 'SKILL.md.tmpl', 'scripts/gen-skill-docs.ts', 'test/skill-routing-e2e.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/fixtures/claude-md-skill-routing.md',
     
 
      "scripts/resolvers/preamble/generate-preamble-bash.ts", "scripts/resolvers/preamble/generate-completion-status.ts"
@@ -910,7 +910,7 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
     
     
     "test/fixtures/plan-scope-recovery-av.json",
-    "test/fixtures/design-scope-checkpoint-at.json", '*/SKILL.md.tmpl', 'SKILL.md.tmpl', 'scripts/gen-skill-docs.ts', 'test/skill-routing-e2e.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts',
+    "test/fixtures/design-scope-checkpoint-at.json", '*/SKILL.md.tmpl', 'SKILL.md.tmpl', 'scripts/gen-skill-docs.ts', 'test/skill-routing-e2e.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/fixtures/claude-md-skill-routing.md',
     
 
      "scripts/resolvers/preamble/generate-preamble-bash.ts", "scripts/resolvers/preamble/generate-completion-status.ts"
@@ -919,7 +919,7 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
     
     
     "test/fixtures/plan-scope-recovery-av.json",
-    "test/fixtures/design-scope-checkpoint-at.json", '*/SKILL.md.tmpl', 'SKILL.md.tmpl', 'scripts/gen-skill-docs.ts', 'test/skill-routing-e2e.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts',
+    "test/fixtures/design-scope-checkpoint-at.json", '*/SKILL.md.tmpl', 'SKILL.md.tmpl', 'scripts/gen-skill-docs.ts', 'test/skill-routing-e2e.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/fixtures/claude-md-skill-routing.md',
     
 
      "scripts/resolvers/preamble/generate-preamble-bash.ts", "scripts/resolvers/preamble/generate-completion-status.ts"
@@ -928,7 +928,7 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
     
     
     "test/fixtures/plan-scope-recovery-av.json",
-    "test/fixtures/design-scope-checkpoint-at.json", '*/SKILL.md.tmpl', 'SKILL.md.tmpl', 'scripts/gen-skill-docs.ts', 'test/skill-routing-e2e.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts',
+    "test/fixtures/design-scope-checkpoint-at.json", '*/SKILL.md.tmpl', 'SKILL.md.tmpl', 'scripts/gen-skill-docs.ts', 'test/skill-routing-e2e.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/fixtures/claude-md-skill-routing.md',
     
 
      "scripts/resolvers/preamble/generate-preamble-bash.ts", "scripts/resolvers/preamble/generate-completion-status.ts"
@@ -937,7 +937,7 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
     
     
     "test/fixtures/plan-scope-recovery-av.json",
-    "test/fixtures/design-scope-checkpoint-at.json", '*/SKILL.md.tmpl', 'SKILL.md.tmpl', 'scripts/gen-skill-docs.ts', 'test/skill-routing-e2e.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts',
+    "test/fixtures/design-scope-checkpoint-at.json", '*/SKILL.md.tmpl', 'SKILL.md.tmpl', 'scripts/gen-skill-docs.ts', 'test/skill-routing-e2e.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/fixtures/claude-md-skill-routing.md',
     
 
      "scripts/resolvers/preamble/generate-preamble-bash.ts", "scripts/resolvers/preamble/generate-completion-status.ts"
@@ -946,7 +946,7 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
     
     
     "test/fixtures/plan-scope-recovery-av.json",
-    "test/fixtures/design-scope-checkpoint-at.json", '*/SKILL.md.tmpl', 'SKILL.md.tmpl', 'scripts/gen-skill-docs.ts', 'test/skill-routing-e2e.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts',
+    "test/fixtures/design-scope-checkpoint-at.json", '*/SKILL.md.tmpl', 'SKILL.md.tmpl', 'scripts/gen-skill-docs.ts', 'test/skill-routing-e2e.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/fixtures/claude-md-skill-routing.md',
     
 
      "scripts/resolvers/preamble/generate-preamble-bash.ts", "scripts/resolvers/preamble/generate-completion-status.ts"
@@ -955,7 +955,7 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
     
     
     "test/fixtures/plan-scope-recovery-av.json",
-    "test/fixtures/design-scope-checkpoint-at.json", '*/SKILL.md.tmpl', 'SKILL.md.tmpl', 'scripts/gen-skill-docs.ts', 'test/skill-routing-e2e.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts',
+    "test/fixtures/design-scope-checkpoint-at.json", '*/SKILL.md.tmpl', 'SKILL.md.tmpl', 'scripts/gen-skill-docs.ts', 'test/skill-routing-e2e.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/fixtures/claude-md-skill-routing.md',
     
 
      "scripts/resolvers/preamble/generate-preamble-bash.ts", "scripts/resolvers/preamble/generate-completion-status.ts"
@@ -964,7 +964,7 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
     
     
     "test/fixtures/plan-scope-recovery-av.json",
-    "test/fixtures/design-scope-checkpoint-at.json", '*/SKILL.md.tmpl', 'SKILL.md.tmpl', 'scripts/gen-skill-docs.ts', 'test/skill-routing-e2e.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts',
+    "test/fixtures/design-scope-checkpoint-at.json", '*/SKILL.md.tmpl', 'SKILL.md.tmpl', 'scripts/gen-skill-docs.ts', 'test/skill-routing-e2e.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/fixtures/claude-md-skill-routing.md',
     
 
      "scripts/resolvers/preamble/generate-preamble-bash.ts", "scripts/resolvers/preamble/generate-completion-status.ts"
@@ -973,7 +973,7 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
     
     
     "test/fixtures/plan-scope-recovery-av.json",
-    "test/fixtures/design-scope-checkpoint-at.json", '*/SKILL.md.tmpl', 'SKILL.md.tmpl', 'scripts/gen-skill-docs.ts', 'test/skill-routing-e2e.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts',
+    "test/fixtures/design-scope-checkpoint-at.json", '*/SKILL.md.tmpl', 'SKILL.md.tmpl', 'scripts/gen-skill-docs.ts', 'test/skill-routing-e2e.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/fixtures/claude-md-skill-routing.md',
     
 
      "scripts/resolvers/preamble/generate-preamble-bash.ts", "scripts/resolvers/preamble/generate-completion-status.ts"
@@ -1161,13 +1161,11 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
     
 
     "test/fixtures/plan-scope-recovery-av.json",
-    "test/fixtures/design-scope-checkpoint-at.json", '*/SKILL.md.tmpl', 'SKILL.md.tmpl', 'scripts/gen-skill-docs.ts', 'test/skill-routing-e2e.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts',
+    "test/fixtures/design-scope-checkpoint-at.json", '*/SKILL.md.tmpl', 'SKILL.md.tmpl', 'scripts/gen-skill-docs.ts', 'test/skill-routing-e2e.test.ts', 'bin/gstack-skill-start', 'test/helpers/shipped-skill-routing.ts', 'test/fixtures/claude-md-skill-routing.md',
     
 
      "scripts/resolvers/preamble/generate-preamble-bash.ts", "scripts/resolvers/preamble/generate-completion-status.ts"
   ],
-  'router-failure-verified-cause': ['SKILL.md.tmpl', 'SKILL.md', 'scripts/resolvers/preamble/generate-test-failure-triage.ts', 'lib/bun-isolation.ts', 'test/skill-e2e-failure-routing.test.ts', 'test/helpers/failure-routing-fixture.ts', 'test/helpers/none-arm.ts'],
-  'router-failure-triage-resolves': ['SKILL.md.tmpl', 'SKILL.md', 'scripts/resolvers/preamble/generate-test-failure-triage.ts', 'lib/bun-isolation.ts', 'test/skill-e2e-failure-routing.test.ts', 'test/helpers/failure-routing-fixture.ts', 'test/helpers/none-arm.ts'],
 };
 
 /**
@@ -1573,8 +1571,6 @@ export const E2E_TIERS: Record<string, 'gate' | 'periodic' | 'marathon'> = {
   'overlay-harness-claude-dedicated-tools-vs-bash-sonnet': 'periodic',
   'overlay-harness-claude-dedicated-tools-vs-bash-opus-5-5': 'periodic',
   'journey-negatives': 'periodic',
-  'router-failure-verified-cause': 'gate',
-  'router-failure-triage-resolves': 'gate',
 };
 
 /**
@@ -1891,8 +1887,6 @@ export const E2E_KINDS: Record<string, 'rule' | 'behavior' | 'judge'> = {
   'overlay-harness-claude-dedicated-tools-vs-bash-sonnet': 'rule',
   'overlay-harness-claude-dedicated-tools-vs-bash-opus-5-5': 'rule',
   'journey-negatives': 'rule',
-  'router-failure-verified-cause': 'rule',
-  'router-failure-triage-resolves': 'rule',
 };
 
 /**

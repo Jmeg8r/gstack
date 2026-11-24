@@ -77,6 +77,9 @@
  *   bun run scripts/test-free-shards.ts --attribute-home           # name real-home writers: each file alone, private HOME
  *   bun run scripts/test-free-shards.ts --ci-plan plan.json --shards 20
  *   bun run scripts/test-free-shards.ts --ci-run plan.json --shard 1 --result result.json
+ *   bun run scripts/test-free-shards.ts --windows-only --ci-plan plan.json --shards 8 --shard-budget-seconds 720
+ *       # --shards becomes a floor: the Windows plan adds shards, up to twice it, until every
+ *       # shard predicts at most 720 s, and fails past that (GST-3440).
  *   bun run scripts/test-free-shards.ts --ci-plan plan.json --shards 20 --shard-jobs 2
  *       # the plan stores a per-shard k: min(k, the shard's files that may run in parallel),
  *       # kept only when above 1, so the exclusive TREE_MUTATING shard stays one child.
@@ -382,6 +385,23 @@ export function loadFreeTestDurations(rootDir = ROOT): Record<string, number> | 
   return Object.keys(seed.durations).length === 0 ? null : seed.durations;
 }
 
+export const WINDOWS_FREE_TEST_DURATIONS_FILE = 'scripts/free-test-durations-windows.json';
+
+/**
+ * Windows plans pack by Windows-recorded time. A file the Windows seed lacks
+ * falls back to its Linux time instead of the Windows 99th percentile (161 s),
+ * which once packed 27 such files as phantom load and left one shard with
+ * 946 s of real Windows work against a 900 s job (GST-3440).
+ */
+export function loadWindowsFreeTestDurations(rootDir = ROOT): Record<string, number> {
+  const read = (file: string) => {
+    const seed = readDurationSeed(path.join(rootDir, file), FREE_LANE_POLICY.acceptsSeedDuration);
+    if (seed.status === 'corrupt') console.error(`[test:free] WARNING: corrupt durations seed ${file} (${seed.error.message})`);
+    return seed.status === 'ok' ? seed.durations : {};
+  };
+  return { ...read(FREE_TEST_DURATIONS_FILE), ...read(WINDOWS_FREE_TEST_DURATIONS_FILE) };
+}
+
 export interface PackedShards {
   shards: string[][];
   /** Predicted total per shard, aligned with `shards` — feeds walls + logs. */
@@ -491,6 +511,20 @@ export function createFreeCiPlan(files: string[], count: number, durations: Reco
   });
   const body = { version: 1 as const, revision, shards };
   return { ...body, id: planDigest(body) };
+}
+
+/**
+ * The Windows plan with the fewest shards, from `minimum` up to twice it, whose
+ * every shard predicts at most `budgetMs` (--shard-budget-seconds). Needing more
+ * than that means a stale Windows seed, so the plan fails instead of growing further.
+ */
+export function createWindowsCiPlan(files: string[], minimum: number, budgetMs: number, durations: Record<string, number>, revision: string, shardJobs = 1): FreeCiPlan {
+  for (let count = minimum; count <= minimum * 2; count += 1) {
+    const plan = createFreeCiPlan(files, count, durations, revision, shardJobs);
+    if (plan.shards.every(shard => shard.predictedMs <= budgetMs)) return plan;
+  }
+  throw new Error(`No Windows plan of ${minimum} to ${minimum * 2} shards keeps every shard within ${budgetMs / 1000} s.`
+    + ` Refresh ${WINDOWS_FREE_TEST_DURATIONS_FILE} with a record_durations dispatch of windows-free-tests.yml.`);
 }
 
 /**
@@ -629,6 +663,8 @@ type CliOptions = {
   shardJobs?: number;
   /** Set only by --job-setup-seconds (with --ci-plan): the matrix then carries each shard's job timeout. */
   jobSetupSeconds?: number;
+  /** Set only by --shard-budget-seconds (with --windows-only --ci-plan): --shards is then a floor. */
+  shardBudgetSeconds?: number;
 };
 
 export function parseCliOptions(argv: string[]): CliOptions {
@@ -646,6 +682,7 @@ export function parseCliOptions(argv: string[]): CliOptions {
   let jobs: number | undefined;
   let shardJobs: number | undefined;
   let jobSetupSeconds: number | undefined;
+  let shardBudgetSeconds: number | undefined;
   let junitDir: string | undefined;
   const paths: Record<'ciPlan' | 'ciRun' | 'ciVerify' | 'result' | 'results' | 'filesFrom', string | null> = {
     ciPlan: null, ciRun: null, ciVerify: null, result: null, results: null, filesFrom: null,
@@ -682,6 +719,11 @@ export function parseCliOptions(argv: string[]): CliOptions {
       jobSetupSeconds = /^\d+$/.test(value) ? Number(value) : NaN;
       if (!(jobSetupSeconds > 0 && jobSetupSeconds <= 3600)) throw new Error('--job-setup-seconds needs a whole number of seconds from 1 to 3600');
     },
+    '--shard-budget-seconds': (next) => {
+      const value = next() ?? '';
+      shardBudgetSeconds = /^\d+$/.test(value) ? Number(value) : NaN;
+      if (!(shardBudgetSeconds > 0 && shardBudgetSeconds <= 21600)) throw new Error('--shard-budget-seconds needs a whole number of seconds from 1 to 21600');
+    },
     '--shards': (next) => {
       const value = next();
       if (!value) throw new Error('Missing value for --shards');
@@ -705,12 +747,13 @@ export function parseCliOptions(argv: string[]): CliOptions {
   if (ciModes > 1 || (ciModes && (quick || listOnly || dryRun || recordDurations || attributeHome))) throw new Error('CI modes cannot be combined with other selection modes');
   if (paths.ciRun && (shardIndex === null || !paths.result)) throw new Error('--ci-run requires --shard and --result');
   if (paths.ciVerify && !paths.results) throw new Error('--ci-verify requires --results');
-  if (junitDir !== undefined && !paths.ciRun) throw new Error('--junit-dir applies only to --ci-run');
+  if (junitDir !== undefined && !paths.ciRun && !quick) throw new Error('--junit-dir applies only to --ci-run or --quick');
   if (jobs !== undefined && !paths.ciRun) rejectJobsWithoutCiRun();
   if (shardJobs !== undefined && !paths.ciPlan) rejectShardJobsWithoutCiPlan();
   if (jobSetupSeconds !== undefined && !paths.ciPlan) throw new Error('--job-setup-seconds applies only to --ci-plan');
+  if (shardBudgetSeconds !== undefined && !(paths.ciPlan && windowsOnly)) throw new Error('--shard-budget-seconds applies only to --windows-only --ci-plan');
   if (quick && (recordDurations || windowsOnly || shardIndex !== null)) throw new Error('--quick cannot change recording, Windows or shard selection');
-  return { dryRun, listOnly, recordDurations, windowsOnly, verbose, shardCount, shardIndex, wallTimeoutMs, wallTimeoutExplicit, quick, attributeHome, ...paths, ...(jobs === undefined ? {} : { jobs }), ...(shardJobs === undefined ? {} : { shardJobs }), ...(jobSetupSeconds === undefined ? {} : { jobSetupSeconds }), ...(junitDir === undefined ? {} : { junitDir }) };
+  return { dryRun, listOnly, recordDurations, windowsOnly, verbose, shardCount, shardIndex, wallTimeoutMs, wallTimeoutExplicit, quick, attributeHome, ...paths, ...(jobs === undefined ? {} : { jobs }), ...(shardJobs === undefined ? {} : { shardJobs }), ...(jobSetupSeconds === undefined ? {} : { jobSetupSeconds }), ...(shardBudgetSeconds === undefined ? {} : { shardBudgetSeconds }), ...(junitDir === undefined ? {} : { junitDir }) };
 }
 
 const describeLines = (lines: string[]) => `${lines.slice(0, 5).join(', ')}${lines.length > 5 ? ` (+${lines.length - 5} more)` : ''}`;
@@ -1230,6 +1273,7 @@ const EPILOGUE_WORD: Record<FreeShardStatus, string> = {
 function trackShardBrowser(stateDir: string, env: NodeJS.ProcessEnv) {
   class BrowserCleanupError extends Error {}
   class CaptureStopped extends Error {}
+  class ProcessExited extends Error {}
   type Identity = { pid: number; parent: number; start: string; daemon: number; root: boolean };
   type Capture = { abort: AbortController; deadline: number; probes: Set<Promise<unknown>>; records?: [string, string] };
   const identities = new Map<number, Identity>();
@@ -1298,7 +1342,7 @@ function trackShardBrowser(stateDir: string, env: NodeJS.ProcessEnv) {
   };
 
   const failure = (error: unknown) => {
-    if (error instanceof CaptureStopped) return;
+    if (error instanceof CaptureStopped || error instanceof ProcessExited) return;
     const code = (error as NodeJS.ErrnoException)?.code;
     const file = (error as NodeJS.ErrnoException & { path?: string })?.path;
     const pid = typeof file === 'string' ? /^\/proc\/(\d+)\//.exec(file)?.[1] : undefined;
@@ -1372,10 +1416,11 @@ function trackShardBrowser(stateDir: string, env: NodeJS.ProcessEnv) {
     const key = `${identity.pid}:${identity.start}`;
     const recorded = nativeStarts.get(key);
     if (recorded) return recorded;
-    if (!await live(capture, identity)) throw new BrowserCleanupError('process exited before its native identity was captured');
+    if (!await live(capture, identity)) throw new ProcessExited('process exited before its native identity was captured');
     const result = await probe(capture, 'ps', ['-p', String(identity.pid), '-o', 'lstart='], 2000);
     const value = result.status === 0 ? result.stdout.trim().replace(/\s+/g, ' ') : '';
-    if (!value || !await live(capture, identity)) throw new BrowserCleanupError('native process identity unavailable');
+    if (!await live(capture, identity)) throw new ProcessExited('process exited during its native identity probe');
+    if (!value) throw new BrowserCleanupError('native process identity unavailable');
     check(capture);
     nativeStarts.set(key, value);
     return value;
@@ -1460,7 +1505,8 @@ function trackShardBrowser(stateDir: string, env: NodeJS.ProcessEnv) {
       if (state?.chromiumPid !== undefined) validations.push(validateChild(state.chromiumPid, state.chromiumStartTime, state.pid));
       const results = await Promise.allSettled(validations);
       check(operation);
-      for (const result of results) if (result.status === 'rejected') throw result.reason;
+      const rejected = results.flatMap(result => result.status === 'rejected' ? [result.reason] : []);
+      if (rejected.length) throw rejected.find(reason => !(reason instanceof ProcessExited)) ?? rejected[0];
       operation.records = [JSON.stringify(state), JSON.stringify(agent)];
     } catch (error) {
       check(operation);
@@ -2047,14 +2093,22 @@ async function main(): Promise<number> {
       fs.renameSync(temporary, file);
     };
     if (options.ciPlan) {
-      const durations = loadFreeTestDurations() ?? {};
+      const durations = curation ? loadWindowsFreeTestDurations() : loadFreeTestDurations() ?? {};
       if (curation) {
         const line = windowsCurationLine(curation);
         console.error(`[test:free] ${line}`);
         appendStepSummary(line);
       }
       warnUnseededFreeFiles(ciFiles, durations);
-      const plan = createFreeCiPlan(ciFiles, options.shardCount, durations, revision, options.shardJobs, options.jobSetupSeconds);
+      const budgetSeconds = options.shardBudgetSeconds;
+      const plan = budgetSeconds !== undefined
+        ? createWindowsCiPlan(ciFiles, options.shardCount, budgetSeconds * 1000, durations, revision, options.shardJobs)
+        : createFreeCiPlan(ciFiles, options.shardCount, durations, revision, options.shardJobs, options.jobSetupSeconds);
+      if (budgetSeconds !== undefined) {
+        const line = `Windows plan: ${plan.shards.length} shards, heaviest ${Math.round(Math.max(...plan.shards.map(shard => shard.predictedMs)) / 1000)} s of a ${budgetSeconds} s budget`;
+        console.error(`[test:free] ${line}`);
+        appendStepSummary(line);
+      }
       validateFreeCiPlan(plan, ciFiles, revision);
       const matrix = ciPlanMatrix(plan, options.jobSetupSeconds);
       if ('include' in matrix) {
@@ -2206,6 +2260,7 @@ async function main(): Promise<number> {
         ? wallTimeoutForPackedShard(packed.predictedMs[index], options.wallTimeoutMs, shardFiles.length)
         : shardTimeout(shardFiles.length),
       verbose: options.verbose,
+      ...(options.junitDir ? { junitDir: options.junitDir } : {}),
     })),
   );
   const homeChange = phaseHome.verify();
@@ -2216,6 +2271,7 @@ async function main(): Promise<number> {
     const exclusiveOutcome = await runFreeShard(exclusive, totalShards, totalShards, {
       wallTimeoutMs: shardTimeout(exclusive.length),
       verbose: options.verbose,
+      ...(options.junitDir ? { junitDir: options.junitDir } : {}),
     });
     if (exclusiveOutcome.status !== 'passed') {
       // Fixture safety rests on each test restoring default state itself; a

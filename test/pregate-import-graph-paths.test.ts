@@ -8,6 +8,8 @@
  *     — `@/…` was resolved as a repo path, so it never matched a file.
  */
 import { afterEach, describe, expect, test } from 'bun:test';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { MAX_TSCONFIG_EXTENDS, buildGraph, testsFor } from '../lib/pregate/import-graph';
 import { cleanup, commit, makeFixtureRepo, type FixtureRepo } from './helpers/pregate-fixture';
 
@@ -122,6 +124,88 @@ describe('import graph: route-group / dynamic-segment paths and tsconfig path al
   });
 });
 
+describe('import graph: a nested tsconfig governs the files under it', () => {
+  // Value: protects=an `@/` import inside a monorepo app resolves through that app's own tsconfig `paths`, so its source maps to
+  //   its tests; fails_when=only the root config is read again (every touched app file PREGATE_NO_LANE) or a nested extends leaves
+  //   the repo; why_new=only root configs were tested (gstack#4462); seam=none; no_claim=TS project references, symlinked configs
+  test('an alias in a nested tsconfig maps a source file under it to the test that imports it', () => {
+    const repo = fixture();
+    commit(repo, {
+      'apps/mobile/tsconfig.json': '{ "extends": "expo/tsconfig.base", "compilerOptions": { "strict": true, "paths": { "@/*": ["./src/*"] } } }\n',
+      'apps/mobile/src/media/close-bar.tsx': 'export const CloseBar = () => null;\n',
+      'apps/mobile/src/media/close-bar.test.tsx': "import { CloseBar } from '@/media/close-bar';\nCloseBar;\n",
+    });
+    const g = buildGraph(repo.work);
+    expect(testsFor(g, 'apps/mobile/src/media/close-bar.tsx').tests).toEqual(['apps/mobile/src/media/close-bar.test.tsx']);
+    expect(g.aliasNotes).toContain('apps/mobile/tsconfig.json extends expo/tsconfig.base: not a relative path, not followed');
+  });
+
+  test('a nested config without paths or baseUrl defers to the root; a sibling app keeps its own alias', () => {
+    const repo = fixture();
+    commit(repo, {
+      'tsconfig.json': '{ "compilerOptions": { "paths": { "@/*": ["src/*"] } } }\n',
+      'src/x.ts': 'export const x = "root";\n',
+      'test/x.test.ts': "import { x } from '@/x';\nx;\n",
+      'packages/core/tsconfig.json': '{ "compilerOptions": { "strict": true } }\n',
+      'packages/core/test/x.test.ts': "import { x } from '@/x';\nx;\n",
+      'apps/web/tsconfig.json': '{ "compilerOptions": { "baseUrl": ".", "paths": { "@/*": ["lib/*"] } } }\n',
+      'apps/web/lib/x.ts': 'export const x = "web";\n',
+      'apps/web/test/x.test.ts': "import { x } from '@/x';\nx;\n",
+    });
+    const g = buildGraph(repo.work);
+    expect(testsFor(g, 'src/x.ts').tests).toEqual(['packages/core/test/x.test.ts', 'test/x.test.ts']);
+    expect(testsFor(g, 'apps/web/lib/x.ts').tests).toEqual(['apps/web/test/x.test.ts']);
+  });
+
+  test('a nested config takes paths through a relative extends, joined relative to the config that declares them', () => {
+    const repo = fixture();
+    commit(repo, {
+      'tsconfig.base.json': '{ "compilerOptions": { "paths": { "#core/*": ["packages/core/src/*"] } } }\n',
+      'apps/api/tsconfig.json': '{ "extends": "../../tsconfig.base.json" }\n',
+      'packages/core/src/plan.ts': 'export const plan = 1;\n',
+      'apps/api/test/plan.test.ts': "import { plan } from '#core/plan';\nplan;\n",
+    });
+    expect(testsFor(buildGraph(repo.work), 'packages/core/src/plan.ts').tests).toEqual(['apps/api/test/plan.test.ts']);
+  });
+
+  test('a repo whose only config is at the root resolves every file through the root config, as before', () => {
+    const repo = fixture();
+    commit(repo, {
+      'tsconfig.json': '{ "extends": "@tsconfig/node22", "compilerOptions": { "baseUrl": ".", "paths": { "~lib/*": ["lib/*"] } } }\n',
+      'lib/plan.ts': 'export const plan = 1;\n',
+      'apps/api/test/plan.test.ts': "import { plan } from '~lib/plan';\nplan;\n",
+    });
+    const g = buildGraph(repo.work);
+    expect(g.aliasNotes).toEqual(['tsconfig.json extends @tsconfig/node22: not a relative path, not followed']);
+    expect(testsFor(g, 'lib/plan.ts').tests).toEqual(['apps/api/test/plan.test.ts']);
+  });
+
+  test('a nested extends that climbs out of the repository is not followed, even when the file exists there', () => {
+    const repo = fixture();
+    fs.writeFileSync(path.join(repo.root, 'outside.json'), '{ "compilerOptions": { "paths": { "#core/*": ["packages/core/src/*"] } } }\n');
+    commit(repo, {
+      'apps/api/tsconfig.json': '{ "extends": "../../../outside.json" }\n',
+      'packages/core/src/plan.ts': 'export const plan = 1;\n',
+      'apps/api/test/plan.test.ts': "import { plan } from '#core/plan';\nplan;\n",
+    });
+    const g = buildGraph(repo.work);
+    expect(testsFor(g, 'packages/core/src/plan.ts').tests).toEqual([]);
+    expect(g.aliasNotes).toEqual(['apps/api/tsconfig.json extends ../../../outside.json: outside the repo or a cycle, not followed']);
+  });
+
+  test.skipIf(process.platform === 'win32')('a nested tsconfig that is a symlink to a file outside the repository is not read', () => {
+    const repo = fixture();
+    fs.writeFileSync(path.join(repo.root, 'outside.json'), '{ "compilerOptions": { "paths": { "#core/*": ["../../packages/core/src/*"] } } }\n');
+    fs.mkdirSync(path.join(repo.work, 'apps', 'api'), { recursive: true });
+    fs.symlinkSync(path.join(repo.root, 'outside.json'), path.join(repo.work, 'apps', 'api', 'tsconfig.json'));
+    commit(repo, {
+      'packages/core/src/plan.ts': 'export const plan = 1;\n',
+      'apps/api/test/plan.test.ts': "import { plan } from '#core/plan';\nplan;\n",
+    });
+    expect(testsFor(buildGraph(repo.work), 'packages/core/src/plan.ts').tests).toEqual([]);
+  });
+});
+
 describe('import graph: alias precedence, extends and the no-lane explanation', () => {
   const twoAliases = (specificFirst: boolean) => {
     const specific = '"@/lib/*": ["src/lib/*"]';
@@ -217,5 +301,33 @@ describe('import graph: alias precedence, extends and the no-lane explanation', 
     expect(text).not.toContain("'react'");
     expect(text).not.toContain("'bun:test'");
     expect(text).toContain('declare the file under dependencies in .gstack/pregate.json, or report the resolver gap');
+  });
+});
+
+describe('import graph: NodeNext specifiers written with the emitted extension (#4398)', () => {
+  // Value: protects=NodeNext `./x.js` specifiers map to x.ts or x.tsx (and .jsx→.tsx, .mjs→.mts), directly and transitively, the
+  //   import resolves to the .ts source over a .js twin as in tsc (the twin keeps its literal edge), and a filesystem literal naming
+  //   a `.js` directory keeps that directory;
+  //   fails_when=the .js→.ts rewrite is removed, runs after the as-written lookup, or applies to literals;
+  //   why_new=no case covered emitted-extension imports; seam=none; no_claim=bundler-specific resolution beyond the TS rewrite
+  test('a NodeNext import written with the emitted .js extension maps to its .ts source', () => {
+    const repo = fixture();
+    commit(repo, {
+      'src/leaf.ts': 'export const leaf = 1;\n',
+      'src/mid.ts': "import { leaf } from './leaf.js';\nexport const mid = leaf;\n",
+      'src/view.tsx': 'export const View = () => null;\n',
+      'src/esm.mts': 'export const esm = 1;\n',
+      'src/both.js': 'export const both = 1;\n',
+      'src/both.ts': 'export const both = 2;\n',
+      'src/panel.tsx': 'export const Panel = () => null;\n',
+      'tests/fixtures/config.js/a.json': '{}\n',
+      'tests/fixtures/config.ts': 'export const config = 1;\n',
+      'tests/fixture.ts': "export { mid } from '../src/mid.js';\n",
+      'tests/app.test.ts': "import { readdirSync } from 'node:fs';\nimport { mid } from './fixture.js';\nimport { View } from '../src/view.jsx';\nimport { esm } from '../src/esm.mjs';\nimport { both } from '../src/both.js';\nimport { Panel } from '../src/panel.js';\nvoid [mid, View, esm, both, Panel, readdirSync('tests/fixtures/config.js')];\n",
+    });
+    const g = buildGraph(repo.work);
+    for (const f of ['tests/fixture.ts', 'src/mid.ts', 'src/leaf.ts', 'src/view.tsx', 'src/esm.mts', 'src/both.ts', 'src/both.js', 'src/panel.tsx', 'tests/fixtures/config.js/a.json']) expect(testsFor(g, f).tests).toEqual(['tests/app.test.ts']);
+    expect(testsFor(g, 'src/both.ts').provenance).toEqual(['tests/app.test.ts ← src/both.ts (import)']);
+    expect(testsFor(g, 'tests/fixtures/config.ts').tests).toEqual([]);
   });
 });

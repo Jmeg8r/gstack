@@ -30,7 +30,7 @@
 import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { baseInputs, sha256 } from '../context';
+import { baseInputs, defaultScratchRoot, sha256 } from '../context';
 import { PREGATE_CONFIG_PATH } from '../config';
 import { classifyCommandEnvironment, classifyEnvironment, environmentLine, environmentResult, launchCause } from '../environment';
 import { checkScratch } from '../run-scratch';
@@ -41,14 +41,15 @@ import { selectLanes, type Selection } from '../lane-selection';
 import { launchRuntime } from '../runtime';
 import { cargoModel, type CargoModel } from '../rust';
 import { adapterFor, readRange, STALL_IDLE, supervise, type Counter, type Supervised } from '../supervise';
-import { ranFiles, verifyFromRun, type RunProfile } from '../../run-evidence';
+import { ranFiles, runChanged, runReceiptFields, verifyFromRun, type RunProfile } from '../../run-evidence';
 import { matchesAny } from '../../ship-policy';
+import { testFileArgs } from '../../test-paths';
 import type { CheckDef, CheckResult, PregateContext, RemoteObligation } from '../types';
 
 /** The runner a `.py`-only selection gets; it needs the pytest module importable by python3 (`pytestMissing`). */
 const PYTEST = 'python3 -m pytest {files}';
 
-/** The test command with `{files}`; detected from the repo when the config does not name one. The repo's bun, vitest or jest claims JS/TS files only. */
+/** The test command with `{files}`; detected from the repo when the config does not name one. The repo's bun, vitest or jest claims JS/TS files only; JS files that all load `node:test` get `node --test` ahead of vitest and jest, which find no suite in them, while bun runs them itself. */
 export function detectRunner(ctx: Pick<PregateContext, 'config' | 'repoRoot'>, files: readonly string[]): string | null {
   if (ctx.config.runner) return ctx.config.runner;
   const has = (f: string) => fs.existsSync(path.join(ctx.repoRoot, f));
@@ -57,6 +58,7 @@ export function detectRunner(ctx: Pick<PregateContext, 'config' | 'repoRoot'>, f
   const deps = { ...pkg.dependencies, ...pkg.devDependencies };
   const jsts = files.every(f => /\.[cm]?[jt]sx?$/.test(f));
   if (jsts && (has('bunfig.toml') || has('bun.lock') || has('bun.lockb'))) return 'bun test {files}';
+  if (files.length && files.every(f => /\.[cm]?js$/.test(f) && importsNodeTest(readRepoFile(ctx.repoRoot, f) ?? ''))) return 'node --test {files}';
   if (jsts && deps.vitest) return 'npx vitest run {files}';
   if (jsts && deps.jest) return 'npx jest {files}';
   if (files.every(f => /\.py$/.test(f)) && files.length) return PYTEST;
@@ -195,6 +197,42 @@ function importsPlaywright(text: string): boolean {
   }
   return false;
 }
+/** Where a file takes the value `test` from: a relative module or `@playwright/test`, by `import { test } from …` (aliased or not), `export { test } from …` or `export * from …`. */
+function testSources(text: string): string[] {
+  const code = text.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, '');
+  return [...code.matchAll(/^[\t ]*(?:(?:import|export)[\t ]*\{([^}]*)\}|export[\t ]*\*)[\t ]*from[\t ]*['"](\.{1,2}\/[^'"]+|@playwright\/test)['"]/gm)].filter(m => m[1] === undefined || m[1].split(',').some(s => /^test(?:\s+as\s+[\w$]+)?$/.test(s.trim()))).map(m => m[2]!);
+}
+/**
+ * Whether a JS/TS test is a Playwright spec: it imports a value from `@playwright/test`, or takes `test` from a repo module that does and doesn't take
+ * `test` from a unit runner, directly or through further such modules, up to 8 deep (Playwright's fixtures pattern: `base.extend(…)`, `mergeTests(…)`).
+ * Only the modules `test` comes from are followed, so a unit test whose helper or vitest fixture uses other Playwright APIs keeps its runner (#4347).
+ */
+function playwrightSpec(repoRoot: string, file: string): boolean {
+  const exts = ['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs'];
+  const seen = new Set<string>();
+  let level = [file];
+  for (let depth = 0; level.length && depth <= 8; depth++) {
+    const next: string[] = [];
+    for (const mod of level.filter(m => !seen.has(m))) {
+      seen.add(mod);
+      const text = readRepoFile(repoRoot, mod) ?? '', sources = testSources(text);
+      if (depth === 0 ? importsPlaywright(text) : sources.includes('@playwright/test') || (importsPlaywright(text) && !/^[\t ]*import\b[^;]*\btest\b[^;]*\bfrom[\t ]*['"](?:vitest|@jest\/globals|bun:test|node:test)['"]/m.test(text))) return true;
+      for (const base of sources.filter(s => s.startsWith('.')).map(spec => path.posix.normalize(path.posix.join(path.posix.dirname(mod), spec))).filter(b => b !== '..' && !b.startsWith('../'))) {
+        const stem = base.replace(/\.[cm]?jsx?$/, '');
+        const hit = [base, ...exts.map(e => stem + e), ...exts.map(e => `${base}/index${e}`)].find(c => readRepoFile(repoRoot, c) !== null);
+        if (hit) next.push(hit);
+      }
+    }
+    level = next;
+  }
+  return false;
+}
+/** Whether a JS test is a node:test file: it loads `node:test` in a statement that starts a line (`import … from 'node:test'`, a bare import, or `require`) and loads neither vitest nor `@jest/globals`, whose runner owns it. Text that mentions a module mid-line, in a comment or in a template literal does not count. */
+function importsNodeTest(text: string): boolean {
+  const code = text.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*|`(?:\\[\s\S]|[^\\`])*`/g, '');
+  const loads = (mod: string) => new RegExp(`^[\\t ]*(?:import(?=[\\s{*'"])[^'"\`;]*?|(?:const|let|var)\\b[^=\\n]*=[\\t ]*require\\([\\t ]*)['"](?:${mod})['"]`, 'm').test(code);
+  return loads('node:test') && !loads('vitest|@jest/globals');
+}
 /** Playwright's own text when its browsers are not installed on this machine. */
 const PLAYWRIGHT_NO_BROWSERS = /^.*(?:Executable doesn't exist at|download new browsers).*$/m;
 
@@ -214,7 +252,8 @@ function declaredRunnerFiles(runner: string): RegExp | null {
  * against its own pubspec); Rust tests run per crate as `cargo test -p <name>`
  * from the crate's workspace root; JS/TS tests owned by a nested package that
  * declares vitest or jest run from that package; a JS/TS test that imports
- * `@playwright/test` runs through `playwright test` from its nearest package;
+ * `@playwright/test`, or takes `test` from a local fixtures module built on it, runs through `playwright test` from its nearest package;
+ * a `.js`, `.mjs` or `.cjs` test that loads `node:test` runs from the repo root with the runner `detectRunner` gives node:test files;
  * the rest go to the detected runner from the repo root, split by language
  * when no one runner fits them all (`.mjs` + `.py` runs both), and pytest only
  * when python3 can import it. Files no runner claims (a tool missing from PATH,
@@ -238,6 +277,7 @@ export function planRuns(ctx: PregateContext, files: readonly string[]): RunPlan
   let model: CargoModel | null = null;
   const pkgRunners = new Map<string, ReturnType<typeof packageRunner>>();
   const rest: string[] = [];
+  const nodeTests: string[] = [];
   const noPubspec: string[] = [];
   const unclaimed: string[] = [];
   const missing = new Set<string>();
@@ -255,7 +295,8 @@ export function planRuns(ctx: PregateContext, files: readonly string[]): RunPlan
       continue;
     }
     const pkg = /\.[cm]?[jt]sx?$/.test(f) ? nearestRoot(ctx.repoRoot, f, 'package.json', seenPackage) : null;
-    if (pkg !== null && importsPlaywright(readRepoFile(ctx.repoRoot, f) ?? '')) { add(playwright, pkg, under(pkg, f)); continue; }
+    if (pkg !== null && playwrightSpec(ctx.repoRoot, f)) { add(playwright, pkg, under(pkg, f)); continue; }
+    if (/\.[cm]?js$/.test(f) && importsNodeTest(readRepoFile(ctx.repoRoot, f) ?? '')) { nodeTests.push(f); continue; }
     if (pkg) {
       if (!pkgRunners.has(pkg)) pkgRunners.set(pkg, packageRunner(ctx.repoRoot, pkg, ctx.env));
       const r = pkgRunners.get(pkg);
@@ -278,7 +319,7 @@ export function planRuns(ctx: PregateContext, files: readonly string[]): RunPlan
     unclaimed.push(...c.files.map(f => (c.cwd ? `${c.cwd}/${f}` : f)));
   }
   const language = (f: string) => (/\.py$/.test(f) ? 'py' : /\.[cm]?js$/.test(f) ? 'js' : /\.[cm]?[jt]sx?$/.test(f) ? 'ts' : f);
-  const parts = !rest.length ? [] : detectRunner(ctx, rest) ? [rest] : [...Map.groupBy(rest, language).values()];
+  const parts = [...(!rest.length ? [] : detectRunner(ctx, rest) ? [rest] : Map.groupBy(rest, language).values()), ...(nodeTests.length ? [nodeTests] : [])];
   const byRunner = new Map<string, string[]>();
   for (const part of parts) {
     const runner = detectRunner(ctx, part);
@@ -364,18 +405,56 @@ interface LocalRun { exit: number | null; outcome: Supervised['outcome']; signal
 
 const quote = (f: string) => `'${f.replace(/'/g, `'\\''`)}'`;
 
+/**
+ * Bytes of quoted file arguments one runner process may take. supervise passes the whole command as one `bash -c`
+ * argument: Linux caps a single execve argument at 128 KiB (MAX_ARG_STRLEN), every POSIX system caps argv plus the
+ * environment (ARG_MAX: 1 MiB on macOS, 2 MiB by default on Linux), and Windows caps a whole command line at 32,767
+ * characters. The runner text itself and a margin come off the top.
+ */
+export function argBudget(runner: string, env: NodeJS.ProcessEnv, platform = process.platform): number {
+  const envBytes = Object.entries(env).reduce((n, [k, v]) => n + Buffer.byteLength(`${k}=${v ?? ''}`) + 9, 0);
+  const cap = platform === 'win32' ? 24 * 1024 : Math.min(96 * 1024, 1024 * 1024 - 64 * 1024 - envBytes);
+  return cap - Buffer.byteLength(runner) - 512;
+}
+
+/** `args` split in order into chunks whose quoted, space-joined text fits `budget` bytes; an argument over it runs alone. */
+export function argChunks(args: readonly string[], budget: number): string[][] {
+  const chunks: string[][] = [];
+  let size = 0;
+  for (const a of args) {
+    const n = Buffer.byteLength(quote(a)) + 1;
+    if (!chunks.length || size + n > budget) { chunks.push([]); size = 0; }
+    chunks.at(-1)!.push(a);
+    size += n;
+  }
+  return chunks;
+}
+
 async function runOnce(ctx: PregateContext, env: NodeJS.ProcessEnv, g: RunGroup, files: string[], log: string, counter: Counter): Promise<LocalRun> {
   // playwright test reads each file argument as a case-insensitive regex: escape it and anchor it to a path segment, so `a[1].spec.ts` runs that file, not `a1.spec.ts`.
-  const args = /(?<![\w-])playwright\s+test(?![\w-])/.test(g.runner) ? files.map(f => `(?:^|/)${f.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`) : files;
-  const joined = args.map(quote).join(' ');
-  const run = g.runner.replace('{files}', () => joined);
-  const command = g.cwd ? `(cd ${quote(g.cwd)} && ${run})` : run;
-  const shown = g.cwd ? files.map(f => `${g.cwd}/${f}`) : files;
-  const r = await supervise({ command: run, cwd: path.join(ctx.repoRoot, g.cwd), env: { ...env, CI: env.CI ?? '1' }, log, deadline: Date.now() + ctx.timeoutMs, stallMs: ctx.stallTimeoutMs, label: `lanes (${shown.length === 1 ? shown[0] : `${shown.length} files`})`, files, adapter: adapterFor(g.runner), counter, progress: ctx.progress });
-  const output = readRange(log, r.start, r.end);
-  const summary = parseSummary(output, g.runner);
-  const noBrowsers = /(?<![\w-])playwright\s+test(?![\w-])/.test(g.runner) ? PLAYWRIGHT_NO_BROWSERS.exec(output)?.[0].trim().slice(0, 200) : undefined;
-  return { ...(noBrowsers ? { noBrowsers } : {}), exit: r.exit, outcome: r.outcome, signal: r.signal, observedStart: r.observedStart, ...summary, tail: output.trim().split('\n').slice(-25), runner: g.runner, command, files: shown, lastFile: r.lastFile && g.cwd ? `${g.cwd}/${r.lastFile}` : r.lastFile, ms: r.ms, ...(r.error ? { error: r.error } : {}) };
+  const args = /(?<![\w-])playwright\s+test(?![\w-])/.test(g.runner) ? files.map(f => `(?:^|/)${f.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`) : testFileArgs(g.runner, files);
+  const runEnv = { ...env, CI: env.CI ?? '1' };
+  // A file list over the argument limits (#4424: E2BIG on Linux) runs as chunks in sequence under the group's one deadline, read back as one run:
+  // the first unfinished, else the first non-zero chunk decides; counts add up; a chunk that did not finish ends the group, as a killed runner would.
+  const deadline = Date.now() + ctx.timeoutMs;
+  const parts: LocalRun[] = [];
+  let at = 0;
+  for (const chunk of argChunks(args, argBudget(g.runner, runEnv))) {
+    const part = files.slice(at, at += chunk.length);
+    const joined = chunk.map(quote).join(' ');
+    const run = g.runner.replace('{files}', () => joined);
+    const shown = g.cwd ? part.map(f => `${g.cwd}/${f}`) : part;
+    const r = await supervise({ command: run, cwd: path.join(ctx.repoRoot, g.cwd), env: runEnv, log, deadline, stallMs: ctx.stallTimeoutMs, label: `lanes (${shown.length === 1 ? shown[0] : `${shown.length} files`})`, files: part, adapter: adapterFor(g.runner), counter, progress: ctx.progress });
+    const output = readRange(log, r.start, r.end);
+    const summary = parseSummary(output, g.runner);
+    const noBrowsers = /(?<![\w-])playwright\s+test(?![\w-])/.test(g.runner) ? PLAYWRIGHT_NO_BROWSERS.exec(output)?.[0].trim().slice(0, 200) : undefined;
+    parts.push({ ...(noBrowsers ? { noBrowsers } : {}), exit: r.exit, outcome: r.outcome, signal: r.signal, observedStart: r.observedStart, ...summary, tail: output.trim().split('\n').slice(-25), runner: g.runner, command: g.cwd ? `(cd ${quote(g.cwd)} && ${run})` : run, files: shown, lastFile: r.lastFile && g.cwd ? `${g.cwd}/${r.lastFile}` : r.lastFile, ms: r.ms, ...(r.error ? { error: r.error } : {}) });
+    if (r.exit === null) break;
+  }
+  if (parts.length === 1) return parts[0]!;
+  const bad = parts.find(p => p.exit === null) ?? parts.find(p => p.exit !== 0) ?? parts.at(-1)!;
+  const sum = (k: 'ran' | 'failed') => (parts.some(p => p[k] === null) ? null : parts.reduce((n, p) => n + (p[k] as number), 0));
+  return { ...(parts.every(p => p.noBrowsers) ? { noBrowsers: parts[0]!.noBrowsers } : {}), exit: bad.exit, outcome: bad.outcome, signal: bad.signal, observedStart: parts.some(p => p.observedStart), ran: sum('ran'), failed: sum('failed'), tail: bad.tail, runner: g.runner, command: parts.map(p => p.command).join(' && '), files: parts.flatMap(p => p.files), lastFile: bad.lastFile, ms: parts.reduce((n, p) => n + p.ms, 0), ...(bad.error ? { error: bad.error } : {}) };
 }
 
 /**
@@ -414,7 +493,7 @@ function unfinished(ctx: PregateContext, r: Awaited<ReturnType<typeof runLocal>>
   const timedOut = r.runs.filter(x => x.outcome === 'timeout');
   const rest = r.failed ? `; ${r.failed} failed` : '';
   if (stalled.length) {
-    return { code: 'PREGATE_STALLED', detail: `no test output for ${ctx.stallTimeoutMs / 1000} s${STALL_IDLE}; process group killed; last file started: ${stalled.map(x => x.lastFile ?? `(none reported; ${x.files.length} file(s))`).join(', ')}${rest}`, fix: `read ${r.log} for the stalled file; fix the hang, or raise --stall-timeout (stall_timeout_s in ${ctx.configFile}; 0 disables) for a test that waits quietly for longer` };
+    return { code: 'PREGATE_STALLED', detail: `no test output for ${ctx.stallTimeoutMs / 1000} s${STALL_IDLE}; process tree killed; last file started: ${stalled.map(x => x.lastFile ?? `(none reported; ${x.files.length} file(s))`).join(', ')}${rest}`, fix: `read ${r.log} for the stalled file; fix the hang, or raise --stall-timeout (stall_timeout_s in ${ctx.configFile}; 0 disables) for a test that waits quietly for longer` };
   }
   const launch = r.runs.find(x => x.outcome === 'spawn-failed');
   if (launch) {
@@ -459,10 +538,37 @@ const GSTACK_ROOT = path.resolve(import.meta.dir, '..', '..', '..');
  */
 function remoteObligation(ctx: PregateContext, sel: Selection): RemoteObligation {
   const declared = ctx.config.remote_gate;
-  const runner = detectRunner(ctx, sel.gateTests);
-  const command = declared ?? `${GSTACK_ROOT}/scripts/ubicloud/ubi-runner.sh run --src ${quote(ctx.repoRoot)} -- ${quote(runner ? runner.replace('{files}', sel.gateTests.map(quote).join(' ')) : '<test runner> <selected files>')}`;
+  const command = declared ?? backendCommand(ctx, sel.gateTests);
   const [workflow, job] = declared ? REMOTE_GATE_LANE.split('/') as [string, string] : ['test_backend', ctx.testBackend];
   return { lane: `${workflow}/${job}`, platform: 'remote', workflow, job, tests: sel.gateTests, receipt: null, command };
+}
+
+/**
+ * The test backend's command: gstack's Ubicloud runner, with the selected files in a setup script that writes them one per line
+ * on the VM. The command reaches the VM as one argument and Linux caps one argument at 128 KiB (#4424), so the list never goes in
+ * it. The script lives under the state root, named by its content, so the same selection prints the same command every run and a
+ * same-tree clear still matches it; an unwritable state root keeps it in this run's scratch. A path the one-per-line list can't
+ * hold (a newline, or the list's end marker) keeps the quoted inline form, so no path can end the list early and run as shell.
+ */
+function backendCommand(ctx: PregateContext, files: readonly string[]): string {
+  const ubi = `${GSTACK_ROOT}/scripts/ubicloud/ubi-runner.sh run --src ${quote(ctx.repoRoot)}`;
+  const runner = detectRunner(ctx, files);
+  if (!runner) return `${ubi} -- ${quote('<test runner> <selected files>')}`;
+  const args = testFileArgs(runner, files);
+  if (args.some(f => f.includes('\n') || f === 'PREGATE_FILES')) return `${ubi} -- ${quote(runner.replace('{files}', () => args.map(quote).join(' ')))}`;
+  const setup = `cat > ~/.pregate-files.txt <<'PREGATE_FILES'\n${args.map(f => `${f}\n`).join('')}PREGATE_FILES\n`;
+  const name = `${sha256(setup).slice(0, 16)}.sh`;
+  let file: string;
+  try {
+    const dir = path.join(path.dirname(defaultScratchRoot(ctx.repoRoot, ctx.env)), 'remote-files');
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    file = path.join(dir, name);
+    fs.writeFileSync(file, setup);
+  } catch {
+    file = path.join(checkScratch(ctx.scratch, 'remote'), name);
+    fs.writeFileSync(file, setup);
+  }
+  return `${ubi} --setup ${quote(file)} -- ${quote(`mapfile -t PREGATE_FILES < ~/.pregate-files.txt && ${runner.replace('{files}', () => '"${PREGATE_FILES[@]}"')}`)}`;
 }
 
 export const REMOTE_GATE_LANE = 'pregate.json/remote_gate';
@@ -658,14 +764,22 @@ export function fromRunProfiles(ctx: PregateContext, profiles: Record<string, Ru
  * ones it already passed. Profiles are matched by workflow and OS, never by name, so none has to be named after a lane.
  */
 function fromRun(ctx: PregateContext, sel: Selection): { line: string; passed: string[]; receipt?: string } {
-  const { ref, check } = ctx.fromRun!;
-  const names = 'error' in check ? [] : fromRunProfiles(ctx, check.profiles);
-  const v = 'error' in check ? { ok: false as const, reason: 'profiles_unavailable', detail: check.error } : verifyFromRun(check, ref, names, ctx.wtree, ctx.head);
-  if (!v.ok) return { line: `REUSE: refused reason=${v.reason} — ${v.detail}; every selected test runs here`, passed: [] };
-  const ran = new Set(ranFiles(v.evidence));
+  const { ref, check, runs } = ctx.fromRun!;
+  if ('error' in check) return { line: `REUSE: refused reason=profiles_unavailable — ${check.error}; every selected test runs here`, passed: [] };
+  const names = fromRunProfiles(ctx, check.profiles);
+  const verdicts = (runs ?? [{ ref, profile: null }]).map(r => verifyFromRun(check, r.ref, r.profile ? names.filter(n => n === r.profile) : names, ctx.wtree, ctx.head));
+  const ok = verdicts.flatMap(v => (v.ok ? [v.evidence] : []));
+  const v = verdicts[0]!;
+  if (!ok.length && !v.ok) return { line: `REUSE: refused reason=${v.reason} — ${v.detail}; every selected test runs here`, passed: [] };
+  let changed: string | null = null;
+  try { for (const e of ok.length > 1 ? ok : []) changed ??= runChanged(check.deps, e.run_id, e.run_attempt); }
+  catch (err) { changed = `reading the runs again failed: ${String((err as Error)?.message ?? err).slice(0, 200)}`; }
+  if (changed) return { line: `REUSE: refused reason=run_changed — ${changed}; every selected test runs here`, passed: [] };
+  const ran = new Set(ok.flatMap(ranFiles));
   const passed = sel.localTests.filter(t => ran.has(t));
-  const skipped = sel.localTests.filter(t => v.evidence.skipped?.includes(t)).length;
-  return { line: `REUSE: accepted ${passed.length} of ${sel.localTests.length} selected local test file(s) from ${v.receipt}; ${sel.localTests.length - passed.length} still run${skipped ? ` (${skipped} skipped every test in the run)` : ''}`, passed, receipt: v.receipt };
+  const skipped = sel.localTests.filter(t => !ran.has(t) && ok.some(e => e.skipped?.includes(t))).length;
+  const receipt = `run tree=${ctx.wtree.slice(0, 12)} tests=${ok.reduce((n, e) => n + (e.tests ?? e.files.length), 0)} ${runReceiptFields(ok, check.now)}`;
+  return { line: `REUSE: accepted ${passed.length} of ${sel.localTests.length} selected local test file(s) from ${receipt}; ${sel.localTests.length - passed.length} still run${skipped ? ` (${skipped} skipped every test in the run)` : ''}`, passed, receipt };
 }
 
 /**

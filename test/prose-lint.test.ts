@@ -130,6 +130,14 @@ describe('lintProse: each rule, positive and negative', () => {
     expect(lintProse(text, 'x.md').map(f => [f.rule, f.line])).toEqual([['dropped-article', 5], ['unclosed-block', 9]]);
   });
 
+  // Value: protects=a line that opens with an inline code span is prose, so the lines after it are still read;
+  //   fails_when=the span opens a fence, later prose is masked as code and the next bare fence reads as an unclosed block
+  //   that stops the scan; why_new=every fence case above opens with a bare or info-string fence line; seam=none
+  test('a line opening with an inline code span is prose, and the lines after it are read', () => {
+    const text = ['````gstack-ship-receipt```` is a section of its own.', 'This vibrant line is read.', '````', '```json', '{"vibrant": true}', '```', '````'].join('\n');
+    expect(lintProse(text, 'x.md').map(f => [f.rule, f.line])).toEqual([['vocabulary', 2]]);
+  });
+
   test('findings are sorted by line and the render ends in the trailer', () => {
     const text = renderProseLint({ findings: lintProse('Showcasing a vibrant release.\n\nParser rejects it.', 'f.md'), scanned: ['f.md'], empty: [] });
     expect(text.split('\n').filter(Boolean)).toEqual([
@@ -307,8 +315,8 @@ describe('wiring', () => {
     expect(changelog).toContain('gstack-prose-lint CHANGELOG.md --base origin/<base> --gate');
     const prBody = read('ship/sections/pr-body.md.tmpl');
     const compose = prBody.slice(prBody.indexOf(': "${DOCS_SECTION_FILE:?'), prBody.indexOf('echo "PR_BODY_FILE: $PR_BODY_FILE"'));
-    expect(compose).toContain(`gstack-prose-lint "$BODY_TOP_FILE" --sections 'Why,Summary,Blast radius' --gate`);
-    expect(compose).not.toContain('What changed,');
+    expect(compose).toContain(`gstack-prose-lint "$BODY_TOP_FILE" --sections 'Why,What changed,Blast radius' --gate`);
+    expect(compose).not.toContain('Summary,');
     expect(compose).not.toContain('"$BODY_REST_FILE" --gate');
     expect(compose.indexOf('gstack-prose-lint')).toBeGreaterThan(compose.indexOf('is empty, so the body was never written'));
     expect(compose.indexOf('gstack-prose-lint')).toBeLessThan(compose.indexOf('{ awk 1 "$BODY_TOP_FILE"'));
@@ -317,7 +325,7 @@ describe('wiring', () => {
 
   test('the PR body leads with the problem and carries a Blast radius item, on both the standard and the Capy path', () => {
     const prBody = read('ship/sections/pr-body.md.tmpl');
-    const summary = prBody.slice(prBody.indexOf('## Summary'), prBody.indexOf('## Test Coverage'));
+    const summary = prBody.slice(prBody.indexOf('## What changed'), prBody.indexOf('## Test Coverage'));
     expect(summary).toContain("Open with the problem in the user's words");
     expect(summary).toContain('Never an inventory or a commit list.');
     expect(summary).toMatch(/BAD: ".+" GOOD: "/s);

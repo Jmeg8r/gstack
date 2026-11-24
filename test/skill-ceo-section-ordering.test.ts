@@ -377,8 +377,11 @@ test('CEO integrates completed native findings before its external-only comparis
       anchors.map(anchor => typeof anchor === 'string' ? review.indexOf(anchor) : review.search(anchor));
     expect(review.slice(externalStart, nativeStart)).toContain('**Integrate reviewer findings**');
     const bounded = review.slice(boundedStart, unavailableStart);
-    expect(bounded).toContain('**Integrate reviewer findings**');
-    expect(bounded).toMatch(/follow step 4/i);
+    if (host.name === 'codex') expect(bounded).toContain('take the unavailable path without launching');
+    else {
+      expect(bounded).toContain('**Integrate reviewer findings**');
+      expect(bounded).toMatch(/follow step 4/i);
+    }
     expect(bounded).not.toContain('continue to Cross-model tension');
     const unavailable = review.slice(unavailableStart, findingsStart);
     expect(unavailable).toContain('STATUS = "unavailable", SOURCE = "none", OUTSIDE_STATUS = "unavailable"');
@@ -439,7 +442,8 @@ test('CEO mode recommendation explains a plan-specific consequence without chang
     const source = fs.readFileSync(file, 'utf8');
     const mode = between(source, '### 0E. Mode Selection', '### 0F.');
     const recommendation = compactProse(between(mode, '2. Recommend without selecting.', '3. Resolve that recommendation.'));
-    expect(recommendation).toMatch(/not just its count\/category/i);
+    expect(recommendation).toMatch(/what this mode does with it that the nearest other mode would not/i);
+    expect(recommendation).toMatch(/never a count or category alone/i);
     expectMentions(recommendation, [['>15', 'scope reduction']], 'recommendation');
     expect(recommendation).toContain('(greenfield) → SCOPE EXPANSION');
     expect(recommendation).toContain('added capability → SELECTIVE EXPANSION');

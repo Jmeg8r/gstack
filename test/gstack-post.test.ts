@@ -11,8 +11,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { EXIT, attributionCallout, mergeBodySections, runPost, type PostEnv } from "../lib/gstack-post";
-import { extractReceipt, orderReceipt, placeReceipt, receiptRuns } from "../lib/ship-receipt";
+import { extractReceipt, orderReceipt, placeReceipt, receiptRuns, receiptSummaryLine } from "../lib/ship-receipt";
+import { runReceiptFields, type RunEvidence } from "../lib/run-evidence";
 import type { ShipReceipt } from "../lib/headless-artifacts";
+import { foldSections, unfoldSections } from "../lib/pr-body-shape";
+import { buildRow, renderRecord, type ApprovalRow, type StoreLocation } from "../lib/approval-record";
+import { reviewRoundGrantRow } from "../lib/review-round-grant";
 
 interface Call { cmd: string; args: string[]; input?: string }
 
@@ -348,7 +352,183 @@ describe("gstack-post owns the redaction scan", () => {
     );
     for (const [name, text, needle] of holds) {
       const { code, phones, f } = post(text);
-      expect([name, phones, code]).toEqual([name, [`RULE: pii.phone.e164 LINE: ${lineOf(text, needle)} PART: body`], EXIT.confirm]);
+      expect([name, phones, code]).toEqual([name, [`RULE: pii.phone.e164 LINE: ${lineOf(foldSections(text), needle)} PART: body`], EXIT.confirm]);
+      expect(f.posts()).toEqual([]);
+    }
+  });
+
+  // Value: protects=/ship's own receipt posts through pr-body without a pii.phone.e164 confirmation (gstack#4480): the writer-rendered block's
+  //   run field holding a gstack-skill-start session id (<pid>-<epoch>-<8 hex>), its pregate and requires_remote values naming all-digit 12-hex
+  //   shas, and the SHIP_RECEIPT:, CI_CARRY:, PREGATE: and READY_RECEIPT: lines the writers print (heads=, carried_from=, base_red=,
+  //   ci_carried=<lane>:<run>/<attempt>), while a phone number in prose, in a non-receipt code block, in another field, in a field holding another
+  //   shape, on a line without a receipt prefix or in a hand-written block still needs one; fails_when=every /ship body post with a 7-digit pid or
+  //   an all-digit head prefix needs --confirm, or the exemption reaches past those exact values; why_new=the GST-2047 test covers only run-id
+  //   fields, and the receipt lines' sha fields after heads=, carried_from= and base_red= were never allowlisted; seam=fake run; no_claim=real gh
+  test("a ship receipt's session id, its sha fields and the receipt lines /ship prints are not phone numbers; a phone number anywhere else still is", () => {
+    const HEAD = "2294465066182c2f99d64ba0016213463aaa0c14";
+    const carry = "remote-gate tree=704992822996 tests=37713 skipped=105 " + runReceiptFields([{ run_id: 44231639842, run_attempt: 1, profile: "ci-reuse/free-tests", head_sha: HEAD } as RunEvidence], new Date("2026-11-18T03:48:28.588Z"));
+    const receipt = (extra: Partial<ShipReceipt> = {}) => orderReceipt({
+      schema_version: 1, pr: 4480, head: HEAD, base: "main", run: "1234567-1794900000-0a1b2c3d",
+      pregate: "requires-remote cleared @704992822996 (8 checks, current for 229446506618)",
+      requires_remote: [`pregate.json/remote_gate: ${carry}`],
+      ci_carried: [{ lane: "free-tests", run: 44231639842, attempt: 1, tree: "704992822996ab" }],
+      ...extra,
+    });
+    const summary = receiptSummaryLine({ ...receipt(), predecessor: "381726354901aa", carry: { from: "381726354901ffee" }, base_red: { base: "381726354901ffee" }, ci_carried: [{ lane: "free-tests", run: 44231639842, attempt: 1, tree: "t" }, { lane: "windows-smoke", run: 44231645300, attempt: 2, tree: "t" }] } as ShipReceipt);
+    const lines = [summary, `CI_CARRY: accepted ${carry}`, `- CI_CARRY: cleared pregate.json/remote_gate ${carry}`, "PREGATE: requires-remote tree=704992822996 head=229446506618 checks=8 of 8", "READY_RECEIPT: .gstack/ready/acme-widget/4480-229446506618.json (ok)"];
+    expect(summary).toContain("carried_from=381726354901 ci_carried=free-tests:44231639842/1,windows-smoke:44231645300/2 base_red=381726354901");
+    const body = (r: ShipReceipt, prose = "Narrows one false positive.") => placeReceipt(`## What changed\n\n${prose}\n`, r);
+    const post = (text: string) => {
+      const f = fakeEnv({ files: { "/b": text }, visibility: "public" });
+      return { code: run(["pr-body", "4480", "--replace", "--body-file", "/b"], f), phones: f.stdout().split("\n").filter(l => l.startsWith("RULE: pii.phone.e164 ")), f };
+    };
+    const lineOf = (text: string, needle: string) => text.split("\n").findIndex(l => l.includes(needle)) + 1;
+
+    for (const text of [body(receipt()), body(receipt(), lines.join("\n"))]) {
+      expect(extractReceipt(text)).toMatchObject({ found: true, errors: [] });
+      const { code, phones, f } = post(text);
+      expect([phones, code]).toEqual([[], EXIT.posted]);
+      expect(f.posts()).toHaveLength(1);
+    }
+
+    const holds: Array<[string, string, string]> = [
+      ["E.164 in prose", body(receipt(), "Call +14155552671 for the on-call."), "+14155552671"],
+      ["a session id in a json code block", body(receipt(), '```json\n{ "run": "1234567-1794900000-0a1b2c3d" }\n```'), '{ "run": "1234567'],
+      ["a number in a plain code block", body(receipt(), "```\ncall 14155552671\n```"), "call 14155552671"],
+      ["heads= on a line without a receipt prefix", body(receipt(), "heads=229446506618 ran"), "heads=229446506618"],
+      ["a phone on a receipt line", body(receipt(), "CI_CARRY: none (call +1 415 555 0123)"), "CI_CARRY: none"],
+      ["a 10-digit ci_carried run on a receipt line", body(receipt(), "SHIP_RECEIPT: pr=4480 ci_carried=free-tests:4155552671/1"), "SHIP_RECEIPT: pr=4480 ci_carried"],
+      ["a receipt line inside a plain code block", body(receipt(), "```text\nSHIP_RECEIPT: pr=4480 ci_carried=phone:14155552671/1\n```"), "SHIP_RECEIPT: pr=4480 ci_carried=phone"],
+      ["a receipt line inside a tilde code block", body(receipt(), "~~~\nCI_CARRY: accepted heads=229446506618\n~~~"), "CI_CARRY: accepted heads"],
+      ["a session id in the thread field", body(receipt({ thread: "1234567-1794900000-0a1b2c3d" })), '"thread": "1234567'],
+      ["a phone in the run field", body(receipt({ run: "+14155552671" })), '"run": "+14155552671"'],
+      ["a session id without its random suffix", body(receipt({ run: "1234567-1794900000" })), '"run": "1234567-1794900000"'],
+      ["a phone in the pregate field", body(receipt({ pregate: "requires-remote cleared, call 415-555-0100" })), "call 415-555-0100"],
+    ];
+    holds.push(["hand-written one-line block", "## What changed\n\nOne fix.\n\n```gstack-ship-receipt\n" + JSON.stringify(receipt({ pregate: undefined, requires_remote: undefined, ci_carried: undefined })) + "\n```\n", '"run":"1234567']);
+    for (const [name, text, needle] of holds) {
+      const { code, phones, f } = post(text);
+      expect([name, phones, code]).toEqual([name, [`RULE: pii.phone.e164 LINE: ${lineOf(foldSections(text), needle)} PART: body`], EXIT.confirm]);
+      expect(f.posts()).toEqual([]);
+    }
+  });
+
+  // Value: protects=a gstack-receipt-runs block's session ids (/ship's earlier runs) post through pr-comment and pr-body without a pii.phone.e164
+  //   confirmation (gstack#4725), while a phone number in another field of the same line, a phone number, a truncated id or a session id under
+  //   another key, a non-canonical line, a line whose head is missing or not a 40-hex sha, an unclosed block and the same id in prose still need
+  //   one; fails_when=every /ship that rewrites a PR body holding earlier runs gets a false MEDIUM hold, or the exemption reaches past the exact
+  //   run value of a canonical runs line; why_new=the #4480 test covers only the gstack-ship-receipt block; seam=fake gh; no_claim=real gh
+  test("a runs block's session ids are not phone numbers; a phone number anywhere else in or around the block still is", () => {
+    const HEAD_A = "abc123abc123abc123abc123abc123abc123abcd";
+    const HEAD_B = "def456def456def456def456def456def456def0";
+    const RUN_A = "4242424-1700000000-deadbeef";
+    const RUN_B = "3454314-1795338725-c32255b8";
+    const post = (args: string[], text: string, visibility: "public" | "private" = "private") => {
+      const f = fakeEnv({ files: { "/b": text }, visibility });
+      return { code: run([...args, "--body-file", "/b"], f), phones: f.stdout().split("\n").filter(l => l.startsWith("RULE: pii.phone.e164 ")), f };
+    };
+    const runsBlock = (...lines: string[]) => `Body.\n\n\`\`\`gstack-receipt-runs\n${lines.join("\n")}\n\`\`\`\n`;
+
+    const comment = post(["pr-comment", "1"], runsBlock(JSON.stringify({ head: HEAD_A, version: "1.0.0.0", run: RUN_A }), JSON.stringify({ run: RUN_B, head: HEAD_B, mark: "stop" })));
+    expect([comment.phones, comment.code, comment.f.posts().length]).toEqual([[], EXIT.posted, 1]);
+
+    const first = placeReceipt("## What changed\n\nFirst run.\n", orderReceipt({ schema_version: 1, pr: 4725, head: HEAD_A, base: "main", version: "1.0.0.0", run: RUN_A }));
+    const second = placeReceipt(first, orderReceipt({ schema_version: 1, pr: 4725, head: HEAD_B, base: "main", version: "1.0.0.0", run: RUN_B }));
+    expect(second).toContain("```gstack-receipt-runs\n");
+    const body = post(["pr-body", "4725", "--replace"], second, "public");
+    expect([body.phones, body.code, body.f.posts().length]).toEqual([[], EXIT.posted, 1]);
+
+    const holds: Array<[string, string, string]> = [
+      ["a phone number in reason on a line with a valid run", runsBlock(JSON.stringify({ head: HEAD_A, run: RUN_A, mark: "abandoned", by: "ops", reason: "call +14155552671" })), "call +14155552671"],
+      ["a phone number as the run", runsBlock(JSON.stringify({ head: HEAD_A, run: "+14155552671" })), '"+14155552671"'],
+      ["a truncated session id", runsBlock(JSON.stringify({ head: HEAD_A, run: "4242424-1700000000" })), '"4242424-1700000000"'],
+      ["a session id under another key", runsBlock(JSON.stringify({ head: HEAD_A, run: "ship-1", grant: RUN_A })), RUN_A],
+      ["a session id nested under review_loop", runsBlock(JSON.stringify({ head: HEAD_A, review_loop: { run: RUN_A } })), RUN_A],
+      ["a non-canonical spaced line", runsBlock(`{ "head": "${HEAD_A}", "run": "${RUN_A}" }`), RUN_A],
+      ["a duplicated run key", runsBlock(`{"head":"${HEAD_A}","run":"${RUN_A}","run":"${RUN_B}"}`), RUN_A],
+      ["a line missing head", runsBlock(JSON.stringify({ version: "1.0.0.0", run: RUN_A })), RUN_A],
+      ["a head that is not a 40-hex sha", runsBlock(JSON.stringify({ head: "main", run: RUN_A })), RUN_A],
+      ["an unclosed runs block", `Body.\n\n\`\`\`gstack-receipt-runs\n${JSON.stringify({ head: HEAD_A, run: RUN_A })}\n`, RUN_A],
+      ["a session id in prose after the block", runsBlock(JSON.stringify({ head: HEAD_A, run: RUN_B })) + `\nRun ${RUN_A} failed.\n`, `Run ${RUN_A}`],
+      ["a runs block inside another fence", `Body.\n\n\`\`\`\`markdown\n\`\`\`gstack-receipt-runs\n${JSON.stringify({ head: HEAD_A, run: RUN_A })}\n\`\`\`\n\`\`\`\`\n`, RUN_A],
+      ["a session id in a json block", `Body.\n\n\`\`\`json\n${JSON.stringify({ head: HEAD_A, run: RUN_A })}\n\`\`\`\n`, RUN_A],
+    ];
+    for (const [name, text, needle] of holds) {
+      const { code, phones, f } = post(["pr-comment", "1"], text);
+      const line = text.split("\n").findIndex(l => l.includes(needle)) + 1;
+      expect([name, [...new Set(phones)], code, f.posts()]).toEqual([name, [`RULE: pii.phone.e164 LINE: ${line} PART: body`], EXIT.confirm, []]);
+    }
+  });
+
+  // Value: protects=a /ship session id that also reads as a Luhn-valid card number (about 1 in 10) posts without a pii.cc confirmation when it is
+  //   the run of a runs-block line or of the ship receipt (gstack#4725, gstack#4480), while a card number in another field of the same line, a card
+  //   number as the run, and the same id in prose or in a json block still need one; fails_when=about one /ship body in ten still gets a false
+  //   MEDIUM hold, or the card exemption reaches past the exact run value; why_new=the runs-block and #4480 tests cover pii.phone.e164 only;
+  //   seam=fake gh; no_claim=real gh
+  test("a session id that reads as a card number is skipped only as the run of a runs line or the receipt", () => {
+    const HEAD_A = "abc123abc123abc123abc123abc123abc123abcd";
+    const CARD_RUN = "4242405-1795338725-c32255b8";
+    const DIGIT_RUN = "99999-1795338725-12345678";
+    const post = (args: string[], text: string) => {
+      const f = fakeEnv({ files: { "/b": text }, visibility: "public" });
+      return { code: run([...args, "--body-file", "/b"], f), cards: () => f.stdout().split("\n").filter(l => l.startsWith("RULE: pii.cc ")), f };
+    };
+    const runsBlock = (...lines: string[]) => `Body.\n\n\`\`\`gstack-receipt-runs\n${lines.join("\n")}\n\`\`\`\n`;
+    const receiptBody = (runId: string) => placeReceipt("## What changed\n\nOne fix.\n", orderReceipt({ schema_version: 1, pr: 4725, head: HEAD_A, base: "main", version: "1.0.0.0", run: runId }));
+
+    for (const text of [runsBlock(JSON.stringify({ head: HEAD_A, run: CARD_RUN }), JSON.stringify({ head: HEAD_A, run: DIGIT_RUN, mark: "stop" })), receiptBody(CARD_RUN), receiptBody(DIGIT_RUN)]) {
+      const p = post(["pr-body", "4725", "--replace"], text);
+      expect([p.cards(), p.code, p.f.posts().length]).toEqual([[], EXIT.posted, 1]);
+    }
+
+    const holds: Array<[string, string, string]> = [
+      ["a card number in reason on a line with a valid run", runsBlock(JSON.stringify({ head: HEAD_A, run: CARD_RUN, mark: "abandoned", by: "ops", reason: "card 4111111111111111" })), "card 4111111111111111"],
+      ["a card number as a runs line's run", runsBlock(JSON.stringify({ head: HEAD_A, run: "4111111111111111" })), '"4111111111111111"'],
+      ["a spaced card number as a runs line's run", runsBlock(JSON.stringify({ head: HEAD_A, run: "4111 1111 1111 1111" })), '"4111 1111'],
+      ["a card number as the receipt's run", receiptBody("4111111111111111"), '"run": "4111111111111111"'],
+      ["the session id in prose after the block", runsBlock(JSON.stringify({ head: HEAD_A, run: DIGIT_RUN })) + `\nRun ${CARD_RUN} failed.\n`, `Run ${CARD_RUN}`],
+      ["the session id in a json block", `Body.\n\n\`\`\`json\n${JSON.stringify({ head: HEAD_A, run: CARD_RUN })}\n\`\`\`\n`, CARD_RUN],
+    ];
+    for (const [name, text, needle] of holds) {
+      const p = post(["pr-comment", "1"], text);
+      const line = text.split("\n").findIndex(l => l.includes(needle)) + 1;
+      expect([name, [...new Set(p.cards())], p.code, p.f.posts()]).toEqual([name, [`RULE: pii.cc LINE: ${line} PART: body`], EXIT.confirm, []]);
+    }
+  });
+
+  // Value: protects=a private PR's Approvals table (renderRecord, full mode) posts through pr-body without a pii.phone.e164 confirmation when a
+  //   fix-check grant row's Covers cell names a run id like 507-7192673 (GST-3246, trail-read row 8), while the same digits in that row's
+  //   Asked or Exact words cell, in prose, or in a table no Source footer closes still need one; fails_when=every private /ship body with such a
+  //   grant needs --confirm, or the exemption reaches past the stop= token of a renderer-shaped table; seam=fake run; no_claim=real gh
+  test("a fix-check grant's run id in a rendered Approvals table is no phone number; the same digits anywhere else still are", () => {
+    const HEAD = "2294465066182c2f99d64ba0016213463aaa0c14";
+    const loc: StoreLocation = { file: "/x", branch: "fix-undo-line", slug: "acme-widget", ephemeral: false };
+    const grant = (reason: string, words = "one fix round") => {
+      const row = buildRow({ ...reviewRoundGrantRow(HEAD, 507, "fix-check", reason, { run: "507-7192673", findings: ["p2/outside-voice#3"] }), words, by: "GStack Minder (GSTA-36)" }, loc.branch);
+      if ("code" in row) throw new Error(row.message);
+      return row;
+    };
+    const table = (rows: ApprovalRow[]) => renderRecord({ rows, state: "present", restored: false }, loc, { mode: "full" });
+    const post = (text: string) => {
+      const f = fakeEnv({ files: { "/b": text }, visibility: "private" });
+      return { code: run(["pr-body", "507", "--replace", "--body-file", "/b"], f), phones: f.stdout().split("\n").filter(l => l.startsWith("RULE: pii.phone.e164 ")), f };
+    };
+    const lineOf = (text: string, needle: string) => text.split("\n").findIndex(l => l.includes(needle)) + 1;
+    const ok = `## What changed\n\nFixes the undo line.\n\n${table([grant("the undo line names the wrong migration")])}`;
+    expect(ok).toContain("stop=507-7192673 findings=p2/outside-voice#3 |");
+    const clean = post(ok);
+    expect([clean.phones, clean.code]).toEqual([[], EXIT.posted]);
+    expect(clean.f.posts()).toHaveLength(1);
+
+    const footerless = table([grant("the undo line names the wrong migration")]).replace(/\nSource: gstack-approvals record for .*\n/, "\n");
+    const holds: Array<[string, string, string]> = [
+      ["the digits in prose", ok + "\nCall 507-7192673 for the on-call.\n", "Call 507-7192673"],
+      ["the digits in the Asked cell", ok.replace("the undo line names the wrong migration", "call 507-7192673 later"), "call 507-7192673"],
+      ["a table no Source footer closes", `## What changed\n\n${footerless}`, "stop=507-7192673"],
+    ];
+    for (const [name, text, needle] of holds) {
+      const { code, phones, f } = post(text);
+      expect([name, phones, code]).toEqual([name, [`RULE: pii.phone.e164 LINE: ${lineOf(foldSections(text), needle)} PART: body`], EXIT.confirm]);
       expect(f.posts()).toEqual([]);
     }
   });
@@ -494,23 +674,33 @@ describe("gstack-post pr-body merges the PR body by section", () => {
   test("a first-section-only body keeps the other sections and the receipt; a same-titled section is replaced in place; new sections are appended", () => {
     const f = withBody(CURRENT, { "/b": "## What Changed\n\n- the new summary\n" });
     expect(run(["pr-body", "5", "--body-file", "/b"], f)).toBe(EXIT.posted);
-    expect(sent(f).input).toBe(RECEIPT("aaaa") + "\n## What Changed\n\n- the new summary\n\n## Why\n\nBecause.\n\n## Approvals\n\n- owner: do it\n");
+    expect(sent(f).input).toBe(foldSections(RECEIPT("aaaa") + "\n## What Changed\n\n- the new summary\n\n## Why\n\nBecause.\n\n## Approvals\n\n- owner: do it\n"));
     expect(f.stderr()).toBe("gstack-post: pr-body merged by section: replaced What changed; kept ship receipt, Why, Approvals; added none\n");
     expect(f.calls.find(c => c.cmd === "gh" && c.args[1] === "view")!.args).toEqual(["pr", "view", "5", "--json", "body", "--jq", ".body"]);
 
     const receipt = withBody(CURRENT, { "/b": RECEIPT("bbbb") });
     expect(run(["pr-body", "5", "--body-file", "/b"], receipt)).toBe(EXIT.posted);
-    expect(sent(receipt).input).toBe(CURRENT.replace(RECEIPT("aaaa"), RECEIPT("bbbb")));
+    expect(sent(receipt).input).toBe(foldSections(CURRENT.replace(RECEIPT("aaaa"), RECEIPT("bbbb"))));
     expect(receipt.stderr()).toBe("gstack-post: pr-body merged by section: replaced ship receipt; kept What changed, Why, Approvals; added none\n");
 
     const added = withBody(CURRENT, { "/b": "## Why\n\nStill because.\n\n## Tests\n\n- one\n" });
     expect(run(["pr-body", "5", "--body-file", "/b"], added)).toBe(EXIT.posted);
-    expect(sent(added).input).toBe(RECEIPT("aaaa") + "\n## What changed\n\n- the old summary\n\n## Why\n\nStill because.\n\n## Approvals\n\n- owner: do it\n\n## Tests\n\n- one\n");
+    expect(sent(added).input).toBe(foldSections(RECEIPT("aaaa") + "\n## What changed\n\n- the old summary\n\n## Why\n\nStill because.\n\n## Approvals\n\n- owner: do it\n\n## Tests\n\n- one\n"));
     expect(added.stderr()).toBe("gstack-post: pr-body merged by section: replaced Why; kept ship receipt, What changed, Approvals; added Tests\n");
 
     const fenced = withBody("## Notes\n\n```md\n## not a heading\n```\n\n## Why\n\nold\n", { "/b": "## Why\n\nnew\n" });
     expect(run(["pr-body", "5", "--body-file", "/b"], fenced)).toBe(EXIT.posted);
-    expect(sent(fenced).input).toBe("## Notes\n\n```md\n## not a heading\n```\n\n## Why\n\nnew\n");
+    expect(sent(fenced).input).toBe(foldSections("## Notes\n\n```md\n## not a heading\n```\n\n## Why\n\nnew\n"));
+  });
+
+  // Value: protects=re-posting an already-folded body (the live body, or gstack-post fold output) replaces each section once instead of keeping the
+  // old sections beside it; fails_when=the incoming folds are read as leading text and every section ends up twice; why_new=GST-2737 review (granted fix-check)
+  test("a folded incoming body replaces the folded sections it names; nothing is duplicated", () => {
+    const current = foldSections("Opening.\n\n## Tests\n\nOld\n\n## Why\n\nBecause.\n");
+    const f = withBody(current, { "/b": foldSections("Opening.\n\n## Tests\n\nNew\n") });
+    expect(run(["pr-body", "5", "--body-file", "/b"], f)).toBe(EXIT.posted);
+    expect(sent(f).input).toBe(foldSections("Opening.\n\n## Tests\n\nNew\n\n## Why\n\nBecause.\n"));
+    expect(f.stderr()).toContain("replaced leading text, Tests; kept Why");
   });
 
   // Value: protects=a fence closes only on a run of its own character at least as long as the opener with nothing after it, so a ``` line inside a
@@ -522,31 +712,31 @@ describe("gstack-post pr-body merges the PR body by section", () => {
     const long = "## Notes\n\n````md\n```\n## Tests\nfake\n```\n````\n\n## Tests\n\nold\n";
     const four = withBody(long, { "/b": "## Tests\n\nnew\n" });
     expect(run(["pr-body", "5", "--body-file", "/b"], four)).toBe(EXIT.posted);
-    expect(sent(four).input).toBe("## Notes\n\n````md\n```\n## Tests\nfake\n```\n````\n\n## Tests\n\nnew\n");
+    expect(sent(four).input).toBe(foldSections("## Notes\n\n````md\n```\n## Tests\nfake\n```\n````\n\n## Tests\n\nnew\n"));
     expect(four.stderr()).toBe("gstack-post: pr-body merged by section: replaced Tests; kept Notes; added none\n");
 
     const info = withBody("## Notes\n\n```sh\n```js\n## Tests\n~~~\n```\n\n## Tests\n\nold\n", { "/b": "## Tests\n\nnew\n" });
     expect(run(["pr-body", "5", "--body-file", "/b"], info)).toBe(EXIT.posted);
-    expect(sent(info).input).toBe("## Notes\n\n```sh\n```js\n## Tests\n~~~\n```\n\n## Tests\n\nnew\n");
+    expect(sent(info).input).toBe(foldSections("## Notes\n\n```sh\n```js\n## Tests\n~~~\n```\n\n## Tests\n\nnew\n"));
 
     const unclosed = "```gstack-ship-receipt\nSHIP_RECEIPT: pr=5 head=aaaa\n\n## Summary\n\nold\n\n## Approvals\n\n- owner: do it\n";
     const open = withBody(unclosed, { "/b": RECEIPT("bbbb") + "\n## Summary\n\nnew\n" });
     expect(run(["pr-body", "5", "--body-file", "/b"], open)).toBe(EXIT.posted);
-    expect(sent(open).input).toBe(RECEIPT("bbbb") + "\n" + unclosed + "\n## Summary\n\nnew\n");
+    expect(sent(open).input).toBe(foldSections(RECEIPT("bbbb") + "\n" + unclosed + "\n## Summary\n\nnew\n"));
     expect(open.stderr()).toBe("gstack-post: pr-body merged by section: replaced none; kept unclosed receipt fence; added ship receipt, Summary\n");
 
     const prose = withBody(unclosed, { "/b": "Updated introduction\n\n## Summary\n\nnew\n" });
     expect(run(["pr-body", "5", "--body-file", "/b"], prose)).toBe(EXIT.posted);
-    expect(sent(prose).input).toBe("Updated introduction\n\n" + unclosed + "\n## Summary\n\nnew\n");
+    expect(sent(prose).input).toBe(foldSections("Updated introduction\n\n" + unclosed + "\n## Summary\n\nnew\n"));
 
     const inside = withBody("Intro\n\n## Notes\n\n" + unclosed, { "/b": "New intro\n\n## Notes\n\nnew notes\n\n## Approvals\n\n- owner: still\n" });
     expect(run(["pr-body", "5", "--body-file", "/b"], inside)).toBe(EXIT.posted);
-    expect(sent(inside).input).toBe("New intro\n\n## Notes\n\nnew notes\n\n" + unclosed + "\n## Approvals\n\n- owner: still\n");
+    expect(sent(inside).input).toBe(foldSections("New intro\n\n## Notes\n\nnew notes\n\n" + unclosed + "\n## Approvals\n\n- owner: still\n"));
     expect(inside.stderr()).toBe("gstack-post: pr-body merged by section: replaced leading text, Notes; kept unclosed receipt fence; added Approvals\n");
 
     const after = withBody(RECEIPT("aaaa") + "\n## Why\n\nold\n\n" + unclosed, { "/b": RECEIPT("bbbb") + "\n## Why\n\nnew\n" });
     expect(run(["pr-body", "5", "--body-file", "/b"], after)).toBe(EXIT.posted);
-    expect(sent(after).input).toBe(RECEIPT("bbbb") + "\n## Why\n\nnew\n\n" + unclosed);
+    expect(sent(after).input).toBe(foldSections(RECEIPT("bbbb") + "\n## Why\n\nnew\n\n" + unclosed));
     expect(after.stderr()).toBe("gstack-post: pr-body merged by section: replaced ship receipt, Why; kept unclosed receipt fence; added none\n");
   });
 
@@ -560,18 +750,18 @@ describe("gstack-post pr-body merges the PR body by section", () => {
     const intro = "Draft intro from gh pr create, long enough to need truncation in the summary line\nsecond line\n\n";
     const stale = withBody(intro + CURRENT, { "/b": RECEIPT("bbbb") + "\n## What changed\n\n- new\n" });
     expect(run(["pr-body", "5", "--body-file", "/b"], stale)).toBe(EXIT.posted);
-    expect(sent(stale).input).toBe(intro + RECEIPT("bbbb") + "\n## What changed\n\n- new\n\n## Why\n\nBecause.\n\n## Approvals\n\n- owner: do it\n");
+    expect(sent(stale).input).toBe(foldSections(intro + RECEIPT("bbbb") + "\n## What changed\n\n- new\n\n## Why\n\nBecause.\n\n## Approvals\n\n- owner: do it\n"));
     expect(stale.stderr()).toBe("gstack-post: pr-body merged by section: replaced ship receipt, What changed; kept leading text, Why, Approvals; added none\n");
 
     const between = withBody(RECEIPT("aaaa") + "Old note under the receipt\n\n## What changed\n\n- old\n", { "/b": RECEIPT("bbbb") + "## What changed\n\n- new\n" });
     expect(run(["pr-body", "5", "--body-file", "/b"], between)).toBe(EXIT.posted);
-    expect(sent(between).input).toBe(RECEIPT("bbbb") + "\n## What changed\n\n- new\n");
+    expect(sent(between).input).toBe(foldSections(RECEIPT("bbbb") + "\n## What changed\n\n- new\n"));
     expect(between.stderr()).toBe("gstack-post: pr-body merged by section: replaced ship receipt, What changed; kept none; added none; dropped trailing text (\"Old note under the receipt\")\n");
 
     const own = withBody("Stale intro\n\n" + RECEIPT("aaaa") + "Stale note\n\n## Why\n\nold\n", { "/b": "Fresh intro\n\n" + RECEIPT("bbbb") + "Fresh note\n\n## Why\n\nnew\n" });
     expect(run(["pr-body", "5", "--body-file", "/b"], own)).toBe(EXIT.posted);
-    expect(sent(own).input).toBe("Fresh intro\n\n" + RECEIPT("bbbb") + "\nFresh note\n\n## Why\n\nnew\n");
-    expect(mergeBodySections(sent(own).input!, "Fresh intro\n\n" + RECEIPT("bbbb") + "Fresh note\n\n## Why\n\nnew\n").body).toBe(sent(own).input!);
+    expect(sent(own).input).toBe(foldSections("Fresh intro\n\n" + RECEIPT("bbbb") + "\nFresh note\n\n## Why\n\nnew\n"));
+    expect(foldSections(mergeBodySections(unfoldSections(sent(own).input!), "Fresh intro\n\n" + RECEIPT("bbbb") + "Fresh note\n\n## Why\n\nnew\n").body)).toBe(sent(own).input!);
     expect(own.stderr()).toBe("gstack-post: pr-body merged by section: replaced leading text, ship receipt, trailing text, Why; kept none; added none\n");
   });
 
@@ -585,17 +775,17 @@ describe("gstack-post pr-body merges the PR body by section", () => {
     const PREAMBLE = BADGE + "\nThis PR stops the login retry from looping.\n\n";
     const first = withBody(PREAMBLE + "## What changed\n\n- the old summary\n\n## Why\n\nBecause.\n", { "/b": RECEIPT("bbbb") + "\n## What changed\n\n- new\n" });
     expect(run(["pr-body", "5", "--body-file", "/b"], first)).toBe(EXIT.posted);
-    expect(sent(first).input).toBe(PREAMBLE + RECEIPT("bbbb") + "\n## What changed\n\n- new\n\n## Why\n\nBecause.\n");
+    expect(sent(first).input).toBe(foldSections(PREAMBLE + RECEIPT("bbbb") + "\n## What changed\n\n- new\n\n## Why\n\nBecause.\n"));
     expect(first.stderr()).toBe("gstack-post: pr-body merged by section: replaced What changed; kept leading text, Why; added ship receipt\n");
 
     const again = withBody(sent(first).input!, { "/b": RECEIPT("cccc") + "\n## What changed\n\n- newer\n" });
     expect(run(["pr-body", "5", "--body-file", "/b"], again)).toBe(EXIT.posted);
-    expect(sent(again).input).toBe(PREAMBLE + RECEIPT("cccc") + "\n## What changed\n\n- newer\n\n## Why\n\nBecause.\n");
+    expect(sent(again).input).toBe(foldSections(PREAMBLE + RECEIPT("cccc") + "\n## What changed\n\n- newer\n\n## Why\n\nBecause.\n"));
     expect(again.stderr()).toBe("gstack-post: pr-body merged by section: replaced ship receipt, What changed; kept leading text, Why; added none\n");
 
     const trailing = withBody(CURRENT + "\n" + BADGE, { "/b": RECEIPT("bbbb") + "\n## Approvals\n\n- owner: ship it\n\n## Tests\n\n- one\n" });
     expect(run(["pr-body", "5", "--body-file", "/b"], trailing)).toBe(EXIT.posted);
-    expect(sent(trailing).input).toBe(RECEIPT("bbbb") + "\n## What changed\n\n- the old summary\n\n## Why\n\nBecause.\n\n## Approvals\n\n- owner: ship it\n\n## Tests\n\n- one\n\n" + BADGE);
+    expect(sent(trailing).input).toBe(foldSections(RECEIPT("bbbb") + "\n## What changed\n\n- the old summary\n\n## Why\n\nBecause.\n\n## Approvals\n\n- owner: ship it\n\n## Tests\n\n- one\n\n" + BADGE));
     expect(trailing.stderr()).toBe("gstack-post: pr-body merged by section: replaced ship receipt, Approvals; kept What changed, Why, capy-badge block; added Tests\n");
   });
 
@@ -655,7 +845,7 @@ describe("gstack-post pr-body merges the PR body by section", () => {
   test("a partial post keeps the current intro and the note under the receipt", () => {
     const partial = withBody("Human intro\n\n" + RECEIPT("aaaa") + "Review-loop exception: accepted by owner\n\n## What changed\n\n- old\n", { "/b": "## Screenshots\n\n![shot](u)\n" });
     expect(run(["pr-body", "5", "--body-file", "/b"], partial)).toBe(EXIT.posted);
-    expect(sent(partial).input).toBe("Human intro\n\n" + RECEIPT("aaaa") + "Review-loop exception: accepted by owner\n\n## What changed\n\n- old\n\n## Screenshots\n\n![shot](u)\n");
+    expect(sent(partial).input).toBe(foldSections("Human intro\n\n" + RECEIPT("aaaa") + "Review-loop exception: accepted by owner\n\n## What changed\n\n- old\n\n## Screenshots\n\n![shot](u)\n"));
     expect(partial.stderr()).toBe("gstack-post: pr-body merged by section: replaced none; kept leading text, ship receipt, trailing text, What changed; added Screenshots\n");
 
     for (const file of ["Screenshots below.\n\n## Screenshots\n\n![shot](u)\n", "## Screenshots\n\n![shot](u)\n\n" + RECEIPT("bbbb")]) {
@@ -678,12 +868,12 @@ describe("gstack-post pr-body merges the PR body by section", () => {
     const lead = "Human intro\n\n" + CURRENT;
     const receiptOnly = withBody(lead, { "/b": RECEIPT("bbbb") });
     expect(run(["pr-body", "5", "--body-file", "/b"], receiptOnly)).toBe(EXIT.posted);
-    expect(sent(receiptOnly).input).toBe(lead.replace(RECEIPT("aaaa"), RECEIPT("bbbb")));
+    expect(sent(receiptOnly).input).toBe(foldSections(lead.replace(RECEIPT("aaaa"), RECEIPT("bbbb"))));
     expect(receiptOnly.stderr()).toBe("gstack-post: pr-body merged by section: replaced ship receipt; kept leading text, What changed, Why, Approvals; added none\n");
 
     const textOnly = withBody(RECEIPT("aaaa") + "Old note\n\n## Why\n\nx\n", { "/b": "New intro\n" });
     expect(run(["pr-body", "5", "--body-file", "/b"], textOnly)).toBe(EXIT.posted);
-    expect(sent(textOnly).input).toBe("New intro\n\n" + RECEIPT("aaaa") + "Old note\n\n## Why\n\nx\n");
+    expect(sent(textOnly).input).toBe(foldSections("New intro\n\n" + RECEIPT("aaaa") + "Old note\n\n## Why\n\nx\n"));
     expect(textOnly.stderr()).toBe("gstack-post: pr-body merged by section: replaced none; kept ship receipt, trailing text, Why; added leading text\n");
 
     const composed = "Intro\n\n" + RECEIPT("bbbb") + "\n## Summary\n\nnew\n\n## Test plan\n\n- [x] bun test\n";
@@ -707,22 +897,22 @@ describe("gstack-post pr-body merges the PR body by section", () => {
   test("--replace overwrites; a body without H2 headings is kept above a new receipt by any file; the merged bytes are what is scanned; a failed read refuses", () => {
     const replaced = withBody(CURRENT, { "/b": "## What changed\n\nonly this\n" });
     expect(run(["pr-body", "5", "--replace", "--body-file", "/b"], replaced)).toBe(EXIT.posted);
-    expect(sent(replaced).input).toBe("## What changed\n\nonly this\n");
+    expect(sent(replaced).input).toBe(foldSections("## What changed\n\nonly this\n"));
     expect(replaced.stderr()).toBe("");
     expect(replaced.calls.some(c => c.cmd === "gh" && c.args[1] === "view")).toBe(false);
 
     const plain = withBody("Just a paragraph.\nAnother line.", { "/b": RECEIPT("bbbb") + "\n## Tests\n\n- one\n" });
     expect(run(["pr-body", "5", "--body-file", "/b"], plain)).toBe(EXIT.posted);
-    expect(sent(plain).input).toBe("Just a paragraph.\nAnother line.\n\n" + RECEIPT("bbbb") + "\n## Tests\n\n- one\n");
+    expect(sent(plain).input).toBe(foldSections("Just a paragraph.\nAnother line.\n\n" + RECEIPT("bbbb") + "\n## Tests\n\n- one\n"));
     expect(plain.stderr()).toBe("gstack-post: pr-body merged by section: replaced none; kept leading text; added ship receipt, Tests\n");
     const plainText = withBody("Just a paragraph.\nAnother line.", { "/b": RECEIPT("bbbb") });
     expect(run(["pr-body", "5", "--body-file", "/b"], plainText)).toBe(EXIT.posted);
-    expect(sent(plainText).input).toBe("Just a paragraph.\nAnother line.\n\n" + RECEIPT("bbbb"));
+    expect(sent(plainText).input).toBe(foldSections("Just a paragraph.\nAnother line.\n\n" + RECEIPT("bbbb")));
     expect(plainText.stderr()).toBe("gstack-post: pr-body merged by section: replaced none; kept leading text; added ship receipt\n");
 
     const empty = withBody("", { "/b": "new body" });
     expect(run(["pr-body", "6", "--body-file", "/b"], empty)).toBe(EXIT.posted);
-    expect(sent(empty).input).toBe("new body");
+    expect(sent(empty).input).toBe(foldSections("new body"));
 
     const secret = fakeEnv({ files: { "/b": "## What changed\n\nclean\n" }, respond: c => (c.cmd === "gh" && c.args[1] === "view" ? { status: 0, stdout: "## Keys\n\n" + AWS + "\n" } : undefined) });
     expect(run(["pr-body", "5", "--body-file", "/b"], secret)).toBe(EXIT.refused);
@@ -747,15 +937,15 @@ describe("gstack-post pr-body merges the PR body by section", () => {
     const merged = fakeEnv({ remote, files: { "/b": "## Why\n\nnew\n" }, respond: view(JSON.stringify({ iid: 8, description: "## What changed\n\n- old\n\n## Why\n\nold\n" }) + "\n") });
     expect(run(["pr-body", "8", "--body-file", "/b"], merged)).toBe(EXIT.posted);
     expect(merged.calls.find(c => c.cmd === "glab" && c.args[1] === "view")!.args).toEqual(["mr", "view", "8", "--output", "json"]);
-    expect(merged.posts()).toEqual([{ cmd: "glab", args: ["mr", "update", "8", "--description=## What changed\n\n- old\n\n## Why\n\nnew\n"], input: undefined }]);
+    expect(merged.posts()).toEqual([{ cmd: "glab", args: ["mr", "update", "8", "--description=" + foldSections("## What changed\n\n- old\n\n## Why\n\nnew\n")], input: undefined }]);
     expect(merged.stderr()).toBe("gstack-post: pr-body merged by section: replaced Why; kept What changed; added none\n");
 
     const empty = fakeEnv({ remote, files: { "/b": "## Why\n\nnew\n" }, respond: view("") });
     expect(run(["pr-body", "8", "--body-file", "/b"], empty)).toBe(EXIT.posted);
-    expect(empty.posts()[0]!.args).toEqual(["mr", "update", "8", "--description=## Why\n\nnew\n"]);
+    expect(empty.posts()[0]!.args).toEqual(["mr", "update", "8", "--description=" + foldSections("## Why\n\nnew\n")]);
     const nullDescription = fakeEnv({ remote, files: { "/b": "## Why\n\nnew\n" }, respond: view('{"iid":8,"description":null}\n') });
     expect(run(["pr-body", "8", "--body-file", "/b"], nullDescription)).toBe(EXIT.posted);
-    expect(nullDescription.posts()[0]!.args).toEqual(["mr", "update", "8", "--description=## Why\n\nnew\n"]);
+    expect(nullDescription.posts()[0]!.args).toEqual(["mr", "update", "8", "--description=" + foldSections("## Why\n\nnew\n")]);
 
     const garbled = fakeEnv({ remote, files: { "/b": "## Why\n\nnew\n" }, respond: view("<html>502</html>\n") });
     expect(run(["pr-body", "8", "--body-file", "/b"], garbled)).toBe(EXIT.cliFailed);
@@ -809,7 +999,7 @@ describe("gstack-post pr-body merges the PR body by section", () => {
 
     const replaced = withBody(current, { "/b": fresh });
     expect(run(["pr-body", "5", "--body-file", "/b", "--replace"], replaced)).toBe(EXIT.posted);
-    expect(sent(replaced).input).toBe(fresh);
+    expect(sent(replaced).input).toBe(foldSections(fresh));
   });
 
   // Value: protects=a current body holding two ship-receipt blocks (an old receipt pasted below) refuses like a doubled title, so the stale
@@ -861,15 +1051,28 @@ describe("gstack-post keeps the Agent notes section last", () => {
   const RECEIPT = (head: string) => "```gstack-ship-receipt\n{\n  \"head\": \"" + head + "\"\n}\n```\n";
   const NOTES = (content: string) => "<!-- gstack:agent-notes -->\n<details><summary>Agent notes</summary>\n\n" + content + "\n\n</details>\n";
   const composed = (head: string, summary: string) => "Opening sentence.\n\n## Summary\n\n" + summary + "\n\n## Test plan\n\n- [x] bun test\n\n" + NOTES("Plan: exempt: docs-only\n\n" + RECEIPT(head).trim());
+  /** The run history a /ship body post keeps right after its receipt: the replaced receipt joins the runs block (GST-2706). */
+  const RUNS_AAAA = "\n```gstack-receipt-runs\n" + JSON.stringify({ head: "aaaa" }) + "\n```\n";
 
   // Value: protects=the body /ship composes since GST-1825 (opening, sections, Agent notes last) reposts byte for byte and replaces the notes as one
   // section; fails_when=the receipt inside the notes is split out as its own section, or the notes stop being last; why_new=the notes section is new;
   // seam=none (mergeBodySections); no_claim=the gh round trip
   test("a full post whose notes section is last reposts byte for byte and replaces the notes, receipt included, as one section", () => {
     const first = mergeBodySections(composed("aaaa", "old"), composed("bbbb", "new"));
-    expect(first.body).toBe(composed("bbbb", "new"));
+    expect(first.body.replace(RUNS_AAAA, "")).toBe(composed("bbbb", "new"));
+    expect(receiptRuns(first.body).map(r => r.head)).toEqual(["aaaa"]);
     expect([first.replaced, first.kept, first.added, first.dropped]).toEqual([["leading text", "Summary", "Test plan", "Agent notes"], [], [], []]);
-    expect(mergeBodySections(first.body, composed("bbbb", "new")).body).toBe(composed("bbbb", "new"));
+    expect(mergeBodySections(first.body, composed("bbbb", "new")).body).toBe(first.body);
+  });
+
+  // Value: protects=the kept run history lands in the Agent notes the receipt is read from, and the readable part keeps its bytes;
+  // fails_when=keepRuns searches the whole body and splices the runs block into a receipt fence the Summary quotes; why_new=keepRuns is new
+  // (GST-2706); seam=none (mergeBodySections); no_claim=the gh round trip
+  test("a /ship body post keeps the runs block in Agent notes when the readable part quotes a receipt fence", () => {
+    const ex = "~~~\n" + RECEIPT("example").trim() + "\n~~~";
+    const first = mergeBodySections(composed("aaaa", ex), composed("bbbb", ex));
+    expect(receiptRuns(first.body).map(r => r.head)).toEqual(["aaaa"]);
+    expect(first.body.replace(RUNS_AAAA, "")).toBe(composed("bbbb", ex));
   });
 
   // Value: protects=a partial post keeps the current notes and they stay last, above a Capy badge that ends the body; fails_when=a new section is
@@ -917,7 +1120,8 @@ describe("gstack-post keeps the Agent notes section last", () => {
     const partial = mergeBodySections(legacy, "## Summary\n\nnew\n");
     expect(partial.body).toBe(RECEIPT("aaaa") + "\n## Summary\n\nnew\n\n## Approvals\n\nPlan: exempt: docs-only\n");
     const full = mergeBodySections(legacy, composed("bbbb", "new"));
-    expect(full.body).toBe("Opening sentence.\n\n## Summary\n\nnew\n\n## Approvals\n\nPlan: exempt: docs-only\n\n## Test plan\n\n- [x] bun test\n\n" + NOTES("Plan: exempt: docs-only\n\n" + RECEIPT("bbbb").trim()));
+    expect(receiptRuns(full.body).map(r => r.head)).toEqual(["aaaa"]);
+    expect(full.body.replace(RUNS_AAAA, "")).toBe("Opening sentence.\n\n## Summary\n\nnew\n\n## Approvals\n\nPlan: exempt: docs-only\n\n## Test plan\n\n- [x] bun test\n\n" + NOTES("Plan: exempt: docs-only\n\n" + RECEIPT("bbbb").trim()));
     expect(full.body.match(/```gstack-ship-receipt/g)).toHaveLength(1);
     expect(full.replaced).toEqual(["ship receipt", "Summary"]);
   });
@@ -970,10 +1174,95 @@ describe("gstack-post refuses a title that is not in plain words (exit 4)", () =
     } finally { fs.rmSync(none, { recursive: true, force: true }); fs.rmSync(broken, { recursive: true, force: true }); }
   });
 
+  // Value: protects=a comment is never held back by a broken policy file, which it never needed before the body check;
+  // fails_when=an invalid policy stops pr-comment, issue-comment and reply; why_new=comments now read the policy for warnings (GST-2737 review)
+  test("an invalid policy file warns and still posts a comment", () => {
+    const broken = repoWith("{ not json");
+    try {
+      const c = fakeEnv({ root: broken, files: { "/b": "The pregate passed.\n" } });
+      expect(run(["pr-comment", "7", "--body-file", "/b"], c)).toBe(EXIT.posted);
+      expect(c.posts()).toHaveLength(1);
+      expect(c.stderr()).toContain("(PLAIN_POLICY_INVALID); the comment is posted unchecked");
+    } finally { fs.rmSync(broken, { recursive: true, force: true }); }
+  });
+
   test("the help names exit 4", () => {
     const f = fakeEnv();
     expect(run(["--help"], f)).toBe(EXIT.posted);
     expect(f.stdout()).toContain("4 the title is not plain words");
+  });
+});
+
+
+describe("gstack-post refuses a PR body that breaks the plain shape (exit 4)", () => {
+  const repoWith = (policy: string | null) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "gstack-post-body-"));
+    if (policy !== null) { fs.mkdirSync(path.join(root, ".gstack")); fs.writeFileSync(path.join(root, ".gstack", "plain-titles.json"), policy); }
+    return root;
+  };
+  const POLICY = JSON.stringify({ codes: ["\\bGST-\\d+\\b"], terms: ["pregate"], allow: [], since: "2026-11-08", body_since: "2026-11-17", exempt_branch_prefixes: [], replace_default_terms: true });
+  const TITLE = "Stop gstack from hitting GitHub's rate limit (GST-1713)";
+  const LONG = "One.\n\nTwo.\n\nThree.\n\nFour, and the pregate said so.\n\n## Tests\n\n- one\n";
+  const created = (at: string) => (c: Call) => (c.cmd === "gh" && c.args[1] === "view" && c.args.includes("createdAt") ? { status: 0, stdout: at + "\n" } : undefined);
+
+  // Value: protects=a body with more than three visible lines or a listed word above the Agent notes fold posts nothing under a policy,
+  // with title and body findings printed in one pass; fails_when=the body is checked after posting, unfolded, or not at all;
+  // why_new=R76 as amended 2026-11-15; seam=a real policy file under the fake root; no_claim=real gh
+  test("a body with four visible lines and a listed word posts nothing; title and body findings print in one pass", () => {
+    const root = repoWith(POLICY);
+    try {
+      const f = fakeEnv({ root, files: { "/t": "Make the pregate quieter", "/b": LONG } });
+      expect(run(["pr-create", "--base", "main", "--title-file", "/t", "--body-file", "/b"], f)).toBe(EXIT.plainTitle);
+      expect(f.calls.filter(c => c.cmd === "gh" || c.cmd === "glab")).toEqual([]);
+      expect(f.stdout()).toContain("PLAIN_TITLE: refused=1\n");
+      expect(f.stdout()).toContain('PLAIN_BODY: PLAIN_BODY_REFUSED visible-lines "4 lines');
+      expect(f.stdout()).toContain('PLAIN_BODY: PLAIN_BODY_REFUSED term "pregate"');
+      expect(f.stdout()).toContain("PLAIN_BODY: refused=2\n");
+      expect(f.stderr()).toContain("the body does not have the plain shape; nothing was posted");
+      const edit = fakeEnv({ root, files: { "/b": LONG }, respond: created("2026-11-18T00:00:00Z") });
+      expect(run(["pr-body", "7", "--body-file", "/b", "--replace"], edit)).toBe(EXIT.plainTitle);
+      expect(edit.posts()).toEqual([]);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  // Value: protects=PRs opened before body_since, repositories without a policy and comments only warn, and still post;
+  // fails_when=old PRs or other repositories start refusing; why_new=A1 (refusals need a policy) and J1 (comments warn);
+  // seam=a real policy file and a fake createdAt; no_claim=real gh
+  test("an older PR, a repository without the policy and a comment get warnings and still post", () => {
+    const root = repoWith(POLICY);
+    const none = repoWith(null);
+    try {
+      const old = fakeEnv({ root, files: { "/b": LONG }, respond: created("2026-11-10T00:00:00Z") });
+      expect(run(["pr-body", "7", "--body-file", "/b", "--replace"], old)).toBe(EXIT.posted);
+      expect(old.stdout()).toContain("(warning only)");
+      expect(old.stdout()).toContain("PLAIN_BODY: warned=2\n");
+      const free = fakeEnv({ root: none, files: { "/t": TITLE, "/b": LONG } });
+      expect(run(["pr-create", "--base", "main", "--title-file", "/t", "--body-file", "/b"], free)).toBe(EXIT.posted);
+      expect(free.stdout()).toContain("PLAIN_BODY: warned=1\n");
+      const comment = fakeEnv({ root, files: { "/b": "One.\nTwo.\nThree.\nFour: the pregate passed.\n" } });
+      expect(run(["pr-comment", "7", "--body-file", "/b"], comment)).toBe(EXIT.posted);
+      expect(comment.stdout()).toContain('PLAIN_BODY: PLAIN_BODY_REFUSED term "pregate"');
+      expect(comment.stdout()).not.toContain("visible-lines");
+    } finally { fs.rmSync(root, { recursive: true, force: true }); fs.rmSync(none, { recursive: true, force: true }); }
+  });
+
+  // Value: protects=bodies go out folded, a ## section replaces the same-titled fold already on the PR, and fold posts nothing;
+  // fails_when=a body is posted with open sections or the merge duplicates a folded section; why_new=E1; seam=the fake gh pr view body; no_claim=real gh
+  test("a body is posted folded, a ## Tests section replaces the Tests fold, and fold prints without posting", () => {
+    const root = repoWith(POLICY);
+    try {
+      const current = "What changed for a user.\n\n<details><summary>Tests</summary>\n\n- old\n\n</details>\n";
+      const f = fakeEnv({ root, files: { "/b": "## Tests\n\n- new\n" }, respond: c => (c.cmd === "gh" && c.args[1] === "view" && c.args.includes("body") ? { status: 0, stdout: current } : undefined) });
+      expect(run(["pr-body", "7", "--body-file", "/b"], f)).toBe(EXIT.posted);
+      expect(f.posts().find(c => c.args[1] === "edit")!.input).toBe("What changed for a user.\n\n<details><summary>Tests</summary>\n\n- new\n\n</details>\n");
+      const fold = fakeEnv({ root, files: { "/b": "Opening.\n\n## Tests\n\n- one\n" } });
+      expect(run(["fold", "--body-file", "/b"], fold)).toBe(EXIT.posted);
+      expect(fold.stdout()).toBe("Opening.\n\n<details><summary>Tests</summary>\n\n- one\n\n</details>\n");
+      expect(fold.calls.filter(c => c.cmd === "gh" || c.cmd === "glab")).toEqual([]);
+      const bad = fakeEnv({ root, files: { "/b": LONG } });
+      expect(run(["fold", "--body-file", "/b"], bad)).toBe(EXIT.plainTitle);
+      expect(bad.stderr()).toContain("PLAIN_BODY: refused=2");
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 });
 

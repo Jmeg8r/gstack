@@ -18,7 +18,7 @@ const OBSERVED: Record<string, string> = {
   'free-tests.yml': 'free-suite,macos-named-regressions',
   'windows-smoke.yml': 'windows-smoke',
   'windows-scoped-tests.yml': 'windows-scoped-shard',
-  'windows-setup-e2e.yml': 'windows-setup,held-install-journey',
+  'windows-setup-e2e.yml': 'windows-setup,windows-setup-recovery,windows-setup-cso,held-install-journey,held-install-trial,held-install-later-release',
   'quality-gate.yml': 'quality',
   'evals.yml': 'build-image,eval-slices',
 };
@@ -52,7 +52,7 @@ describe('Trunk Dynamic CI observers', () => {
       for (const [name, job] of Object.entries(wf.jobs as Record<string, any>).filter(([n]) => n !== 'trunk-dynamic-ci')) {
         expect([name, [job.needs ?? []].flat().includes('trunk-dynamic-ci')]).toEqual([name, false]);
         const text = JSON.stringify(job);
-        const mentions = name === 'trunk-flaky-tests' && file === 'free-tests.yml' ? /dynamic-ci|TRUNK_API_TOKEN/i.test(text) : /trunk|dynamic-ci|TRUNK_API_TOKEN/i.test(text);
+        const mentions = /trunk|dynamic-ci|TRUNK_API_TOKEN/i.test(text);
         expect([name, mentions]).toEqual([name, false]);
       }
       const trunkRefs = (JSON.stringify(wf.jobs).match(SECRET_REF) ?? []).filter(ref => ref === 'secrets.TRUNK_API_TOKEN');

@@ -18,8 +18,9 @@ import { AgentModelError, resolveAgentModel } from './agent-model';
 import { BriefError, briefFile, checkoutRoot, checkoutTree, promptHash, renderBrief, sliceDiff, sliceNote, withWorkspace, type BriefRole, type SectionTexts, type Slots } from './review-brief';
 import { REVIEW_DIFF_MAX_BYTES, disclosureDigest } from './review-exclude';
 import { appendEvent, readerKey } from './review-ledger';
+import { claimedFixCheckHunks, recordFixCheckHunks } from './review-evidence';
 import { policySelection, selectFor } from './review-selection';
-import { diffCommand, type Dispatch } from './review-depth';
+import { SPECIALISTS, diffCommand, type Dispatch } from './review-depth';
 import { TARGETED_RULES, parseClassList, targetedBriefSha, targetedRead } from './review-targeted';
 import type { FetchHit } from './review-fetch';
 import type { EffectiveReaders } from './ship-policy-readers';
@@ -50,6 +51,8 @@ export interface PassReader {
   fetch_audit?: { policy_digest: string; events: number; events_sha256: string; hits: FetchHit[]; verdict: 'clean' | 'violation'; enforced: boolean };
   /** A stage rerun after a fetch violation (lib/review-sweep.ts): attempt 2 of the slot, and the reader it replaced points at it. */
   attempt?: number; superseded_by?: string;
+  /** An outside voice retried after a cyber_policy refusal (R95, planCyberRetry): the reader it retries, and whether it gets the read-only brief. */
+  retry_of?: string; read_only?: true;
   /** Set when the stage's sweep found a fetch: the reply's new home under <out>/quarantine/; it is never merged, judged or returned. */
   quarantined?: { file: string; at: string };
   path?: string; output?: string; error?: string; state_at?: string;
@@ -195,6 +198,12 @@ export function specialistFindings(mergedFile: string): string {
   return lines.length ? lines.join('\n') + '\n' : '';
 }
 
+/** The file a plan's checklist name reads: the design specialist's is the generated review/design-checklist.md (#4410), every other one review/specialists/<name>.md. */
+export function checklistFile(root: string, name: string): string {
+  if (name !== 'red-team' && !(SPECIALISTS as readonly string[]).includes(name)) throw new BriefError(`checklist not found: ${name} is none of ${SPECIALISTS.join(', ')}, red-team`);
+  return path.join(root, name === 'design' ? 'review/design-checklist.md' : `review/specialists/${name}.md`);
+}
+
 /** Render every planned reader of a stage. The Red Team renders only after every earlier reader is collected. */
 export function renderStage(m: Manifest, stage: Stage, t: SectionTexts, diffFor: (base: string, r: PassReader) => string): PassReader[] {
   const open = m.readers.filter(r => (r.stage === 'first' || r.stage === 'specialists') && r.state !== 'collected');
@@ -217,10 +226,11 @@ export function renderStage(m: Manifest, stage: Stage, t: SectionTexts, diffFor:
     }
     const role = r.role!;
     const slots: Slots = { name: r.name, diff_base: r.diff_base ?? m.diff_base, exclude: r.exclude, stack: m.stack, test_fw: m.test_fw, learnings: m.learnings ?? undefined,
-      checklists: r.checklists?.map(n => path.join(m.checklist_root, 'review/specialists', `${n}.md`)).join(','),
+      checklists: r.checklists?.map(n => checklistFile(m.checklist_root, n)).join(','),
       policy_exclude: r.policy_exclude, ...(m.disclosure ? { disclosure: m.disclosure, keep: r.keep?.map(shellQuote).join(' ') } : {}),
       ...(m.disclosure && r.excerpt_file ? { excerpt_file: r.excerpt_file.file, excerpt_bytes: String(r.excerpt_file.bytes), excerpt_sha256: r.excerpt_file.sha256, excerpt_files: String(r.excerpt_file.files) } : {}) };
-    if (role === 'specialist') slots.checklist = path.join(m.checklist_root, 'review/specialists', `${r.name}.md`);
+    if (role === 'specialist') slots.checklist = checklistFile(m.checklist_root, r.name ?? '');
+    if (r.read_only) slots.read_only = '1';
     let findingsSha: string | undefined;
     if (role === 'red-team') {
       const findings = specialistFindings(m.merged);
@@ -240,7 +250,8 @@ export function renderStage(m: Manifest, stage: Stage, t: SectionTexts, diffFor:
     if (role === 'fix-check') {
       const read = (f: string | undefined, what: string) => { if (!f) return undefined; try { return fs.readFileSync(f, 'utf8'); } catch { throw new BriefError(`cannot read the fix-check ${what} ${f}`); } };
       const fc = m.fix_check!;
-      Object.assign(slots, { fix_list: read(fc.fix_list, 'fix list'), hunks: read(fc.hunks, 'hunks'), tests: read(fc.tests, 'tests'), callers: read(fc.callers, 'callers') });
+      Object.assign(slots, { fix_list: read(fc.fix_list, 'fix list'), hunks: claimedFixCheckHunks(process.cwd())?.text ?? read(fc.hunks, 'hunks'), tests: read(fc.tests, 'tests'), callers: read(fc.callers, 'callers') });
+      recordFixCheckHunks(process.cwd(), slots.hunks ?? '', m.ledger, slots.fix_list ?? '');
     }
     let targeted = {};
     if (role === 'targeted' || (role === 'adversarial-native' && r.classes?.length)) {
@@ -250,16 +261,43 @@ export function renderStage(m: Manifest, stage: Stage, t: SectionTexts, diffFor:
       Object.assign(slots, { checklist, brief, classes: (r.classes ?? []).join(','), diff_base: r.diff_base ?? m.diff_base });
       targeted = { classes: parseClassList(slots.classes!), rules: TARGETED_RULES, brief_sha: targetedBriefSha(checklist), diff_base: slots.diff_base, ...targetedRead(process.cwd(), slots.diff_base!) };
     }
-    const text = withWorkspace(renderBrief(role, slots, t), workdir, m.fetch_policy);
+    const text = withWorkspace(renderBrief(role, slots, t), workdir, m.fetch_policy, { verdict: true });
     const file = path.join(briefs, briefFile(role, r.name));
     fs.writeFileSync(file, text, { mode: 0o600 });
     const sha = promptHash(text);
     const bytes = Buffer.byteLength(text);
-    appendEvent(m.ledger, { event: 'rendered', reader: readerKey(role, r.name), role, name: r.name ?? null, file, sha256: sha, bytes, pass: m.pass, stage, workdir, tree, ...(findingsSha ? { findings_sha256: findingsSha } : {}), ...targeted, ...slice, ...(disclosureDigest(m.disclosure) ? { exclude: disclosureDigest(m.disclosure) } : {}), ...(m.fetch_policy ? { readers: m.fetch_policy.digest } : {}) });
+    appendEvent(m.ledger, { event: 'rendered', reader: readerKey(role, r.name), role, name: r.name ?? null, file, sha256: sha, bytes, pass: m.pass, stage, workdir, tree, verdict: 1, ...(findingsSha ? { findings_sha256: findingsSha } : {}), ...targeted, ...slice, ...(disclosureDigest(m.disclosure) ? { exclude: disclosureDigest(m.disclosure) } : {}), ...(m.fetch_policy ? { readers: m.fetch_policy.digest } : {}) });
     Object.assign(r, { file, sha256: sha, bytes, chunks: chunkCount(text), state: 'rendered', tree, ...(findingsSha ? { findings_sha256: findingsSha } : {}) });
     done.push(r);
   }
   return done;
+}
+
+/**
+ * R95 (2026-11-13): after OpenAI refuses the outside voice under cyber_policy, the brief goes once to GPT-6 Astra reworded as a
+ * read-only correctness review, then once to Gemini 4 Carbon unchanged; never the same brief to another OpenAI model.
+ */
+export const CYBER_RETRIES: ReadonlyArray<{ name: string; model: PassModel; read_only?: true }> = [
+  { name: 'astra-read-only', model: { model_id: 'openai/gpt-6-astra', reasoning_mode: 'high' }, read_only: true },
+  { name: 'gemini-4-carbon', model: { model_id: 'google/gemini-4-carbon', reasoning_mode: 'high' } },
+];
+
+/**
+ * Plan the next R95 attempt after `refused`, which the refused reader then points at; null once the chain is spent. A step whose
+ * model family is in `taken` (the lane's and the native voice's, from the pass's voice-models.json) is skipped, since Step 11 refuses
+ * an outside voice of either family; with no step left the second-family read is missing.
+ */
+export function planCyberRetry(m: Manifest, refused: PassReader, taken: ReadonlyArray<string> = []): PassReader | null {
+  const step = CYBER_RETRIES.slice(CYBER_RETRIES.findIndex(x => x.name === refused.name) + 1).find(x => !taken.includes(x.model.model_id.split('/')[0]!.toLowerCase()));
+  if (!step || refused.role !== 'outside-voice') return null;
+  const reader = readerKey('outside-voice', step.name);
+  const existing = m.readers.find(x => x.reader === reader);
+  if (existing) return existing.quarantined ? null : existing;
+  const { file: _f, sha256: _s, bytes: _b, chunks: _c, findings_sha256: _fs, tree: _t, path: _p, output: _o, error: _e, state_at: _a, quarantined: _q, fetch_audit: _fa, attempt: _at, superseded_by: _sb, model: _m, cross_family: _cf, read_only: _ro, ...plan } = refused;
+  const next: PassReader = { ...plan, reader, name: step.name, title: `ship ${m.pass} ${reader}`, state: 'planned', model: { ...step.model }, retry_of: refused.reader, ...(step.read_only ? { read_only: true as const } : {}) };
+  refused.superseded_by = reader;
+  m.readers.push(next);
+  return next;
 }
 
 export const chunkCount = (text: string) => Math.max(1, Math.ceil(text.length / CHUNK_CHARS));

@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { spawnSync } from './spawn-sync';
 import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { deriveReviewStatus, isCriticalFinding, isOpenByAction, readJsonl } from './headless-artifacts';
 import { resultLine, type ResultCodeName } from './result-codes';
+import { readRunRecord, thisRunOwner } from './ship-run-record';
 
 const DIFF_REVIEWS = new Set(['review', 'review-fix-check', 'adversarial-review', 'codex-review', 'design-review-lite', 'ship']);
 const SHARED_LIBS_COVERAGE_VERSION = 1;
@@ -203,13 +204,15 @@ export function captureReviewStart(skill: string, env = process.env, fixRange = 
     throw new Error('cannot capture a diff review without a working-tree fingerprint');
   }
   const fixBase = fixRange ? fixRangeBase(skill, env) : undefined;
+  const claimed = skill === 'review-fix-check' ? (r => (r.kind === 'record' && r.record.state === 'open' ? r.record : undefined))(readRunRecord(env.GSTACK_REVIEW_REPO)) : undefined;
   const dir = join(env.GSTACK_REVIEW_DIR!, '.review-starts');
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const token = crypto.randomUUID();
   writeFileSync(join(dir, `${token}.json`), JSON.stringify({
     skill, repo: env.GSTACK_REVIEW_REPO, branch: env.GSTACK_REVIEW_BRANCH,
-    wtree: env.GSTACK_STAMP_WTREE, started_at: new Date().toISOString(),
+    wtree: env.GSTACK_STAMP_WTREE, started_at: new Date().toISOString(), ...(o => (o ? { owner: o } : {}))(thisRunOwner()),
     ...(fixBase ? { scope: 'fix-range', fix_base: fixBase } : {}),
+    ...(claimed?.claim ? { fix_check: { base: claimed.claim.stop_head, run: claimed.run, grant: claimed.claim.grant, pr: claimed.claim.pr ?? claimed.pr } } : {}),
   }), { mode: 0o600, flag: 'wx' });
   return fixBase ? `${token}\nFIX_BASE=${fixBase}` : token;
 }
@@ -260,7 +263,7 @@ export function deriveFromFindings(rec: Record<string, any>, findingsPath: strin
   if (mismatches.length) {
     throw new ReviewLogError('REVIEW_STATUS_MISMATCH', `review-log: status mismatch: ${mismatches.join('; ')} (${derived.findings_open} open of ${derived.findings_total}) (REVIEW_STATUS_MISMATCH)`);
   }
-  return { ...rec, ...derived, status_source: 'derived', findings_file: findingsPath };
+  return { ...rec, ...derived, status_source: 'derived', findings_file: resolve(findingsPath) };
 }
 
 export function bindReview(rec: Record<string, any>, token: string, env = process.env, findingsPath?: string): Record<string, any> {
@@ -302,6 +305,11 @@ export function bindReview(rec: Record<string, any>, token: string, env = proces
       if (error.code !== 'ENOENT') console.error(`gstack-review-log: cannot consume review start: ${error.message}`);
     }
   }
+  if (rec.skill === 'review-fix-check') {
+    for (const key of ['fix_check_base', 'run', 'grant', 'pr', 'hunks']) delete rec[key];
+    const fc = start?.fix_check;
+    if (fc) Object.assign(rec, { fix_check_base: fc.base, run: fc.run, grant: fc.grant, ...(fc.pr ? { pr: fc.pr } : {}), ...(h => (h ? { hunks: h } : {}))(readFixCheckHunks(env.GSTACK_REVIEW_REPO!, start.started_at)) });
+  }
   const end = env.GSTACK_STAMP_WTREE;
   const state = !start || !end ? 'uncaptured'
     : start.wtree !== end ? 'changed'
@@ -339,11 +347,15 @@ export const unresolvedFinding = (f: unknown) => record(f) && (f.action === 'ope
   ((f.action === 'deferred' || f.action === 'noted') && (f.blocking === true || isCriticalFinding(f))) ||
   (!f.gate && isCriticalFinding(f) && isOpenByAction(f)));
 export const RULABLE = new Set(['open', 'skipped', 'noted', 'deferred']);
-/** What a ruling must cover before rulings can clear a row: every unresolved finding and every one the reader marked blocking, whatever its action. */
-export const holdsOpen = (f: unknown) => !record(f) || unresolvedFinding(f) || f.blocking === true;
+/**
+ * What a ruling must cover before rulings can clear a row: every unresolved finding and every one the reader marked blocking,
+ * unless the reader recorded it fixed or auto-fixed. A fixed finding cannot be ruled, and a row with no rulings already reads it as resolved,
+ * so holding it open left a fix-check that confirmed its blockers fixed uncountable (GST-3501, gbrain#10036).
+ */
+export const holdsOpen = (f: unknown) => !record(f) || unresolvedFinding(f) || (f.blocking === true && f.action !== 'fixed' && f.action !== 'auto-fixed');
 
 /**
- * GST-1537: the claimed row with each finding the owner ruled a disclosed note (`ruled`: fingerprints from approved
+ * GST-1537: the row (claimed, or derived with its file's findings shown, GST-3296) with each finding the owner ruled a disclosed note (`ruled`: fingerprints from approved
  * `gstack-approvals rule` rows, lib/ruled-notes.ts, never from the row itself) taken out, and recorded clean when the
  * rest leave nothing unresolved and the findings account for every claimed issue and critical; otherwise unchanged. An open
  * finding is rulable too: a fix-check that finds a CRITICAL stops for the owner (review-army decision 3.5 sends it to decision 2)
@@ -352,16 +364,92 @@ export const holdsOpen = (f: unknown) => !record(f) || unresolvedFinding(f) || f
  * taken out the same way only when `gated` holds its `<fingerprint> <gate_id>` key (the owner's gate_disposition rows whose
  * head lies in this row's range, lib/gate-dispositions.ts, GST-2491); a ruling never closes a gate finding.
  */
+const isRuledBy = (ruled: ReadonlySet<string>, gated: ReadonlySet<string>) => (f: unknown) => record(f) && typeof f.fingerprint === 'string' &&
+  (f.gate ? (f.action === 'open' || f.action === 'kept') && gated.has(`${f.fingerprint} ${f.gate_id}`) : RULABLE.has(f.action) && ruled.has(f.fingerprint));
+
 function withoutRuledNotes(rec: Record<string, any>, ruled: ReadonlySet<string>, gated: ReadonlySet<string>): Record<string, any> {
-  const isRuled = (f: unknown) => record(f) && typeof f.fingerprint === 'string' && (f.gate ? (f.action === 'open' || f.action === 'kept') && gated.has(`${f.fingerprint} ${f.gate_id}`) : RULABLE.has(f.action) && ruled.has(f.fingerprint));
-  if ((!ruled.size && !gated.size) || rec.status_source === 'derived' || rec.completed !== true || !Array.isArray(rec.findings) ||
+  const isRuled = isRuledBy(ruled, gated);
+  if ((!ruled.size && !gated.size) || rec.completed !== true || !Array.isArray(rec.findings) ||
       !rec.findings.some(isRuled) || rec.findings.length < Number(rec.issues_found ?? 0) ||
       rec.findings.filter(f => record(f) && isCriticalFinding(f)).length < Number(rec.critical ?? 0) ||
       rec.findings.some(f => !isRuled(f) && holdsOpen(f))) return rec;
-  return { ...rec, status: 'clean', issues_found: 0, critical: 0, informational: 0, findings: rec.findings.filter(f => !isRuled(f)) };
+  return { ...rec, status: 'clean', issues_found: 0, critical: 0, informational: 0, findings: rec.findings.filter(f => !isRuled(f)),
+    ...(rec.status_source === 'derived' ? { unresolved: 0, critical_gaps: 0, findings_open: 0 } : {}) };
 }
 
-export function reviewFreshness(rec: Record<string, any>, currentWtree: string, ruled: ReadonlySet<string> = new Set(), gated: ReadonlySet<string> = new Set()): { status: string; reason: string } | undefined {
+const listsNone = (rec: Record<string, any>) => !Array.isArray(rec.findings) || rec.findings.length === 0;
+const same = (a: unknown, b: unknown) => typeof a === 'string' && a === b;
+
+/**
+ * GST-3296 (harness-evals#515): gstack-review-read's view of the findings rulings match on a stopped row that lists none
+ * inline. A Step 9 row logged with `--findings <file>` (status_source derived) takes that file's findings while the file still
+ * derives the counts the row recorded. An adversarial-review row that lists none takes the findings of the review row of the
+ * same pass, commit and bound tree, which carries Step 11's queued findings, so its rulings must cover that whole pass. A
+ * clean row is left alone, and a file that cannot be read or no longer matches attaches nothing and sets `findings_unread`.
+ */
+export function withCollectedFindings(rows: Record<string, any>[]): void {
+  for (const rec of rows) {
+    delete rec.findings_from;
+    delete rec.findings_unread;
+    if (rec.status_source !== 'derived' || rec.status === 'clean' || typeof rec.findings_file !== 'string' || !listsNone(rec)) continue;
+    let read;
+    try { read = readJsonl(rec.findings_file); }
+    catch (e: any) { rec.findings_unread = `its findings file ${rec.findings_file} is unreadable (${e.code ?? e.message})`; continue; }
+    stampGateFindings(read.rows, 'unattended');
+    const derived: Record<string, any> = deriveReviewStatus(read.rows);
+    if (read.errors.length || ([...DERIVED_KEYS, 'findings_total', 'findings_open'] as const).some(key => rec[key] !== derived[key])) {
+      rec.findings_unread = `its findings file ${rec.findings_file} no longer holds what the row recorded (${read.errors.length ? 'malformed' : `${derived.findings_open} open of ${derived.findings_total} now, ${rec.findings_open} of ${rec.findings_total} logged`})`;
+      continue;
+    }
+    rec.findings = read.rows;
+    rec.findings_from = rec.findings_file;
+  }
+  for (const rec of rows) {
+    if (rec.skill !== 'adversarial-review' || rec.status === 'clean' || !listsNone(rec)) continue;
+    const pass = rows.findLast(r => r.skill === 'review' && r.via === rec.via && r.pass === rec.pass && same(r.commit_full, rec.commit_full) &&
+      same(r.review_binding?.end_wtree, rec.review_binding?.end_wtree));
+    if (pass && !listsNone(pass)) {
+      rec.findings = structuredClone(pass.findings);
+      rec.findings_from = `the pass ${pass.pass} review row${pass.findings_from ? ` (${pass.findings_from})` : ''}`;
+    } else if (pass?.findings_unread) rec.findings_unread = `the pass ${pass.pass} review row's findings are unavailable: ${pass.findings_unread}`;
+  }
+}
+
+/**
+ * GST-3267 (harness-evals#498): why the rulings did not clear a completed pass that stopped (converged:false, bound
+ * `incomplete` on unchanged content). Names each finding that still holds the row open with no ruling, a `noted` or
+ * `deferred` CRITICAL included, and a gate finding with the gate_id its disposition needs, or says the findings list
+ * fewer issues than the row claims; undefined for any other row. Any diff review row that claims issues but lists no
+ * findings says so, with why none were collected (GST-3296, harness-evals#515).
+ */
+export function rulingGap(rec: Record<string, any>, ruled: ReadonlySet<string>, gated: ReadonlySet<string>): string | undefined {
+  const binding = rec.review_binding;
+  if (!DIFF_REVIEWS.has(rec.skill) || rec.skill === 'ship' || rec.skill === 'codex-review') return;
+  const issues = Number(rec.issues_found ?? 0), critical = Number(rec.critical ?? 0);
+  if (listsNone(rec) && (issues > 0 || critical > 0 || rec.status === 'issues_found' || rec.status === 'issues_open')) {
+    return `it lists no findings (fcount 0) but claims ${rec.issues_found ?? 'unspecified'} issue(s) and ${rec.critical ?? 'unspecified'} CRITICAL, so no ruling can match it: ${rec.findings_unread
+      ?? (rec.skill === 'adversarial-review' ? 'no review row of the same pass, commit and tree lists that pass\'s findings either' : 'its findings were logged neither inline nor with --findings')}`;
+  }
+  if (rec.scope === 'fix-range' || rec.completed !== true || rec.converged !== false || binding?.state !== 'incomplete' || !binding.start_wtree ||
+      binding.start_wtree !== binding.end_wtree || !Array.isArray(rec.findings)) return;
+  const listedCritical = rec.findings.filter(f => record(f) && isCriticalFinding(f)).length;
+  if (rec.findings.length < issues || listedCritical < critical) {
+    return `its findings list ${rec.findings.length} issue(s) and ${listedCritical} CRITICAL, fewer than the ${issues} issue(s) and ${critical} CRITICAL it claims, so no ruling can cover the rest`;
+  }
+  const isRuled = isRuledBy(ruled, gated);
+  const left = rec.findings.filter(f => !isRuled(f) && holdsOpen(f))
+    .map(f => !record(f) ? 'malformed finding' : `${f.fingerprint ?? 'unfingerprinted'} (${f.severity ?? 'unknown'}, ${f.action ?? 'no action'}${f.gate ? `; gate ${f.gate_id ?? 'with no gate_id'} needs a gate disposition, not a ruling` : ''})`);
+  if (!left.length) return;
+  return `${left.length} finding(s) still need an owner ruling at this head: ${left.slice(0, 10).join('; ')}${left.length > 10 ? `; +${left.length - 10} more` : ''} (a noted or deferred CRITICAL still counts as open)`;
+}
+
+/**
+ * A row's freshness at the current content. A clean read of other content reads STALE, except a head `baseMerged` accepts
+ * (gstack-review-read passes baseMergeOnly, lib/ship-receipt-patch.ts): the reviewed commit plus clean merges of the base with
+ * the branch's patch unchanged, which R51 counts as already reviewed (GST-3308, harness-evals#515).
+ */
+export function reviewFreshness(rec: Record<string, any>, currentWtree: string, ruled: ReadonlySet<string> = new Set(), gated: ReadonlySet<string> = new Set(),
+  baseMerged?: (rec: Record<string, any>, reviewedWtree: string) => { ok: true; note: string } | { ok: false; why: string }): { status: string; reason: string } | undefined {
   if (!DIFF_REVIEWS.has(rec.skill)) return;
   if (rec.skill === 'ship') return { status: 'UNVERIFIED', reason: 'ship telemetry is not a review pass' };
   const binding = rec.review_binding;
@@ -377,8 +465,11 @@ export function reviewFreshness(rec: Record<string, any>, currentWtree: string, 
       !wtree || binding.start_wtree !== wtree || binding.end_wtree !== wtree) {
     return { status: 'UNVERIFIED', reason: 'missing start capture or incomplete/nonconverged pass' };
   }
+  let merged: string | undefined;
   if (!currentWtree || currentWtree === 'unknown' || wtree !== currentWtree) {
-    return { status: 'STALE', reason: 'working-tree content differs from reviewed content' };
+    const carried = currentWtree && currentWtree !== 'unknown' ? baseMerged?.(rec, wtree) : undefined;
+    if (!carried?.ok) return { status: 'STALE', reason: `working-tree content differs from reviewed content${carried ? ` (${carried.why})` : ''}` };
+    merged = carried.note;
   }
   // B7: a derived row carries findings_open; a resolved critical finding no
   // longer counts against it. Claimed rows keep the conservative reading of
@@ -390,5 +481,62 @@ export function reviewFreshness(rec: Record<string, any>, currentWtree: string, 
       (Array.isArray(rec.findings) && rec.findings.some(unresolvedFinding))) {
     return { status: 'UNVERIFIED', reason: 'review has unresolved findings or did not finish clean' };
   }
-  return { status: 'CURRENT', reason: 'completed clean pass on unchanged content' };
+  return { status: 'CURRENT', reason: merged ? `completed clean pass; ${merged}` : 'completed clean pass on unchanged content' };
+}
+
+/** The hunks a fix-check reader was given: the sha256 of the file's bytes and every path its diff headers name. */
+export function hunksDigest(text: string): { sha256: string; paths: string[] } {
+  const paths = new Set<string>();
+  for (const m of text.matchAll(/^diff --git a\/(.+?) b\/(.+)$/gm)) { paths.add(m[1]!); paths.add(m[2]!); }
+  return { sha256: createHash('sha256').update(text).digest('hex'), paths: [...paths].sort() };
+}
+
+const hunksFile = (cwd: string) => {
+  const r = spawnSync('git', ['rev-parse', '--git-path', 'gstack-fix-check-hunks'], { cwd, encoding: 'utf8', timeout: 60_000 });
+  return r.status === 0 && r.stdout.trim() ? resolve(cwd, r.stdout.trim()) : '';
+};
+
+/**
+ * The hunks a claimed fix-check reads, built by gstack (GST-3546): git diff <the claimed grant's head> HEAD, the exact bytes
+ * bindFixCheckRow later compares, so a thread never hand-builds a partial or stale packet. Undefined when this checkout's run
+ * record holds no open claim, or git cannot diff it (the caller's --hunks file stands then).
+ */
+export function claimedFixCheckHunks(cwd: string): { base: string; text: string } | undefined {
+  const read = readRunRecord(cwd);
+  const base = read.kind === 'record' && read.record.state === 'open' ? read.record.claim?.stop_head : undefined;
+  if (!base) return undefined;
+  const r = spawnSync('git', ['diff', base, 'HEAD'], { cwd, encoding: 'utf8', timeout: 60_000, maxBuffer: 256 * 1024 * 1024 });
+  return r.status === 0 && r.stdout.trim() ? { base, text: r.stdout } : undefined;
+}
+
+/** The ledger ids, path:line:category fingerprints and a-… approval ids a fix list names: the only grant ids its clean fix-check can close. */
+export function fixListNames(text: string): string[] {
+  return [...new Set(text.split(/[\s`'"(),;]+/).map(t => t.replace(/[.:]+$/, '')).filter(t => t.includes('#') || /:\d+:/.test(t) || /^a-[0-9a-f]{12}$/.test(t)))].sort();
+}
+
+/** gstack-review-plan --fix-check-prompt and the pass program's fix-check render record the hunks and fix list they rendered from; a failed write only leaves the row without hunks, so it closes nothing. */
+export function recordFixCheckHunks(cwd: string, text: string, ledger: string | undefined, fixList: string): void {
+  try {
+    const file = hunksFile(cwd);
+    if (file) writeFileSync(file, JSON.stringify({ at: new Date().toISOString(), ...hunksDigest(text), fix_list: fixListNames(fixList), ...(ledger ? { ledger: resolve(ledger) } : {}) }) + '\n');
+  } catch { /* the row carries no hunks and closes nothing */ }
+}
+
+/** The pass program renders a fix-check brief before it takes the review-fix-check start (GST-3523): re-date that render's record, only while its digest still matches the hunks the brief carried, so the start's row attaches it. */
+export function restampFixCheckHunks(cwd: string, text: string): boolean {
+  try {
+    const file = hunksFile(cwd);
+    const o = JSON.parse(readFileSync(file, 'utf8'));
+    if (o.sha256 !== hunksDigest(text).sha256) return false;
+    writeFileSync(file, JSON.stringify({ ...o, at: new Date().toISOString() }) + '\n');
+    return true;
+  } catch { return false; }
+}
+
+/** The hunks record gstack-review-log stamps on a granted fix-check row: the newest render at or after the row's start. */
+export function readFixCheckHunks(cwd: string, since: string): { sha256: string; paths: string[]; fix_list: string[]; ledger?: string } | undefined {
+  try {
+    const o = JSON.parse(readFileSync(hunksFile(cwd), 'utf8'));
+    return Date.parse(o.at) >= Date.parse(since) && typeof o.sha256 === 'string' && Array.isArray(o.paths) ? { sha256: o.sha256, paths: o.paths, fix_list: Array.isArray(o.fix_list) ? o.fix_list : [], ...(typeof o.ledger === 'string' ? { ledger: o.ledger } : {}) } : undefined;
+  } catch { return undefined; }
 }

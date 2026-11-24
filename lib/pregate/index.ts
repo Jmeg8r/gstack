@@ -10,7 +10,7 @@
  * land: `guards` (field wave CD1); ratchets, lint, links, hermetic, patches
  * and integrator later.
  */
-import { spawnSync } from 'node:child_process';
+import { spawnSync } from '../spawn-sync';
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -32,7 +32,7 @@ import { baseBranchOf, baseMismatchFix, describeSubstitution, substituteStampOnl
 import { EXCEPTION_RECEIPT, exceptionProblem, exceptionSummary, flakyDecision, flakyRuns, parseCases, redRunChanged, type FailureDeps, type FlakyInput } from './flaky-exception';
 import { buildRunCheck } from './run-check';
 import { resolveBaseBranch } from '../ship-policy';
-import { parseRunReceipt, parseRunRef, runChanged, runReceiptFields, uncoveredFiles, verifyRun, type ApiJob, type ApiRun, type RemoteGateRuns, type RunDeps, type RunEvidence, type RunProfile } from '../run-evidence';
+import { parseRunReceipt, parseRunRef, runChanged, runReceiptFields, uncoveredFiles, verifyRun, type ApiJob, type ApiRun, type BaseMove, type RemoteGateRuns, type RunDeps, type RunEvidence, type RunProfile } from '../run-evidence';
 import type { CheckDef, CheckResult, PregateContext, Stage } from './types';
 import { displayNamePattern, workflowCallers } from './workflows';
 
@@ -59,8 +59,8 @@ export function applyDowngrades(ctx: PregateContext, result: CheckResult, def: C
 
 /**
  * The tests stage's automatic `--from-run` (GSTA-258): when the base branch declares run profiles and no run was named,
- * the newest verified CI run at HEAD's clean tree under a profile for this OS becomes `ctx.fromRun`, so its tree.json
- * files count as passed and only the rest run (on a small machine, an all-covered selection records no remote gate
+ * the newest verified CI run at HEAD's clean tree under each profile for this OS goes into `ctx.fromRun`, so the tree.json
+ * files of every one of them count as passed and only the rest run (on a small machine, an all-covered selection records no remote gate
  * obligation). Returns the CI_CARRY line, or null when the base declares no profiles. Security scans, guards and the
  * preflight stage are never carried.
  */
@@ -75,12 +75,17 @@ export function autoCarry(ctx: PregateContext): string | null {
   if (!names.length) return none('no_profile: no base run profile for this OS covers a lane this machine runs');
   const wtree = () => { const fp = wtreeFingerprint({ cwd: ctx.repoRoot }); return 'tree' in fp ? fp.tree : null; };
   const refusals: string[] = [];
+  const runs: Array<{ ref: string; profile: string }> = [];
+  const receipts: string[] = [];
   for (const name of names) {
     const v = findCarry(check, { profiles: [name], head: ctx.head, tree, wtree });
-    if (v.ok) { ctx.fromRun = { ref: String(v.runs[0]!.run_id), check }; return `CI_CARRY: accepted ${v.receipt}`; }
-    refusals.push(`${v.reason}: ${v.detail}`);
+    if (!v.ok) { refusals.push(`${v.reason}: ${v.detail}`); continue; }
+    runs.push({ ref: String(v.runs[0]!.run_id), profile: name });
+    receipts.push(v.receipt);
   }
-  return none(refusals.join(' | '));
+  if (!runs.length) return none(refusals.join(' | '));
+  ctx.fromRun = { ref: (runs.find(r => check.gateRuns?.profiles.includes(r.profile)) ?? runs[0]!).ref, check, runs };
+  return `CI_CARRY: accepted ${receipts.join(' + ')}`;
 }
 
 const git = (cwd: string, args: string[]): string | null => {
@@ -128,7 +133,7 @@ function carryGate(ctx: PregateContext, file: PregateFile): string | null {
   const check = ctx.fromRun.check as RunCheck;
   if (!check.gateRuns) return null;
   const view: PregateFile = { ...file, requires_remote: file.requires_remote!.map(r => (r === gate ? { ...r, tests: [...new Set([...carried, ...r.tests])] } : r)) };
-  const d = clearByRuns(view, REMOTE_GATE_LANE, [ctx.fromRun.ref], check, ctx.repoRoot);
+  const d = clearByRuns(view, REMOTE_GATE_LANE, [ctx.fromRun.ref], check, ctx.repoRoot, undefined, ctx.allowRepoCommands, ctx.base);
   if (!('receipt' in d)) return `CI_CARRY: ${REMOTE_GATE_LANE} stays uncleared (${d.message})`;
   clearObligation(file, REMOTE_GATE_LANE, d.receipt, 'ci-carry', d.substitution);
   return `CI_CARRY: cleared ${REMOTE_GATE_LANE} ${d.receipt}`;
@@ -219,10 +224,13 @@ export interface Verification { ok: boolean; code?: 'PREGATE_STALE' | 'PREGATE_R
  * user-owned policy behind the run (or its absence, under the defaults) must
  * still hold, since it lives outside the tree.
  */
-export function verifyPregate(repoRoot: string, file: PregateFile, treeNow: WtreeResult = wtreeFingerprint({ cwd: repoRoot })): Verification {
+export function verifyPregate(repoRoot: string, file: PregateFile, treeNow: WtreeResult = wtreeFingerprint({ cwd: repoRoot }), base?: string): Verification {
   const uncleared = (file.requires_remote ?? []).filter(r => !r.receipt);
   const treeCurrent = 'tree' in treeNow && treeNow.tree === file.tree;
   if (!treeCurrent) return { ok: false, code: 'PREGATE_STALE', message: `pregate.json was recorded against tree ${file.tree.slice(0, 12)}; ${'tree' in treeNow ? `the tree is now ${treeNow.tree.slice(0, 12)}` : `the tree cannot be fingerprinted now (${treeNow.error})`}`, current: false, uncleared };
+  const recordedBase = base === undefined ? null : baseBranchOf(file.base);
+  const shipBase = base?.replace(/^origin\//, '');
+  if (recordedBase && recordedBase !== shipBase) return { ok: false, code: 'PREGATE_STALE', message: `pregate.json was recorded against origin/${recordedBase}, but this ships against origin/${shipBase}; its checks and clears used origin/${recordedBase}'s policy and run profiles`, current: false, uncleared };
   const policyChange = userPolicyChange(file);
   if (policyChange) return { ok: false, code: 'PREGATE_STALE', message: policyChange, current: false, uncleared };
   const current = true;
@@ -275,9 +283,9 @@ function userPolicyChange(file: PregateFile): string | null {
   return `${absent} now holds a user-owned policy, and pregate.json was recorded under the defaults; rerun gstack-pregate`;
 }
 
-export interface ClearInput { runUrl?: string; bundleLane?: string; receiptPath?: string; runs?: string[]; evidence?: RunCheck; flaky?: FlakyInput }
+export interface ClearInput { runUrl?: string; bundleLane?: string; receiptPath?: string; runs?: string[]; evidence?: RunCheck; flaky?: FlakyInput; allowRepoCommands?: boolean; /** The branch whose run profiles `evidence` holds (gstack-pregate clear: the record's own); absent, origin/HEAD's. */ base?: string }
 /** What a run clear needs: the base branch's run profiles, the verifier's dependencies, the clock, and the remote gate's inventory. */
-export interface RunCheck { repo: string; deps: RunDeps; profiles: Record<string, RunProfile>; gateRuns: RemoteGateRuns | null; now: Date; unchanged?: (p: RunProfile) => string | null; docsOnly?: (head: string) => boolean; inventory: (command: string, tree: string, selected?: string[]) => string[] | { error: string }; failures?: FailureDeps }
+export interface RunCheck { repo: string; deps: RunDeps; profiles: Record<string, RunProfile>; gateRuns: RemoteGateRuns | null; now: Date; unchanged?: (p: RunProfile) => string | null; docsOnly?: (head: string) => boolean; dispatchable?: (p: RunProfile) => boolean; onlyBaseMoved?: (merge: string, head: string) => BaseMove; inventory: (command: string, tree: string, selected?: string[]) => string[] | { error: string }; failures?: FailureDeps }
 export type ClearDecision = { receipt: string; attested: boolean; substitution?: PregateReceiptSubstitution; exception?: PregateException } | { refused: 'usage' | 'PREGATE_RECEIPT_INVALID'; message: string; fix?: string };
 
 /**
@@ -313,10 +321,10 @@ export function clearDecision(file: PregateFile, lane: string, input: ClearInput
     const refs = [...(input.runs ?? []), ...(input.runUrl ? [input.runUrl] : [])];
     if (!refs.length) return { refused: 'usage', message: '--flaky-exception needs --run <id|url>: an exception reads GitHub Actions runs' };
     if (!input.flaky.pr) return { refused: 'usage', message: '--flaky-exception needs --pr <n>, the pull request the grant binds' };
-    return clearByRuns(file, lane, refs, input.evidence, repoRoot, { ...input.flaky, cases });
+    return clearByRuns(file, lane, refs, input.evidence, repoRoot, { ...input.flaky, cases }, input.allowRepoCommands, input.base);
   }
   const profiled = input.evidence && (lane === REMOTE_GATE_LANE ? input.evidence.gateRuns : input.evidence.profiles[lane]);
-  if (input.runs?.length || (input.runUrl && profiled)) return clearByRuns(file, lane, [...(input.runs ?? []), ...(input.runUrl ? [input.runUrl] : [])], input.evidence, repoRoot);
+  if (input.runs?.length || (input.runUrl && profiled)) return clearByRuns(file, lane, [...(input.runs ?? []), ...(input.runUrl ? [input.runUrl] : [])], input.evidence, repoRoot, undefined, input.allowRepoCommands, input.base);
   if (input.bundleLane && profiled && lane !== REMOTE_GATE_LANE) return { refused: 'usage', message: `${lane} has a run profile on the base branch; clear it with --run <id|url>, which verifies the run` };
   if (target.lane === REMOTE_GATE_LANE) {
     if (!input.receiptPath) return { refused: 'usage', message: `${lane} clears only with --receipt <file> holding the remote gate's PREGATE_REMOTE: tree=… tests=… failed=… line (a run URL is not checkable); or rerun gstack-pregate --remote` };
@@ -329,7 +337,7 @@ export function clearDecision(file: PregateFile, lane: string, input: ClearInput
     if (!report) return { refused: 'PREGATE_RECEIPT_INVALID', message: `${input.receiptPath} has no PREGATE_REMOTE: line; ${lane} stays uncleared` };
     const own = remoteReportProblem(report, report.tree);
     if (own) return { refused: 'PREGATE_RECEIPT_INVALID', message: `${own}; ${lane} stays uncleared` };
-    const sub = treeSubstitution(file, report.tree, lane, repoRoot);
+    const sub = treeSubstitution(file, report.tree, lane, repoRoot, input.allowRepoCommands);
     if ('refused' in sub) return sub;
     const substitution = sub.substitution;
     const problem = remoteReportProblem(report, substitution ? report.tree : file.tree);
@@ -363,6 +371,14 @@ export function clearDecision(file: PregateFile, lane: string, input: ClearInput
       return invalid(`workflow_mismatch — run ${id} attempt ${run?.run_attempt ?? '?'} ran ${run?.path ?? 'an unknown workflow'}, not ${want}${callers.length ? ` or a workflow that calls it (${names})` : ''}`, `clear ${lane} with a run of its own workflow${callers.length ? ` or of a workflow that calls it (${names})` : ''}: ${start}, then gstack-pregate clear --remote ${lane} --run-url <that run's URL>`);
     }
     const runOf = caller ?? { file: target.workflow, dispatch };
+    if (caller) {
+      const at = `run ${id} attempt ${run.run_attempt} of ${caller.file}`;
+      const fresh = `${caller.dispatch ? `gh workflow run ${caller.file} --ref <branch>` : `push a commit that starts ${caller.file}`} at ${file.head ? file.head.slice(0, 12) : 'the head'}, then gstack-pregate clear --remote ${lane} --run-url <that run's URL>`;
+      if (run.head_sha !== file.head) return invalid(`head_mismatch — ${at} ran at ${(run.head_sha ?? '').slice(0, 12)}, not pregate.json's head ${file.head ? file.head.slice(0, 12) : '(none recorded)'}, and a caller run clears ${target.workflow} only at that exact head`, file.head ? fresh : `rerun gstack-pregate at the head, then ${fresh}`);
+      if (run.event === 'pull_request') return invalid(`merge_tested — ${at} is a pull_request run, which tested GitHub's merge of the head with its base, not the head itself`, fresh);
+      const tested = git(repoRoot, ['rev-parse', `${run.head_sha}^{tree}`]);
+      if (tested !== file.tree) return invalid(`tree_mismatch — ${at} tested tree ${(tested ?? 'unreadable').slice(0, 12)} at its head, not pregate.json's tree ${file.tree.slice(0, 12)}`, `commit what pregate.json recorded, rerun gstack-pregate, then ${fresh}`);
+    }
     const green = `then gstack-pregate clear --remote ${lane} --run-url <the green run's URL>`;
     if (run.status !== 'completed') return invalid(`run_in_progress — run ${id} attempt ${run.run_attempt} is ${run.status}`, `wait for run ${id} to finish green (or rerun ${runOf.file} if it fails), ${green}`);
     if (run.conclusion !== 'success') return invalid(`run_not_success — run ${id} attempt ${run.run_attempt} concluded ${run.conclusion}`, `rerun ${runOf.file} (gh run rerun ${id}${runOf.dispatch ? `, or gh workflow run ${runOf.file} --ref <branch>` : ''}), ${green}`);
@@ -381,13 +397,13 @@ export function clearDecision(file: PregateFile, lane: string, input: ClearInput
 }
 
 /** The stamp-only substitution that lets a receipt for `gatedTree` clear pregate.json's tree, none when the trees are equal, or the refusal. */
-function treeSubstitution(file: PregateFile, gatedTree: string, lane: string, repoRoot: string): { substitution?: PregateReceiptSubstitution } | Extract<ClearDecision, { refused: string }> {
+function treeSubstitution(file: PregateFile, gatedTree: string, lane: string, repoRoot: string, allowRepoCommands = false): { substitution?: PregateReceiptSubstitution } | Extract<ClearDecision, { refused: string }> {
   if (gatedTree === file.tree) return {};
   // The stamp rule is the ship's own base branch's policy (origin/HEAD, as regate reads it), never a branch the artifact names.
   const base = resolveBaseBranch(repoRoot);
   const recorded = baseBranchOf(file.base);
   if (recorded && recorded !== base) return { refused: 'PREGATE_RECEIPT_INVALID', message: `${treeMismatch(gatedTree, file.tree)}; pregate.json was recorded against origin/${recorded}, not this repository's base origin/${base}, so the stamp rule that would class the difference is not the base's; ${lane} stays uncleared`, fix: baseMismatchFix(repoRoot, base, recorded) };
-  const s = substituteStampOnlyTree(repoRoot, base, gatedTree, file.tree);
+  const s = substituteStampOnlyTree(repoRoot, base, gatedTree, file.tree, { allowRepoCommands, head: file.head });
   if ('problem' in s) return { refused: 'PREGATE_RECEIPT_INVALID', message: `${s.problem}; ${lane} stays uncleared`, fix: s.fix };
   return { substitution: s.substitution };
 }
@@ -399,7 +415,7 @@ function treeSubstitution(file: PregateFile, gatedTree: string, lane: string, re
  * does not run (never an inventory file); any other lane needs one verified run of the profile named after it. The run
  * tree must be pregate.json's tree or a stamp-only predecessor of it, exactly as a gate report's tree must.
  */
-function clearByRuns(file: PregateFile, lane: string, refs: string[], check: RunCheck | undefined, repoRoot: string, flaky?: FlakyInput & { cases: string[] }): ClearDecision {
+function clearByRuns(file: PregateFile, lane: string, refs: string[], check: RunCheck | undefined, repoRoot: string, flaky?: FlakyInput & { cases: string[] }, allowRepoCommands = false, profilesBase?: string): ClearDecision {
   if (!check) return { refused: 'usage', message: `--run needs the base branch's run_profiles; none could be read` };
   const isGate = lane === REMOTE_GATE_LANE;
   const names = isGate ? check.gateRuns?.profiles ?? [] : check.profiles[lane] ? [lane] : [];
@@ -407,14 +423,14 @@ function clearByRuns(file: PregateFile, lane: string, refs: string[], check: Run
   if (refs.length !== names.length) return { refused: 'usage', message: `${lane} clears with exactly ${names.length} run(s), one per profile (${names.join(', ')}); got ${refs.length}` };
   const ids = refs.map(ref => parseRunRef(ref, check.repo) ?? ref);
   if (new Set(ids).size !== ids.length) return { refused: 'usage', message: `${lane} needs a different run for each profile; got ${refs.join(', ')}` };
-  // The profiles are the base branch's; a pregate.json recorded against another base names another authority.
-  const base = resolveBaseBranch(repoRoot);
+  // The profiles are one base branch's (the record's own, for gstack-pregate clear); a pregate.json recorded against another base names another authority.
+  const base = profilesBase ?? resolveBaseBranch(repoRoot);
   const recorded = baseBranchOf(file.base);
-  if (recorded && recorded !== base) return { refused: 'PREGATE_RECEIPT_INVALID', message: `REUSE: refused reason=base_mismatch — pregate.json was recorded against origin/${recorded}, but run profiles come from this repository's base origin/${base}; ${lane} stays uncleared`, fix: baseMismatchFix(repoRoot, base, recorded) };
+  if (recorded && recorded !== base) return { refused: 'PREGATE_RECEIPT_INVALID', message: `REUSE: refused reason=base_mismatch — pregate.json was recorded against origin/${recorded}, but run profiles come from origin/${base}; ${lane} stays uncleared`, fix: profilesBase ? `clear without --base, which reads the record's own base origin/${recorded}; or rerun gstack-pregate --base ${base}, then clear again` : baseMismatchFix(repoRoot, base, recorded) };
   const verdicts = new Map<string, ReturnType<typeof verifyRun>>();
   const verdict = (name: string, ref: string) => {
     const key = `${name}\0${ref}`;
-    if (!verdicts.has(key)) verdicts.set(key, verifyRun(check.deps, { repo: check.repo, runRef: ref, profileName: name, profile: check.profiles[name]!, vetoHeads: file.head ? [file.head] : [], now: check.now }));
+    if (!verdicts.has(key)) verdicts.set(key, verifyRun(check.deps, { repo: check.repo, runRef: ref, profileName: name, profile: check.profiles[name]!, vetoHeads: file.head ? [file.head] : [], now: check.now, onlyBaseMoved: check.onlyBaseMoved }));
     return verdicts.get(key)!;
   };
   const missingProfile = names.find(name => !check.profiles[name]);
@@ -442,7 +458,7 @@ function clearByRuns(file: PregateFile, lane: string, refs: string[], check: Run
   if (trees.length > 1) return { refused: 'PREGATE_RECEIPT_INVALID', message: `REUSE: refused reason=tree_mismatch — the runs tested different trees (${trees.map(t => t.slice(0, 12)).join(', ')}); ${lane} stays uncleared` };
   const off = red && evidence.find(e => e.head_sha !== file.head || e.tree !== file.tree);
   if (off) return { refused: 'PREGATE_RECEIPT_INVALID', message: `FLAKY_EXCEPTION: refused reason=head_mismatch — run ${off.run_id} attempt ${off.run_attempt} tested head ${off.head_sha.slice(0, 12)} tree ${off.tree.slice(0, 12)}, not pregate.json's head ${(file.head ?? '').slice(0, 12)} tree ${file.tree.slice(0, 12)}; an exception binds the exact head and tree, never a stamp-only predecessor; ${lane} stays uncleared` };
-  const sub = treeSubstitution(file, trees[0]!, lane, repoRoot);
+  const sub = treeSubstitution(file, trees[0]!, lane, repoRoot, allowRepoCommands);
   if ('refused' in sub) return { ...sub, message: `REUSE: refused reason=tree_not_stamp_only — ${sub.message}` };
   const idle = evidence.filter(e => (e.tests ?? e.files.length) === 0);
   if (idle.length) return { refused: 'PREGATE_RECEIPT_INVALID', message: `REUSE: refused reason=no_tests — ${idle.map(e => `run ${e.run_id} (${e.profile})`).join(', ')} records no tests; ${lane} stays uncleared` };

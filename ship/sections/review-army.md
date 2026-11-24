@@ -6,7 +6,7 @@ Set CYCLES to 0 on first entry only, with PASS set to 1,
 `REVIEW_SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)` saved and the `ship: review_scope`
 policy line (Step 3) kept. Every entry saves `PASS_HEAD=$(git rev-parse HEAD)`; from pass 2 on,
 `RANGE_BASE` is the previous pass's PASS_HEAD. Every entry also runs
-`mkdir -p .gstack/tmp && rm -f .gstack/tmp/targeted.json && _EX=$(git rev-parse --git-path info/exclude) && mkdir -p "$(dirname "$_EX")" && { grep -qxF '/.gstack/tmp/' "$_EX" 2>/dev/null || printf '\n/.gstack/tmp/\n' >> "$_EX"; }`
+`mkdir -p .gstack/tmp && { rm .gstack/tmp/targeted.json 2>/dev/null || true; } && _EX=$(git rev-parse --git-path info/exclude) && mkdir -p "$(dirname "$_EX")" && { grep -qxF '/.gstack/tmp/' "$_EX" 2>/dev/null || printf '\n/.gstack/tmp/\n' >> "$_EX"; }`
 (a pass without the targeted reader leaves no record, and the record never reads as an uncommitted edit). Keep existing approvals; changed
 finding scope needs a new decision. Order: checklist/design, specialists (9.1),
 Red Team (9.2), QA (9.2.1), dedup (9.3), scope, fixes and logging (9.4).
@@ -17,7 +17,12 @@ Finish the complete review and QA before applying any fix in Step 9.4.
 
 **Review plan.** Pass 1 runs `~/.claude/skills/gstack/bin/gstack-review-plan
 --base <base>`, plus `--depth-floor <d>` on every plan run when the /ship prompt
-gave `--depth-floor <d>` (it only raises); add `--declare-risk <classes>` when the diff touches a risk
+gave `--depth-floor <d>` (it only raises), and Step 1's `PR_REVIEW_FLAGS:` on every plan run (the PR's
+earlier rounds and a round grant; past two the plan is one read-only full review, and `PR_ROUND_CAP` stops for the lane, never the owner).
+When they name `--round-grant <id>`, run `gstack-ship-receipt claim --pr <n> --run <SESSION_ID> --grant <id>` before the first
+dispatch (`GRANT_SPENT` stops the run). With `--stop <head>` too, the grant buys that stop's fix round: Step 9 is only decision
+3.5's fix-check of the PR's own change since `<head>`, for the grant's findings, Step 11.5 saves `<head>`'s tree, and the receipt's
+`review_loop_exception` names the grant. Add `--declare-risk <classes>` when the diff touches a risk
 class the plan's `REVIEW_DEPTH:` misses (spend it reserves or binds: `money`), and give Step 16's
 receipt write the same flag; a repeat uses the plan run that picked it.
 A `scoped` repeat is a full pass on the range: its `fix-check` is decision 3.5's
@@ -250,7 +255,7 @@ fi
 
 _REPO_ROOT=$(git rev-parse --show-toplevel) || { echo 'ERROR: not in a git repo' >&2; exit 1; }
 _OUTSIDE_TMP=$(mktemp -d "${TMPDIR:-/tmp}/gstack-outside.XXXXXXXX") || exit 1
-trap 'rm -rf "$_OUTSIDE_TMP"' EXIT
+trap 'rm -r "$_OUTSIDE_TMP"' EXIT
 _OUTSIDE_INPUT="$_OUTSIDE_TMP/prompt"
 cat -- '<prepared-prompt-file>' >"$_OUTSIDE_INPUT" || exit 1
 _CODEX_PROBE="$HOME/.claude/skills/gstack/bin/gstack-codex-probe"
@@ -712,9 +717,9 @@ but missing dispatched output still blocks continuation, even with a QA exceptio
    note, never a pass).
 
 1. **Apply the cap before any edit, then classify.** With the classified output in
-   hand and nothing edited yet: if `CYCLES >= 3`, or under `frozen` `PASS >= 3` with
-   a blocking finding in `scope: fix`, skip items 2–3 (no fix is applied on a capped
-   pass), complete items 3.5–6 with the findings unfixed, and take decision 2 below.
+   hand and nothing edited yet: if `CYCLES >= 3`, or the pass printed `READ_ONLY:` (the
+   read-only final review), or under `frozen` `PASS >= 3` with a blocking finding in
+   `scope: fix`, skip items 2–3 (no fix is applied on a capped pass), complete items 3.5–6 with the findings unfixed, and take decision 2 below.
    Otherwise: Classify only unmatched or reopened findings as AUTO-FIX or ASK when
    the classified output marks them `scope: fix`, per the Fix-First Heuristic in
    checklist.md. Critical findings lean toward ASK; informational lean toward AUTO-FIX.
@@ -821,7 +826,10 @@ finding makes that PR a draft.
 
 ### Decide whether to repeat Step 9
 
-After persistence, record missing output, CYCLES and fixes in the invocation record.
+After persistence, record missing output, CYCLES and fixes in the invocation record. With a PR open, run
+`gstack-review-scope summary --since "$REVIEW_SINCE" --no-ledger --out .gstack/tmp/review-loop.json && gstack-ship-receipt stub --pr <n> --run <SESSION_ID> --review-loop @.gstack/tmp/review-loop.json`
+so a run that stops still counts its rounds (Step 19's write, same `--run`, replaces it). On `NEXT: stop` with a PR open, also
+run `gstack-ship-receipt stop --pr <n> --run <SESSION_ID> --since "$REVIEW_SINCE"` and report its `NEXT:` line with the stop.
 Decision 1 always applies first. Then, under `frozen`, run `gstack-review-plan --base <base> --pass $PASS --last full`
 with each flag that holds (`--fixed-blocking`, `--fixed-below`, `--blocking-open`,
 `--touched-gate` for a fix to an item 2.5 path, `--critical-found` when this pass

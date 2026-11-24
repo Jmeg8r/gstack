@@ -319,7 +319,7 @@ just edited) PLUS any doc claims affected by the diff range — do NOT hard-code
 list (a fixed README/ARCHITECTURE/CHANGELOG list misses generated skill docs, package docs,
 and command-specific docs). **Always start with the filesystem boundary instruction:**
 
-"Filesystem boundary: do not read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. They hold skill definitions, not repository code to review. Do not invoke any installed skill (Codex home skills/, .agents/), hook, or tool instruction; answer directly. Do not modify agents/openai.yaml. Review only the repository code.\n\nYou are reviewing documentation changes against the code that shipped on this
+"Filesystem boundary: do not read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, .agents/, or any agents/openai.yaml. They hold skill definitions, not repository code to review. Do not invoke any installed skill (Codex home skills/, .agents/), hook, or tool instruction; answer directly. Do not modify agents/openai.yaml; other files in the repository agents/ folder are code to review. Review only the repository code.\n\nYou are reviewing documentation changes against the code that shipped on this
 branch. Review the supplied release diff (git diff <diff-base> HEAD) and the current updated working-tree docs
 (the files this release touched, plus any docs whose claims the diff affects). Find: doc
 claims that no longer match the code, new public surface (commands, flags, config keys,
@@ -346,7 +346,7 @@ fi
 
 _REPO_ROOT=$(git rev-parse --show-toplevel) || { echo 'ERROR: not in a git repo' >&2; exit 1; }
 _OUTSIDE_TMP=$(mktemp -d "${TMPDIR:-/tmp}/gstack-outside.XXXXXXXX") || exit 1
-trap 'rm -rf "$_OUTSIDE_TMP"' EXIT
+trap 'rm -r "$_OUTSIDE_TMP"' EXIT
 _OUTSIDE_INPUT="$_OUTSIDE_TMP/prompt"
 cat -- '<prepared-prompt-file>' >"$_OUTSIDE_INPUT" || exit 1
 _CODEX_PROBE="$HOME/.claude/skills/gstack/bin/gstack-codex-probe"
@@ -565,7 +565,7 @@ python3 -c 'import pathlib,subprocess,sys; subprocess.run(["glab","mr","update",
 5. Clean up the tempfile:
 
 ```bash
-rm -f "<run-dir>/body.md" "<run-dir>/body-original.md"
+rm "<run-dir>/body.md" "<run-dir>/body-original.md" 2>/dev/null || true
 rmdir "<run-dir>"
 ```
 

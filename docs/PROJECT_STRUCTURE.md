@@ -58,7 +58,7 @@ gstack/
 ├── eval-plan/       # Preregistered paid evals: prereg, arms, $0 dry run, priced pilot (bin/gstack-eval-plan)
 ├── captain/         # /captain (also /crew): one controller, many lanes; templates/ holds CREW.md, AGENTS.md, NOTES.md, DIGEST.md, the flaky ledger, the lane report, the READY block, slot call, the lane brief, asks and the daily automation prompt
 ├── plan-ceo-review/ # /plan-ceo-review skill
-├── plan-eng-review/ # /autoplan's eng-phase methodology (retired as a skill, GST-1698)
+├── plan-eng-review/ # /plan-eng-review skill
 ├── autoplan/        # /autoplan skill (auto-review pipeline: CEO → design → DX → eng, eng always last)
 ├── benchmark/       # /benchmark skill (performance regression detection)
 ├── runaway-stopper/ # /runaway-stopper skill (runaway thread/subagent detect, stop, rotate, prevent; bin/gstack-runaway, templates/)
@@ -68,7 +68,7 @@ gstack/
 ├── land-and-deploy/ # /land-and-deploy skill (merge → deploy → canary verify)
 ├── modernize/       # /modernize skill (aging PR → MODERNIZE / REWORK / CLOSE disposition, range-diff proof, pinned-lease push)
 ├── office-hours/    # /office-hours skill (YC Office Hours — startup diagnostic + builder brainstorm)
-├── verify/          # /verify skill (build-and-verify loop over bin/gstack-checks + lib/checks.ts; tests come from lib/pregate)
+├── build-check/     # /build-check skill (build-and-verify loop over bin/gstack-checks + lib/checks.ts; tests come from lib/pregate)
 ├── spec/            # /spec skill (five-phase spec → GitHub issue, optional agent spawn, /ship auto-closes)
 ├── retro/           # Retrospective skill (includes /retro global cross-project mode)
 ├── careful/         # /careful skill; bin/check-careful.sh (PreToolUse destructive-command hook) + bin/hook-extract.sh (shared hook helpers: payload extraction, deny JSON, gstack_hook_state_root)

@@ -101,8 +101,8 @@ export const RESULT_CODES = {
   },
   ARTIFACT_GUARD_LINE_MISSING: {
     anchor: 'artifact-guard-line-missing',
-    summary: 'an unattended run’s review-record.md does not state that the publication guard was not enforced',
-    fix: 'start the run through gstack-skill-start so the GUARD_NOT_INSTALLED line is recorded',
+    summary: 'an unattended run’s review-record.md does not state whether the publication guard was enforced',
+    fix: 'start the run through gstack-skill-start so its GUARD_ENFORCED or GUARD_NOT_INSTALLED line is recorded',
   },
   GUARD_NOT_INSTALLED: {
     anchor: 'guard-not-installed',
@@ -411,7 +411,7 @@ export const RESULT_CODES = {
   },
   PREGATE_STALLED: {
     anchor: 'pregate-stalled',
-    summary: 'a test command printed nothing for the stall timeout while its process group used under a tenth of one CPU (log growth alone on Windows), so the group was killed; the check is incomplete, never pass',
+    summary: 'a test command printed nothing for the stall timeout while its process tree used under a tenth of one CPU (log growth alone on Windows), so the tree was killed; the check is incomplete, never pass',
     fix: 'read the lane log for the last file started, fix the hang, or raise `--stall-timeout` (`stall_timeout_s`; 0 disables) for a test that waits quietly for longer, then rerun `gstack-pregate --stage tests`',
   },
   PREGATE_RECEIPT_INVALID: {
@@ -684,8 +684,8 @@ export const RESULT_CODES = {
   },
   EVAL_MODEL_OLD_GENERATION: {
     anchor: 'eval-model-old-generation',
-    summary: 'an arm names an older generation of a model family the eval model rules order newest first',
-    fix: 'use the newest id of the family the EVAL_MODEL line names, or reorder families in .gstack/eval-models.json in a reviewed PR',
+    summary: 'an arm, judge, reader or simulator is gpt-4o or a model lib/pricing.ts marks superseded_by (R116), or an arm is not the newest id of a family the eval model rules order newest first',
+    fix: 'use the replacement the MODEL_GENERATION or EVAL_MODEL line names; a competitor system tested as its vendor ships it declares its built-in model with a vendor-default: line in ## Models; or reorder families in .gstack/eval-models.json in a reviewed PR',
   },
   EVAL_MODEL_GENERATION_UNRESOLVED: {
     anchor: 'eval-model-generation-unresolved',

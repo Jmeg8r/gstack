@@ -332,6 +332,24 @@ function directoryIdentities(root: string, path: string): DirectoryIdentity[] {
   }
   return identities;
 }
+/** Whether every directory above path exists as a real directory, checked from the root down so no later lstat resolves through a link; false when one is missing, UNSAFE_PATH when one is a symlink or a file. */
+function sourceAncestorsPresent(root: string, path: string): boolean {
+  const rel = relativePath(path);
+  let cursor = root;
+  for (const part of rel.split('/').slice(0, -1)) {
+    cursor = join(cursor, part);
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(cursor);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw error;
+    }
+    if (stat.isSymbolicLink() || !stat.isDirectory())
+      throw new CsoError('UNSAFE_PATH', `Symlink or non-directory source ancestor: ${rel}`);
+  }
+  return true;
+}
 function assertDirectoryIdentities(identities: DirectoryIdentity[], path: string): void {
   for (const expected of identities) {
     let current: fs.Stats;
@@ -390,6 +408,16 @@ export function assertOpenedFileContained(root: string, full: string, fd: number
   )
     throw new CsoError('SNAPSHOT_RACE', 'Opened source identity changed during containment validation');
 }
+/** A permission error (a sandbox deny rule, a mode-000 file): the capture may withhold an excluded path instead (#4395). */
+const DENIED = new Set(['EACCES', 'EPERM']);
+class UnreadableSource extends CsoError {
+  constructor(
+    path: string,
+    public errno: string,
+  ) {
+    super('UNSAFE_PATH', `Source could not be opened as a regular file: ${path}`);
+  }
+}
 function readStableWith<T>(
   root: string,
   path: string,
@@ -413,6 +441,7 @@ function readStableWith<T>(
     const code = (error as NodeJS.ErrnoException).code;
     if (['ELOOP', 'ENOENT', 'ENOTDIR', 'ENXIO'].includes(code ?? ''))
       throw new CsoError('SNAPSHOT_RACE', `Source changed before it could be opened: ${path}`);
+    if (DENIED.has(code ?? '')) throw new UnreadableSource(path, code!);
     throw new CsoError('UNSAFE_PATH', `Source could not be opened as a regular file: ${path}`);
   }
   try {
@@ -635,10 +664,15 @@ async function rejectSpecialFiles(
   repo: string,
   home: string,
   admission: ReturnType<typeof snapshotAdmission>,
+  auditPaths?: readonly string[],
 ): Promise<void> {
-  // Git intentionally omits untracked FIFOs and devices from ls-files. Walk
-  // pathnames without opening payloads, then ask Git which special names are
-  // ignored so a nonignored FIFO cannot silently disappear from the snapshot.
+  // Git intentionally omits untracked FIFOs, sockets and devices from
+  // ls-files. Walk pathnames without opening payloads, then ask Git which
+  // special names are ignored so a nonignored FIFO cannot silently disappear
+  // from the snapshot. Symlinks are not special here: Git lists every tracked
+  // or nonignored one, and capture records it by identity and a digest of
+  // its link text, never the text itself, without following it. With --paths, only the audit scope and the directories
+  // leading to it are walked, since nothing outside it is captured.
   admission.time();
   const ignoredRaw = await git(
       repo,
@@ -663,6 +697,9 @@ async function rejectSpecialFiles(
       candidate = candidate.slice(0, slash);
     }
   };
+  const inScope = (path: string) => !auditPaths || inAuditPaths(path, auditPaths),
+    leadsIntoScope = (path: string) =>
+      inScope(path) || auditPaths!.some((prefix) => prefix.startsWith(`${path}/`));
   const special: string[] = [];
   let visited = 0;
   const walk = (at: string, prefix = '') => {
@@ -674,15 +711,22 @@ async function rejectSpecialFiles(
         const path = relativePath(prefix ? `${prefix}/${item.name}` : item.name);
         if (noReadPath(path) || ignoredDirectory(path)) continue;
         admission.count(++visited);
-        const full = join(at, item.name),
+        const full = join(at, item.name);
+        let stat: fs.Stats;
+        try {
           stat = fs.lstatSync(full);
+        } catch (error: any) {
+          // Never opened: the capture withholds an unreadable excluded path.
+          if (DENIED.has(error?.code) && exclusion(path)) continue;
+          throw error;
+        }
         if (stat.isDirectory()) {
-          walk(full, path);
+          if (leadsIntoScope(path)) walk(full, path);
           continue;
         }
         // Symlinks are recorded, never followed, by capture(); only FIFOs,
         // sockets and devices stay refused here.
-        if (!stat.isFile() && !stat.isSymbolicLink()) special.push(path);
+        if (!stat.isFile() && !stat.isSymbolicLink() && inScope(path)) special.push(path);
       }
     } finally {
       directory.closeSync();
@@ -754,8 +798,24 @@ export async function capture(
       sensitiveEvidence: any[] = [],
       boundaries = new Map<string, fs.Stats>(),
       symlinks = new Map<string, { dev: number; ino: number; linkHash: string }>(),
-      absentPaths = new Set<string>();
+      absentPaths = new Set<string>(),
+      lstatDenied = new Set<string>();
     let total = 0;
+    // An excluded secret-like path that cannot be read is already kept out of
+    // snapshot/; record it as an unread input (a coverage gap) instead of
+    // aborting. Every other unreadable path still fails the capture.
+    const withholdUnreadable = (path: string, source: fs.Stats | undefined, errno: string) => {
+      if (!source) lstatDenied.add(path);
+      entries.push({
+        path,
+        pathId: snapshotPathId(repo, path),
+        originalHash: 'not-read',
+        bytes: source?.size ?? 0,
+        mode: (source?.mode ?? 0) & 0o777,
+        transformation: `withheld: ${exclusion(path)} file is unreadable (${errno}); its payload was not assessed`,
+      });
+      guard();
+    };
     guard();
     const objectFormat = (await git(repo, ['rev-parse', '--show-object-format'], home)).trim();
     guard();
@@ -770,7 +830,7 @@ export async function capture(
       throw new CsoError('INVALID_ARGUMENT', `--paths entry matches no source file: ${unmatched}`);
     const outsideAudit = (path: string) => auditPaths !== undefined && !inAuditPaths(path, auditPaths);
     const inventory: ReadonlySet<string> = new Set(list);
-    await rejectSpecialFiles(repo, home, admission);
+    await rejectSpecialFiles(repo, home, admission, auditPaths);
     guard();
     const manifest: SnapshotManifest = {
       version: 3,
@@ -794,6 +854,7 @@ export async function capture(
       for (const candidate of list) {
         if (noReadPath(candidate) || outsideAudit(candidate)) continue;
         try {
+          if (!sourceAncestorsPresent(repo, candidate)) continue;
           measured += fs.lstatSync(join(repo, candidate)).size;
           files++;
         } catch {}
@@ -804,10 +865,18 @@ export async function capture(
       guard();
       let source: fs.Stats;
       try {
+        if (!sourceAncestorsPresent(repo, path)) {
+          absentPaths.add(path);
+          continue;
+        }
         source = fs.lstatSync(join(repo, path));
       } catch (error: any) {
         if (error?.code === 'ENOENT') {
           absentPaths.add(path);
+          continue;
+        }
+        if (DENIED.has(error?.code) && exclusion(path)) {
+          withholdUnreadable(path, undefined, error.code);
           continue;
         }
         throw error;
@@ -890,7 +959,15 @@ export async function capture(
         continue;
       }
       if (total + size > SOURCE_LIMIT) throw sourceCapError();
-      const { data, mode } = readStable(repo, path, SOURCE_LIMIT);
+      let read: { data: Buffer; mode: number };
+      try {
+        read = readStable(repo, path, SOURCE_LIMIT);
+      } catch (error) {
+        if (!(error instanceof UnreadableSource && exclusion(path))) throw error;
+        withholdUnreadable(path, source, error.errno);
+        continue;
+      }
+      const { data, mode } = read;
       total += data.length;
       guard();
       if (total > SOURCE_LIMIT) throw sourceCapError();
@@ -1006,6 +1083,17 @@ export async function capture(
             if (!stable) throw new CsoError('SNAPSHOT_RACE', `${message}: ${e.path}`);
             guard();
             continue;
+          }
+          if (lstatDenied.has(e.path)) {
+            try {
+              fs.lstatSync(containedFile(repo, e.path));
+            } catch (error: any) {
+              if (DENIED.has(error?.code)) {
+                guard();
+                continue;
+              }
+            }
+            throw new CsoError('SNAPSHOT_RACE', `${message}: ${e.path}`);
           }
           const current = fs.lstatSync(containedFile(repo, e.path)),
             compared = gitHashes.get(e.path);
@@ -1181,7 +1269,7 @@ export async function capture(
     // Finish with a complete source check. Nothing below this block reads the
     // audited repository, so a late nonignored file or restored deletion cannot
     // fall between the final inventory and manifest publication.
-    await rejectSpecialFiles(repo, home, admission);
+    await rejectSpecialFiles(repo, home, admission, auditPaths);
     guard();
     assertEntriesStable('Source changed before snapshot persistence');
     if (canonical(list) !== canonical(await paths(repo, home, headCommit, admission)))

@@ -183,6 +183,7 @@ Usage:
   gstack-cso inspect RUN
   gstack-cso read RUN PATH_OR_HANDLE
   gstack-cso history RUN [PATH_OR_HANDLE]
+  gstack-cso search RUN REGEX [--seconds N]
   gstack-cso submit RUN SUBMISSION.json
   gstack-cso scan RUN gitleaks|osv|semgrep|zizmor|trivy|schemathesis [REQUEST.json]
   gstack-cso scanner-outcome RUN ARTIFACT_ID
@@ -1388,10 +1389,34 @@ function requireReportingTime(report: RunReportV3): void {
   if (Date.now() >= Date.parse(report.deadline))
     throw new CsoError('DEADLINE', 'Audit deadline reached; no further evidence can be accepted');
 }
+const REFUSED_SUBMISSION = 'submission-refused.json';
 function submit(args: string[]) {
   const { dir } = run(args);
   if (args.length !== 1) throw new CsoError('INVALID_ARGUMENT', 'submit requires one JSON file');
-  const rawInput = object(readInput(args[0]), 'submission');
+  try {
+    return acceptSubmission(dir, args[0]);
+  } catch (error) {
+    if (error instanceof CsoError) recordRefusedSubmission(dir, error);
+    throw error;
+  }
+}
+function recordRefusedSubmission(dir: string, error: CsoError): void {
+  try {
+    withLock(dir, () => {
+      const report = loadReport(dir);
+      if (report.status === 'running' && Date.now() < Date.parse(report.deadline))
+        writeHelperJson(join(dir, REFUSED_SUBMISSION), {
+          at: new Date().toISOString(),
+          code: error.code,
+          message: error.message,
+        });
+    });
+  } catch {
+    return;
+  }
+}
+function acceptSubmission(dir: string, file: string) {
+  const rawInput = object(readInput(file), 'submission');
   rejectUnexpected(
     rawInput,
     ['application', 'findings', 'coverage', 'gaps', 'modelUsage', 'recheck'],
@@ -1439,8 +1464,6 @@ function submit(args: string[]) {
         normalizedLocation = resolveSnapshotPath(manifest, f.location.path, false, 'Finding path', true);
       if (normalizedLocation.path !== sourceLocation.path)
         throw new CsoError('INVALID_SCHEMA', 'Finding path identity changed during redaction');
-      if (report.policy.mode === 'daily' && f.evidence === 'hypothesis')
-        throw new CsoError('INVALID_SCHEMA', 'Daily reports contain supported findings only');
       const old = report.findings.findIndex((x) => x.fingerprint === f.fingerprint);
       if (old < 0) {
         report.findings.push(f);
@@ -1503,6 +1526,7 @@ function submit(args: string[]) {
     // leaves closure evidence behind.
     saveReport(dir, report);
     if (recheckClaim) writeHelperJson(join(dir, 'recheck-claim.json'), recheckClaim);
+    fs.rmSync(join(dir, REFUSED_SUBMISSION), { force: true });
     return { runId: report.runId, findings: report.findings.length, completeness: report.completeness };
   });
 }
@@ -1513,6 +1537,16 @@ function finish(args: string[]) {
     const report = loadReport(dir),
       manifest = readSnapshotManifest(dir);
     assertSnapshot(dir, manifest);
+    const refused = join(dir, REFUSED_SUBMISSION);
+    if (report.status === 'running' && fs.existsSync(refused)) {
+      const { message } = readJson(refused);
+      if (Date.now() < Date.parse(report.deadline))
+        throw new CsoError(
+          'PREREQUISITE',
+          `The last submit was refused (${message}); correct it and submit again. finish closes the audit without that evidence only after the audit deadline (${report.deadline}).`,
+        );
+      report.gaps.push(`A refused submission was never resubmitted: ${message}`);
+    }
     reclaimDeadAttemptScratch(dir);
     for (const c of report.coverage)
       if (
@@ -1625,6 +1659,122 @@ async function read(args: string[]) {
     full = containedFile(join(dir, 'readable'), selected.path),
     data = readBoundedStable(full, 1024 * 1024, 'Snapshot path');
   emit(data.toString('utf8'));
+}
+const SEARCH_PATTERN_LIMIT = 512,
+  SEARCH_OUTPUT_BUDGET = 96 * 1024,
+  SEARCH_LISTED = 50,
+  SEARCH_SECONDS = 60;
+const listed = (paths: string[]) =>
+  paths.slice(0, SEARCH_LISTED).join(', ') +
+  (paths.length > SEARCH_LISTED ? `, and ${paths.length - SEARCH_LISTED} more` : '');
+/** One regex over every readable snapshot file in a worker the helper stops at a hard time limit; paths it could not search are listed as a coverage gap. */
+async function search(args: string[]) {
+  const { dir } = run(args);
+  let seconds = SEARCH_SECONDS;
+  if (args.length === 3 && args[1] === '--seconds') {
+    seconds = Number(args[2]);
+    if (!Number.isInteger(seconds) || seconds < 1 || seconds > SEARCH_SECONDS)
+      throw new CsoError('INVALID_ARGUMENT', `--seconds must be a whole number from 1 to ${SEARCH_SECONDS}`);
+    args.splice(1, 2);
+  }
+  if (args.length !== 1) throw new CsoError('INVALID_ARGUMENT', 'search requires one regular expression');
+  if (!args[0] || args[0].length > SEARCH_PATTERN_LIMIT)
+    throw new CsoError('INVALID_ARGUMENT', `Search pattern must be 1 to ${SEARCH_PATTERN_LIMIT} characters`);
+  try {
+    new RegExp(args[0]);
+  } catch {
+    throw new CsoError('INVALID_ARGUMENT', 'Search pattern is not a valid regular expression');
+  }
+  const stopAt = Date.now() + seconds * 1000,
+    manifest = readSnapshotManifest(dir);
+  assertSnapshot(dir, manifest);
+  const readable = join(dir, 'readable'),
+    files: Array<{ path: string; shown: string }> = [],
+    unsearched: string[] = [],
+    windowed: string[] = [],
+    out: string[] = [];
+  let noCopy = 0,
+    bytes = 0,
+    hidden = 0,
+    failed = false,
+    current = '',
+    settle: ((done: boolean) => void) | undefined,
+    unfinished: string[] = [];
+  for (const entry of manifest.entries) {
+    const transformation = entry.transformation ?? '';
+    if (transformation === OUTSIDE_AUDIT_PATHS) continue;
+    if (
+      /^(withheld|excluded):/.test(transformation) &&
+      transformation !== 'withheld: exceeds the 1 MiB redacting-reader limit' &&
+      !fs.existsSync(containedFile(readable, entry.path))
+    ) {
+      noCopy++;
+      continue;
+    }
+    files.push({ path: entry.path, shown: publicSnapshotPath(manifest, entry.path, entry.pathId).path });
+  }
+  const worker = new Worker(new URL('./search-worker.ts', import.meta.url).href),
+    step = (message: object) =>
+      new Promise<boolean>((resolve) => {
+        const timer = setTimeout(() => resolve(false), Math.max(0, stopAt - Date.now()));
+        settle = (done) => (clearTimeout(timer), resolve(done));
+        worker.postMessage(message);
+      });
+  worker.onmessage = (event) => {
+    const reply = event.data as { hit?: { line: number; text: string }; done?: boolean; windowed?: boolean };
+    if (reply.hit) {
+      const line = `${current}:${reply.hit.line}:${reply.hit.text}`;
+      if (bytes + Buffer.byteLength(line) > SEARCH_OUTPUT_BUDGET) hidden++;
+      else (out.push(line), (bytes += Buffer.byteLength(line) + 1));
+    }
+    if (reply.windowed) windowed.push(current);
+    if (reply.done) settle?.(true);
+  };
+  worker.onerror = () => ((failed = true), settle?.(true));
+  try {
+    if (!(await step({ pattern: args[0] }))) unfinished = files.map((file) => file.shown);
+    for (let index = 0; !failed && !unfinished.length && index < files.length; index++) {
+      current = files[index].shown;
+      let text: string;
+      try {
+        text = readBoundedStable(
+          containedFile(readable, files[index].path),
+          1024 * 1024,
+          'Snapshot path',
+        ).toString('utf8');
+      } catch (error) {
+        if (!(error instanceof CsoError) || error.code !== 'MISSING_INPUT') throw error;
+        unsearched.push(current);
+        continue;
+      }
+      if (Date.now() >= stopAt || !(await step({ text })))
+        unfinished = files.slice(index).map((file) => file.shown);
+    }
+  } finally {
+    worker.terminate();
+  }
+  if (failed) throw new CsoError('INVALID_SCHEMA', 'Search worker failed');
+  if (!out.length && !hidden) out.push('[gstack-cso search: no matches]');
+  if (hidden) out.push(`[gstack-cso search: ${hidden} more matching lines not shown; narrow the pattern]`);
+  if (unfinished.length)
+    out.push(
+      `[gstack-cso search: stopped at the ${seconds}-second limit; ${unfinished.length} paths not searched, a coverage gap: ${listed(unfinished)}]`,
+    );
+  if (unsearched.length)
+    out.push(
+      `[gstack-cso search: ${unsearched.length} unsearched paths (unreadable or over 1 MiB), a coverage gap: ${listed(unsearched)}]`,
+    );
+  if (windowed.length)
+    out.push(
+      `[gstack-cso search: ${windowed.length} paths have lines over 4096 characters, matched in overlapping 4 KiB windows where ^, $, lookbehind and matches over 256 characters are approximate: ${listed(windowed)}]`,
+    );
+  if (noCopy)
+    out.push(
+      `[gstack-cso search: ${noCopy} paths the snapshot excluded or withheld have no readable copy; inspect and report.md list them]`,
+    );
+  emit(out.join('\n'));
+  if (unfinished.length)
+    (await new Promise<void>((resolve) => process.stdout.write('', () => resolve())), process.exit(0));
 }
 async function history(args: string[]) {
   const { dir } = run(args),
@@ -2852,6 +3002,9 @@ export async function dispatchCsoCommand(
       return;
     case 'history':
       await history(args);
+      return;
+    case 'search':
+      await search(args);
       return;
     case 'submit':
       result = submit(args);

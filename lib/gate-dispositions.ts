@@ -10,17 +10,19 @@
  * the writer's hash reproduces) and its `digest` over those fields, so a hand-typed or edited row is ignored. The digest catches
  * edits; it is not authentication: a same-user lane can compute it too. What authorizes a disposition is the lander's explicit
  * `--accept-gate-disposition <id>` (`gateAcceptance`, run by `gstack-ship-queue land --pin` and `verify --pin`), re-derived from
- * the store at the pin, never from the receipt or the PR body (docs/ship-policy.md#gate-dispositions).
+ * the store at the pin, never from the receipt or the PR body (docs/ship-policy.md#gate-dispositions). A store lives on the machine
+ * that recorded the row, so `ready` also copies each applied non-security row, signed and whole, into the READY note on the
+ * notes ref, and a lander on another machine reads those rows beside its own store under the same checks (#4581).
  */
 import { createHash } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { spawnSync } from './spawn-sync';
 import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { appendRows, locate, readRecord, type ApprovalRow, type Env, type RecordError, type StoreLocation } from './approval-record';
 import type { ShipReceipt } from './headless-artifacts';
 import type { ResultCodeName } from './result-codes';
-import { GSTACK_ACTOR } from './ruled-notes';
-import { BIN_DIR, runScriptSync } from './script-invocation';
+import { isGstackActor, type RuledNote } from './ruled-notes';
+import { isSecurityFinding, REDACTED_FINDING, REDACTED_REASON, REDACTED_WORDS } from './security-findings';
+import { openRun, readRunRecord, withGateLock } from './ship-run-record';
 
 export interface GateDisposition { finding: string; gate_id: string; head: string; by: string; reason: string; words: string; at: string; approval: string }
 
@@ -41,7 +43,7 @@ export const gateDispositionDigest = (r: Record<string, unknown>) => 'sha256:' +
 function writerShaped(r: Record<string, any>, branch: string): boolean {
   const str = (v: unknown) => typeof v === 'string' && v.trim() === v && v !== '';
   return r.schema_version === 1 && typeof r.id === 'string' && APPROVAL_ID.test(r.id) && r.source === GATE_SOURCE && r.outcome === 'approved' &&
-    r.pending === 'none' && str(r.by) && ONE_LINE.test(r.by) && !GSTACK_ACTOR.test(r.by) && str(r.words) && ONE_LINE.test(r.words) && typeof r.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(r.date) &&
+    r.pending === 'none' && str(r.by) && ONE_LINE.test(r.by) && !isGstackActor(r.by) && str(r.words) && ONE_LINE.test(r.words) && typeof r.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(r.date) &&
     typeof r.recorded_at === 'string' && ISO_TIME.test(r.recorded_at) && r.branch === branch && typeof r.ask === 'string' && typeof r.scope === 'string' &&
     r.id === 'a-' + createHash('sha256').update([r.source, r.date, r.ask, r.words, r.by].join('\u0000')).digest('hex').slice(0, 12) &&
     r.digest === gateDispositionDigest(r);
@@ -79,7 +81,7 @@ export function readGateDispositions(cwd: string, env: Env = process.env): GateD
  * full clone a row whose head commit is gone (a rewritten and collected branch, a reused name) is not applied: the pin's history
  * is all present, so a missing commit cannot be in it.
  */
-export function appliedGateDispositions(cwd: string, o: { branch?: string; pin: string; env?: Env }): { applied: GateDisposition[]; loc: StoreLocation } {
+export function appliedGateDispositions(cwd: string, o: { branch?: string; pin: string; env?: Env; noted?: readonly ApprovalRow[] }): { applied: GateDisposition[]; rows: ApprovalRow[]; loc: StoreLocation } {
   const loc = locate({ cwd, env: o.env ?? process.env, branch: o.branch });
   if ('code' in loc) throw new Error(loc.message);
   const git = (...args: string[]) => spawnSync('git', args, { cwd, encoding: 'utf8', timeout: 10_000 });
@@ -93,49 +95,32 @@ export function appliedGateDispositions(cwd: string, o: { branch?: string; pin: 
     if (r.status === 1 || git('cat-file', '-e', `${head}^{commit}`).status !== 0) return false;
     throw new Error(`git merge-base --is-ancestor ${head.slice(0, 12)} ${o.pin.slice(0, 12)} failed (${(r.stderr ?? r.error?.message ?? '').trim().slice(0, 120) || `exit ${r.status}`})`);
   };
-  return { applied: gateDispositions(readRecord(loc).rows, loc.branch).filter(d => contains(d.head)), loc };
+  const byId = new Map([...(o.noted ?? []), ...readRecord(loc).rows].map(r => [r.id, r]));
+  const rows = [...byId.values()].sort((a, b) => String(a.recorded_at).localeCompare(String(b.recorded_at)));
+  const applied = gateDispositions(rows, loc.branch).filter(d => contains(d.head));
+  return { applied, rows: applied.map(d => byId.get(d.approval)!), loc };
 }
 
 /**
  * The /ship runs open on `branch` in any worktree of this repository (found through the git common dir); a detached worktree's run
- * counts too. A marker counts while its run's lease is open (`gstack-lease open`, the test preflight uses), so a run parked before
- * finish stops counting once its 120-minute lease ends; a lease check that cannot run counts the marker as open.
+ * counts too. Each worktree's run record decides (lib/ship-run-record.ts): an open, stopped, legacy or unreadable record counts,
+ * a finished or abandoned one does not, and no timer ends a run. `detail` is the record's state, beat_age and abandon command.
  */
-export function openShipRunsOn(cwd: string, branch: string): string[] {
+export function openShipRunsOn(cwd: string, branch: string): Array<{ text: string; detail: string }> {
   const list = spawnSync('git', ['worktree', 'list', '--porcelain'], { cwd, encoding: 'utf8', timeout: 10_000 });
-  if (list.status !== 0) return [`unknown (git worktree list failed: ${(list.stderr ?? '').trim().slice(0, 120)})`];
+  if (list.status !== 0) return [{ text: `unknown (git worktree list failed: ${(list.stderr ?? '').trim().slice(0, 120)})`, detail: '' }];
   const here = spawnSync('git', ['rev-parse', '--show-toplevel'], { cwd, encoding: 'utf8', timeout: 10_000 }).stdout?.trim() ?? '';
   const real = (p: string) => { try { return fs.realpathSync(p); } catch { return p; } };
-  const open: string[] = [];
+  const open: Array<{ text: string; detail: string }> = [];
   for (const block of list.stdout.split(/\n\n+/).filter(b => b.trim())) {
     const dir = /^worktree (.+)$/m.exec(block)?.[1];
     const on = /^branch refs\/heads\/(.+)$/m.exec(block)?.[1];
     if (!dir || /^bare$/m.test(block) || (on !== undefined && on !== branch)) continue;
-    const marker = spawnSync('git', ['rev-parse', '--git-path', 'gstack-ship-run'], { cwd: dir, encoding: 'utf8', timeout: 10_000 });
-    if (marker.status !== 0 || !marker.stdout.trim()) continue;
-    let run = '';
-    try { run = fs.readFileSync(path.resolve(dir, marker.stdout.trim()), 'utf8').trim(); } catch { continue; }
-    if (!run || runScriptSync(path.join(BIN_DIR, 'gstack-lease'), ['open', '--root', dir, '--run', run], { cwd: dir, encoding: 'utf8', timeout: 60_000 }).status === 1) continue;
-    open.push(real(dir) === real(here) ? `${run} is open on this checkout` : `${run} is open in the worktree ${dir}`);
+    const run = openRun(readRunRecord(dir));
+    if (!run) continue;
+    open.push({ text: real(dir) === real(here) ? `${run.run} is open on this checkout` : `${run.run} is open in the worktree ${dir}`, detail: `${run.run}: ${run.detail}` });
   }
   return open;
-}
-
-/** Run `fn` holding the repository's gate-disposition lock (a directory in the git common dir; one older than a minute is stale). */
-export function withGateLock<T>(cwd: string, fn: () => T, waitMs = 15_000): T | RecordError {
-  const common = spawnSync('git', ['rev-parse', '--git-common-dir'], { cwd, encoding: 'utf8', timeout: 10_000 });
-  if (common.status !== 0 || !common.stdout.trim()) return { code: 'APPROVAL_RECORD_WRITE_FAILED', message: `no git common dir at ${cwd}, so the gate-disposition lock cannot be taken` };
-  const lock = path.join(path.resolve(cwd, common.stdout.trim()), 'gstack-gate-disposition.lock');
-  const until = Date.now() + waitMs;
-  for (;;) {
-    try { fs.mkdirSync(lock); break; } catch (e: any) {
-      if (e.code !== 'EEXIST') return { code: 'APPROVAL_RECORD_WRITE_FAILED', message: `${lock}: ${e.code ?? e.message}` };
-      try { if (Date.now() - fs.statSync(lock).mtimeMs > 60_000) { fs.rmSync(lock, { recursive: true, force: true }); continue; } } catch { continue; }
-      if (Date.now() > until) return { code: 'APPROVAL_RECORD_WRITE_FAILED', message: `${lock} is held; another gate disposition or /ship preflight is writing (rerun in a moment)` };
-      Bun.sleepSync(100);
-    }
-  }
-  try { return fn(); } finally { fs.rmSync(lock, { recursive: true, force: true }); }
 }
 
 /** Append one disposition row under the lock, refused while any /ship run is open on its branch in any worktree (the check and the append are one step). */
@@ -144,7 +129,7 @@ export function recordGateDisposition(cwd: string, loc: StoreLocation, row: Appr
   if (!gateDispositions([signed], loc.branch).length) return { code: 'APPROVAL_RECORD_INVALID', message: 'the row would not count as a gate disposition (gstack-approvals dispositions would not list it: a 40-hex --head and one-line fields are required), so it would close nothing; nothing was written' };
   const held = withGateLock(cwd, () => {
     const open = openShipRunsOn(cwd, loc.branch);
-    if (open.length) return { code: 'APPROVAL_RECORD_INVALID' as const, message: `/ship run ${open.join('; /ship run ')} (branch ${loc.branch}): a gate disposition is the owner's, never the lane's own runner's; record it from the owner's session once no /ship run is open on the branch` };
+    if (open.length) return { code: 'APPROVAL_RECORD_INVALID' as const, message: `/ship run ${open.map(o => o.text).join('; /ship run ')} (branch ${loc.branch}): a gate disposition is the owner's, never the lane's own runner's; record it from the owner's session once no /ship run is open on the branch (${open.map(o => o.detail).filter(Boolean).join('; ')})` };
     return appendRows(loc, [signed]);
   });
   return held;
@@ -157,18 +142,19 @@ export type GateAcceptanceCode = Extract<ResultCodeName, 'QUEUE_GATE_DISPOSITION
  * receipt's gate_dispositions or the PR body's `Gate disposition:` lines differ from them, and, with `accepted` (land and
  * verify; ready passes none), when an applied disposition is not accepted or an accepted id is not applied.
  */
-export function gateAcceptance(o: { cwd: string; branch: string; pin: string; body: string; receipt?: ShipReceipt; accepted?: readonly string[]; env?: Env }):
-  { lines: string[]; applied: GateDisposition[]; failure?: { code: GateAcceptanceCode; message: string; fix: string } } {
+export function gateAcceptance(o: { cwd: string; branch: string; pin: string; body: string; receipt?: ShipReceipt; accepted?: readonly string[]; env?: Env; noted?: readonly ApprovalRow[] }):
+  { lines: string[]; applied: GateDisposition[]; noteRows?: ApprovalRow[]; failure?: { code: GateAcceptanceCode; message: string; fix: string } } {
   const fix = 'the lander reads each GATE_DISPOSITION line and reruns with --accept-gate-disposition <approval id> for each one it accepts; a receipt or body that differs from the store is rewritten by /ship at the pin (docs/troubleshooting.md#queue-gate-disposition)';
   let got: ReturnType<typeof appliedGateDispositions>;
   try { got = appliedGateDispositions(o.cwd, o); }
   catch (e: any) { return { lines: [], applied: [], failure: { code: 'QUEUE_GATE_DISPOSITION', message: `the gate dispositions for ${o.branch} at the pin cannot be derived (${e.message}); an unreadable store or a git error refuses, never reads as none`, fix } }; }
   const { applied, loc } = got;
+  const noteRows = got.rows.filter(r => !isSecurityFinding(SCOPE.exec(r.scope)![1]!));
   const recorded = o.receipt?.gate_dispositions;
   const listed = recorded ?? [];
-  const where = `the store at ${loc.mirror ?? loc.file}`;
+  const where = `the store at ${loc.mirror ?? loc.file}${o.noted?.length ? ' with the READY note\'s rows' : ''}`;
   const lines = applied.map(d => `GATE_DISPOSITION: ${gateDispositionText(d)}`);
-  if (!applied.length && !listed.length && !o.accepted?.length) return { lines, applied };
+  if (!applied.length && !listed.length && !o.accepted?.length) return { lines, applied, noteRows };
   const problems: string[] = [];
   for (const d of applied) {
     const r = listed.find(l => l.approval === d.approval);
@@ -181,12 +167,15 @@ export function gateAcceptance(o: { cwd: string; branch: string; pin: string; bo
     for (const d of applied) if (!o.accepted.includes(d.approval)) problems.push(`disposition ${d.approval} is not accepted (--accept-gate-disposition ${d.approval})`);
     for (const id of o.accepted) if (!applied.some(d => d.approval === id)) problems.push(`--accept-gate-disposition ${id} names no disposition the store applies at ${o.pin.slice(0, 12)}`);
   }
-  lines.push(`GATE_DISPOSITIONS: applied=${applied.map(d => d.approval).join(',') || 'none'}${o.accepted ? ` accepted=${o.accepted.join(',') || 'none'}` : ''} store=${loc.mirror ?? loc.file}`);
-  return problems.length ? { lines, applied, failure: { code: 'QUEUE_GATE_DISPOSITION', message: problems.join('; '), fix } } : { lines, applied };
+  lines.push(`GATE_DISPOSITIONS: applied=${applied.map(d => d.approval).join(',') || 'none'}${o.accepted ? ` accepted=${o.accepted.join(',') || 'none'}` : ''} store=${loc.mirror ?? loc.file}${o.noted?.length ? ` ready_note_rows=${o.noted.length}` : ''}`);
+  return problems.length ? { lines, applied, noteRows, failure: { code: 'QUEUE_GATE_DISPOSITION', message: problems.join('; '), fix } } : { lines, applied, noteRows };
 }
 
-/** The one-line form finish prints after `GATE_DISPOSITION: ` and the PR body carries after `Gate disposition: `. */
-export const gateDispositionText = (d: GateDisposition) => `${d.finding} [gate ${d.gate_id}] at ${d.head.slice(0, 12)} by ${d.by} at ${d.at}: ${d.reason} — "${d.words}" (approval ${d.approval})`;
+/** The disposition as public text may carry it: a security-class finding's fingerprint, reason and owner words stay in the approval record (GST-3076). */
+export const publicGateDisposition = (d: GateDisposition): GateDisposition => isSecurityFinding(d.finding) ? { ...d, finding: REDACTED_FINDING, reason: REDACTED_REASON, words: REDACTED_WORDS } : d;
+
+/** The one-line form finish prints after `GATE_DISPOSITION: ` and the PR body carries after `Gate disposition: `, from publicGateDisposition. */
+export const gateDispositionText = (disposition: GateDisposition) => { const d = publicGateDisposition(disposition); return `${d.finding} [gate ${d.gate_id}] at ${d.head.slice(0, 12)} by ${d.by} at ${d.at}: ${d.reason} — "${d.words}" (approval ${d.approval})`; };
 
 /**
  * The dispositions that close a review row's gate findings: the same fingerprint and gate_id on a gate finding the logger left
@@ -199,12 +188,29 @@ export function dispositionedOn(cwd: string, row: Record<string, any>, dispositi
     .filter((f: any) => !!f && typeof f.gate === 'string' && f.gate && typeof f.fingerprint === 'string' && validGateId(f.gate_id) && (f.action === 'open' || (f.action === 'kept' && f.actor !== 'interactive')))
     .map((f: any) => gateKey(f.fingerprint, f.gate_id)));
   const mine = dispositions.filter(d => open.has(gateKey(d.finding, d.gate_id)));
-  if (!mine.length) return [];
+  const holds = mine.length ? rowRange(cwd, row) : null;
+  return holds ? mine.filter(d => holds(d.head)) : [];
+}
+
+/**
+ * The owner's rulings that apply to a review row, as gstack-review-read reads it for Step 11.5 (harness-evals#498, HARN-1): a
+ * ruling for a finding the row carries that is not a gate finding (a ruling never closes one), recorded at a head inside the
+ * row's range by the same test dispositions use.
+ */
+export function ruledOn(cwd: string, row: Record<string, any>, notes: readonly RuledNote[]): RuledNote[] {
+  const fingerprints = new Set((Array.isArray(row?.findings) ? row.findings : []).flatMap((f: any) => f && !f.gate && typeof f.fingerprint === 'string' ? [f.fingerprint] : []));
+  const mine = notes.filter(n => fingerprints.has(n.finding));
+  const holds = mine.length ? rowRange(cwd, row) : null;
+  return holds ? mine.filter(n => holds(n.head)) : [];
+}
+
+/** Whether an owner's answer at `head` lies inside a review row's `range_base..commit_full` (both ends), or is the row's own commit when it has no range_base; null when those commits do not resolve. */
+function rowRange(cwd: string, row: Record<string, any>): ((head: string) => boolean) | null {
   const commitOf = (c: unknown) => typeof c === 'string' && /^[0-9a-f]{7,40}$/.test(c) ? spawnSync('git', ['rev-parse', '--verify', '--quiet', `${c}^{commit}`], { cwd, encoding: 'utf8', timeout: 10_000 }).stdout?.trim() ?? '' : '';
   const ancestor = (a: string, d: string) => spawnSync('git', ['merge-base', '--is-ancestor', a, d], { cwd, timeout: 10_000 }).status === 0;
   const to = commitOf(row.commit_full), from = row.range_base == null ? '' : commitOf(row.range_base);
-  if (!to || (row.range_base != null && !from)) return [];
-  return mine.filter(d => from ? ancestor(from, d.head) && ancestor(d.head, to) : d.head === to);
+  if (!to || (row.range_base != null && !from)) return null;
+  return head => from ? ancestor(from, head) && ancestor(head, to) : head === to;
 }
 
 /**

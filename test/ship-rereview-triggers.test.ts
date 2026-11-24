@@ -178,7 +178,7 @@ describe('finish route after a base merge (GST-407 #1, GBRA-108 #7739)', () => {
     expect(comparePath(f.work, sides(), 'assets/x.bin')).toBe('changed');
     f.write({ 'assets/x.bin': 'a\u0000b\n', 'src/auth.ts': 'export const authRequired = false;\nexport const a = 2;\n' }); f.commit('flip');
     const r = finish(f, reviewed, post, ['--reviewed-base', reviewedBase]);
-    expect([r.status, lineOf(r.stdout, 'STOP')]).toEqual([3, 'STOP: behavior, tests or build inputs changed since review (src/auth.ts): insert 5–11.5 → 12–14 → 16 before Step 17; plan that Step 9 with gstack-review-plan --post-review, which at the round cap stops for the owner\'s grant of one scoped fix-check (stage 2.1)']);
+    expect([r.status, lineOf(r.stdout, 'STOP')]).toEqual([3, 'STOP: behavior, tests or build inputs changed since review (src/auth.ts): insert 5–11.5 → 12–14 → 16 before Step 17; plan that Step 9 with gstack-review-plan --post-review, which at the round cap plans one read-only full review of the final head (stage 2.1)']);
   });
 });
 
@@ -197,7 +197,7 @@ describe('a version stamp after review (GBRA-251, gbrain #8095)', () => {
       const post = snapshot(f);
       f.write({ VERSION: '1.0.1.0\n', 'plugin.json': pluginAfter, 'docs/guide.md': guide('1.0.1.0') }); f.commit('stamp');
       const r = finish(f, reviewed, post, ['--reviewed-base', mergeBase(f)]);
-      if (stops) expect([name, r.status, lineOf(r.stdout, 'STOP')]).toEqual([name, 3, 'STOP: behavior, tests or build inputs changed since review (plugin.json): insert 5–11.5 → 12–14 → 16 before Step 17; plan that Step 9 with gstack-review-plan --post-review, which at the round cap stops for the owner\'s grant of one scoped fix-check (stage 2.1)']);
+      if (stops) expect([name, r.status, lineOf(r.stdout, 'STOP')]).toEqual([name, 3, 'STOP: behavior, tests or build inputs changed since review (plugin.json): insert 5–11.5 → 12–14 → 16 before Step 17; plan that Step 9 with gstack-review-plan --post-review, which at the round cap plans one read-only full review of the final head (stage 2.1)']);
       else expect([name, lineOf(r.stdout, 'ROUTE')]).toEqual([name, expect.stringMatching(/ behavior=0 docs=0 metadata=3 tests=0 /)]);
     }
   });
@@ -220,7 +220,7 @@ describe('a restamp after a lost slot (GST-895, GBRA-218, gbrain #8134)', () => 
     mergeMain(f, { VERSION: '1.0.2.0\n', 'src/notice.ts': notice(['0.9.0.0', 'old'], ['1.0.1.0', 'theirs'], [ownRow, 'mine']) });
     return { f, reviewed: wtree(f), reviewedBase: mergeBase(f), post: snapshot(f) };
   };
-  const behaviorStop = 'STOP: behavior, tests or build inputs changed since review (src/notice.ts): insert 5–11.5 → 12–14 → 16 before Step 17; plan that Step 9 with gstack-review-plan --post-review, which at the round cap stops for the owner\'s grant of one scoped fix-check (stage 2.1)';
+  const behaviorStop = 'STOP: behavior, tests or build inputs changed since review (src/notice.ts): insert 5–11.5 → 12–14 → 16 before Step 17; plan that Step 9 with gstack-review-plan --post-review, which at the round cap plans one read-only full review of the final head (stage 2.1)';
 
   test('the moved stale stamp is metadata; a moved base row or pre-fork row stops', () => {
     const own = lostSlot('1.0.1.0');
@@ -472,7 +472,7 @@ describe('test-only and audit-requested edits after the docs audit (GST-391, gbr
     const plong = snapshot(long);
     long.write({ 'test/b.test.ts': spec('b') + Array.from({ length: 250 }, (_, i) => `test('case ${i}', () => expect(${i}).toBe(${i}));\n`).join('') }); long.commit('test: 250 cases');
     const tooLong = finish(long, rlong, plong, ['--reviewed-base', mergeBase(long)]);
-    expect([tooLong.status, lineOf(tooLong.stdout, 'STOP')]).toEqual([3, 'STOP: behavior, tests or build inputs changed since review (test/b.test.ts): insert 5–11.5 → 12–14 → 16 before Step 17; plan that Step 9 with gstack-review-plan --post-review, which at the round cap stops for the owner\'s grant of one scoped fix-check (stage 2.1)']);
+    expect([tooLong.status, lineOf(tooLong.stdout, 'STOP')]).toEqual([3, 'STOP: behavior, tests or build inputs changed since review (test/b.test.ts): insert 5–11.5 → 12–14 → 16 before Step 17; plan that Step 9 with gstack-review-plan --post-review, which at the round cap plans one read-only full review of the final head (stage 2.1)']);
     expect(tooLong.stdout).toContain('too large for the scoped review (over 200 lines in a section): test/b.test.ts');
 
     for (const [rel, route] of [['src/main/java/ABTest.java', 'behavior=1 docs=0 metadata=0 tests=0'], ['app/test_mode.py', 'behavior=1 docs=0 metadata=0 tests=0'], ['tests/test_mode.py', 'behavior=0 docs=0 metadata=0 tests=1']] as const) {
@@ -552,6 +552,28 @@ describe('test-only and audit-requested edits after the docs audit (GST-391, gbr
     f.write({ 'docs/guide.md': '# guide\n', 'docs/KEY_FILES.md': index.replace(/entry/g, 'item') + '- src/b.ts\n' }); f.commit('docs: big');
     const big = finish(f, reviewed, post, [...base, '--docs-requested', 'docs/KEY_FILES.md', '--docs-result', result]);
     expect(big.stdout).toContain('STOP: --docs-requested docs/KEY_FILES.md');
+  });
+
+  // Value: protects=an audit that names the requested doc as path:line or path:line:column (FOUN-32 via Vorflux at 2af3822f)
+  //   still backs the fix, while a different file sharing the path's prefix never does; fails_when=a correct requested fix stops
+  //   on how the audit wrote the location, or a sibling file's note waves the fix through; seam=finish --docs-requested;
+  //   no_claim=the audit child's wording
+  test.each([
+    ['path:line', 'docs/KEY_FILES.md:8: the src/b.ts entry is missing', true],
+    ['path:line:column', 'docs/KEY_FILES.md:8:12 the src/b.ts entry is missing', true],
+    ['path then "line"', 'docs/KEY_FILES.md: line 8 is missing the src/b.ts entry', true],
+    ['another file sharing the prefix', 'docs/KEY_FILES.md.tmpl:8: the src/b.ts entry is missing', false],
+  ])('--docs-requested matches the audit naming the doc as %s: %p', (_name, decision, named) => {
+    const index = Array.from({ length: 30 }, (_, i) => `- entry ${i}`).join('\n') + '\n';
+    const f = fx({ 'docs/KEY_FILES.md': index });
+    const reviewed = wtree(f);
+    const post = snapshot(f, ['docs']);
+    const result = path.join(f.root, 'a1-result.json');
+    fs.writeFileSync(result, JSON.stringify({ schema_version: 1, audit_id: 'a1', status: 'current', files_updated: [], files_reviewed: ['docs/KEY_FILES.md'], blockers: [], decisions: [decision], documentation_section: 'x' }));
+    f.write({ 'docs/KEY_FILES.md': index + '- src/b.ts: the b constant\n' }); f.commit('docs: index link');
+    const r = finish(f, reviewed, post, ['--reviewed-base', mergeBase(f), '--docs-rechecked', '--docs-requested', 'docs/KEY_FILES.md', '--docs-result', result]);
+    if (named) expect([r.status, lineOf(r.stdout, 'DOCS')]).toEqual([0, expect.stringContaining('requested=1')]);
+    else expect(r.stdout).toContain("STOP: --docs-requested docs/KEY_FILES.md is not named in the audit result's blockers or decisions");
   });
 
   // Value: protects=an audit launch the child's install check refused is not counted, once per invocation; a crashed child,

@@ -6,11 +6,11 @@
  *      `bun test <dirs>` glob — the runner owns TEST_ROOTS and strict-output
  *      classification, so a truncated run can't report green.
  *   2. It is SECRETLESS where code runs: free tests make no API calls, and
- *      keeping keys out means fork PRs get real signal here. The two allowed
- *      `secrets.` references are TRUNK_API_TOKEN in the learning-only
- *      trunk-dynamic-ci observer and TRUNK_ORG_API_TOKEN in the detection-only
- *      trunk-flaky-tests uploader. Neither checks out or runs anything of the
- *      PR's and no job depends on either; any other reference is a regression.
+ *      keeping keys out means fork PRs get real signal here. The one allowed
+ *      `secrets.` reference is TRUNK_API_TOKEN in the learning-only
+ *      trunk-dynamic-ci observer, which checks out and runs nothing of the
+ *      PR's and no job depends on; any other reference is a regression. The
+ *      detection-only Trunk uploader runs after the run, in trunk-flaky-tests.yml.
  *   3. It triggers on `pull_request` (never `pull_request_target`, which
  *      would hand a fork PR the base repo's context).
  *
@@ -39,9 +39,8 @@ describe('free-tests workflow wiring', () => {
 
   test('secretless: no secrets reach the free lane', () => {
     const jobs = (Bun.YAML.parse(source) as any).jobs;
-    expect(source.match(/secrets\s*(?:\.|\[)\s*['"]?[A-Za-z0-9_-]*|toJSON\(\s*secrets\b/gi)).toEqual(['secrets.TRUNK_API_TOKEN', 'secrets.TRUNK_ORG_API_TOKEN']);
+    expect(source.match(/secrets\s*(?:\.|\[)\s*['"]?[A-Za-z0-9_-]*|toJSON\(\s*secrets\b/gi)).toEqual(['secrets.TRUNK_API_TOKEN']);
     expect(jobs['trunk-dynamic-ci'].env).toEqual({ TRUNK_API_TOKEN: '${{ secrets.TRUNK_API_TOKEN }}' });
-    expect(jobs['trunk-flaky-tests'].env).toEqual({ TRUNK_ORG_API_TOKEN: '${{ secrets.TRUNK_ORG_API_TOKEN }}' });
     expect(source).not.toContain('ANTHROPIC_API_KEY');
     expect(source).not.toContain('OPENAI_API_KEY');
   });
@@ -68,13 +67,12 @@ describe('free-tests workflow wiring', () => {
     for (const key of step.with['job-keys'].split(',')) expect(jobs[key], key).toBeDefined();
     for (const name of Object.keys(jobs).filter(n => n !== 'trunk-dynamic-ci')) {
       expect([name, [jobs[name].needs ?? []].flat()]).not.toEqual([name, expect.arrayContaining(['trunk-dynamic-ci'])]);
-      if (name === 'trunk-flaky-tests') continue;
       expect([name, JSON.stringify(jobs[name])]).not.toEqual([name, expect.stringMatching(/trunk|dynamic-ci/i)]);
     }
   });
 
   // Value: protects=GST-1859's detection-only contract: Trunk Flaky Tests receives every free-suite shard's JUnit, failures included, and can never quarantine, skip, gate or fail anything, while the token never shares a job with pull-request code; fails_when=the suite stops writing or uploading JUnit, the uploader job checks out or runs code, gains token scopes, is needed or read by any job, loses fail-open or its token skip, turns quarantine on, runs on forks, or either action is unpinned; seam=.github/workflows/free-tests.yml; no_claim=what Trunk flags
-  test('trunk-flaky-tests is a detection-only uploader: pinned, scope-less, fail-open, quarantine off, read by no job', () => {
+  test('trunk-flaky-tests.yml is a detection-only uploader after the run: pinned, read-only token, fail-open, quarantine off, never on forks', () => {
     const jobs = (Bun.YAML.parse(source) as any).jobs;
     const suite = jobs['free-suite'];
     expect(suite.steps.find((step: any) => step.name === 'Run free suite').run).toContain('--junit-dir "$RUNNER_TEMP/free-junit"');
@@ -82,43 +80,73 @@ describe('free-tests workflow wiring', () => {
     expect(keep.if).toBe('always()');
     expect(keep.uses).toMatch(/^actions\/upload-artifact@[0-9a-f]{40}$/);
     expect(keep.with).toEqual({ name: 'free-junit-${{ matrix.shard }}', path: '${{ runner.temp }}/free-junit/*.xml', 'if-no-files-found': 'ignore', 'retention-days': 7 });
-    const flaky = jobs['trunk-flaky-tests'];
-    expect(flaky.needs).toBe('free-suite');
-    expect(flaky.if).toBe("always() && needs.free-suite.result != 'skipped' && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))");
+    const quick = jobs['quick-bun-default'].steps as any[];
+    const quickRun = quick.findIndex(step => step.name === 'Run the quick free tier on the install-default Bun');
+    expect(quick[quickRun].env).toEqual({ GSTACK_FREE_RETRY_FLAKY: '1', GSTACK_FLAKE_LEDGER: '${{ runner.temp }}/flake-ledger.jsonl' });
+    expect(quick[quickRun].run).toBe('xvfb-run -a bun run test:quick --junit-dir "$RUNNER_TEMP/quick-junit"');
+    const quickLedger = quick.find(step => step.with?.name === 'flake-ledger-quick');
+    expect(quick.indexOf(quickLedger)).toBeGreaterThan(quickRun);
+    expect(quickLedger.if).toBe('always()');
+    expect(quickLedger.uses).toMatch(/^actions\/upload-artifact@[0-9a-f]{40}$/);
+    expect(quickLedger.with).toEqual({ name: 'flake-ledger-quick', path: '${{ runner.temp }}/flake-ledger.jsonl', 'if-no-files-found': 'ignore', 'retention-days': 90 });
+    const quickJunit = quick.find(step => step.with?.name === 'quick-junit');
+    expect(quick.indexOf(quickJunit)).toBeGreaterThan(quickRun);
+    expect(quickJunit.if).toBe('always()');
+    expect(quickJunit.uses).toMatch(/^actions\/upload-artifact@[0-9a-f]{40}$/);
+    expect(quickJunit.with).toEqual({ name: 'quick-junit', path: '${{ runner.temp }}/quick-junit/*.xml', 'if-no-files-found': 'ignore', 'retention-days': 7 });
+    for (const name of Object.keys(jobs)) expect([name, /TRUNK_ORG_API_TOKEN|analytics-uploader|download-artifact[^"]*"[^}]*free-junit-\*/.test(JSON.stringify(jobs[name]))]).toEqual([name, false]);
+
+    const upSource = fs.readFileSync(path.resolve(import.meta.dir, '..', '.github', 'workflows', 'trunk-flaky-tests.yml'), 'utf-8');
+    const up = Bun.YAML.parse(upSource) as any;
+    expect(up.on).toEqual({ workflow_run: { workflows: ['Free Tests'], types: ['completed'] } });
+    expect(up.permissions).toEqual({});
+    expect(Object.keys(up.jobs)).toEqual(['trunk-flaky-tests']);
+    expect(upSource.match(/secrets\s*(?:\.|\[)\s*['"]?[A-Za-z0-9_-]*|toJSON\(\s*secrets\b/gi)).toEqual(['secrets.TRUNK_ORG_API_TOKEN']);
+    expect(upSource).not.toContain('pull_request_target');
+    const flaky = up.jobs['trunk-flaky-tests'];
+    expect(flaky.if).toBe("github.event.workflow_run.conclusion != 'skipped' && ((github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main') || github.event.workflow_run.event == 'workflow_dispatch' || (github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.head_repository.full_name == github.repository))");
     expect(flaky['runs-on']).toBe('ubuntu-24.04');
-    expect(flaky.permissions).toEqual({});
+    expect(flaky.permissions).toEqual({ actions: 'read' });
+    expect(flaky.env).toEqual({ TRUNK_ORG_API_TOKEN: '${{ secrets.TRUNK_ORG_API_TOKEN }}' });
     expect(flaky['continue-on-error']).toBe(true);
     expect(flaky['timeout-minutes']).toBe(10);
     expect(flaky.outputs).toBeUndefined();
-    expect(flaky.steps).toHaveLength(2);
-    const [download, upload] = flaky.steps;
+    expect(flaky.needs).toBeUndefined();
+    expect(flaky.steps).toHaveLength(4);
+    const [downloadShards, downloadQuick, uploadShards, uploadQuick] = flaky.steps;
     for (const step of flaky.steps) {
       expect(step.run).toBeUndefined();
-      expect(step.if).toBe("env.TRUNK_ORG_API_TOKEN != ''");
+      expect(step.uses.startsWith('actions/checkout@')).toBe(false);
       expect(step['continue-on-error']).toBe(true);
     }
-    expect(download.uses).toMatch(/^actions\/download-artifact@[0-9a-f]{40}$/);
-    expect(download.with).toEqual({ pattern: 'free-junit-*', path: '${{ runner.temp }}/free-junit' });
-    expect(upload.uses).toBe('trunk-io/analytics-uploader@a86313c7029d22e6ea2d5c346060a224d90053dc');
-    expect(upload['timeout-minutes']).toBe(5);
-    expect(upload.with).toEqual({
-      'junit-paths': '${{ runner.temp }}/free-junit/**/*.xml',
+    const fromRun = { 'run-id': '${{ github.event.workflow_run.id }}', 'github-token': '${{ github.token }}' };
+    for (const download of [downloadShards, downloadQuick]) {
+      expect(download.if).toBe("env.TRUNK_ORG_API_TOKEN != ''");
+      expect(download.uses).toMatch(/^actions\/download-artifact@[0-9a-f]{40}$/);
+    }
+    expect(downloadShards.with).toEqual({ pattern: 'free-junit-*', path: '${{ github.workspace }}/free-junit', ...fromRun });
+    expect(downloadQuick.with).toEqual({ name: 'quick-junit', path: '${{ github.workspace }}/quick-junit', ...fromRun });
+    const uploaded = (dir: string) => ({
+      'junit-paths': `\${{ github.workspace }}/${dir}/**/*.xml`,
       'org-slug': 'garry-tan',
       token: '${{ env.TRUNK_ORG_API_TOKEN }}',
       'test-collection-id': '7yDVXXE3',
-      'cli-version': '0.16.2',
+      'cli-version': '0.17.0',
       'use-cache': 'false',
       quarantine: 'false',
       'use-uncloned-repo': 'true',
       'github-token': '',
       'gh-repo-url': '${{ github.server_url }}/${{ github.repository }}',
-      'gh-repo-head-sha': '${{ github.event.pull_request.head.sha || github.sha }}',
-      'gh-repo-head-branch': '${{ github.event.pull_request.head.ref || github.ref_name }}',
+      'gh-repo-head-sha': '${{ github.event.workflow_run.head_sha }}',
+      'gh-repo-head-branch': '${{ github.event.workflow_run.head_branch }}',
     });
-    for (const name of Object.keys(jobs).filter(n => n !== 'trunk-flaky-tests')) {
-      expect([name, [jobs[name].needs ?? []].flat().includes('trunk-flaky-tests')]).toEqual([name, false]);
-      expect([name, /TRUNK_ORG_API_TOKEN|analytics-uploader|free-junit-\*/.test(JSON.stringify(jobs[name]))]).toEqual([name, false]);
+    for (const [upload, dir] of [[uploadShards, 'free-junit'], [uploadQuick, 'quick-junit']] as const) {
+      expect(upload.if).toBe(`env.TRUNK_ORG_API_TOKEN != '' && hashFiles('${dir}/**/*.xml') != ''`);
+      expect(upload.uses).toBe('trunk-io/analytics-uploader@9886de74a788c450c793109577a4d97bfb3e799f');
+      expect(upload['timeout-minutes']).toBe(5);
     }
+    expect(uploadShards.with).toEqual(uploaded('free-junit'));
+    expect(uploadQuick.with).toEqual({ ...uploaded('quick-junit'), variant: 'bun-default' });
   });
 
   test('pull_request trigger, never pull_request_target', () => {
@@ -132,7 +160,7 @@ describe('free-tests workflow wiring', () => {
     const suite = workflow.jobs['free-suite'];
     const aggregate = workflow.jobs['free-tests'];
     expect(planner.steps.find((step: any) => step.id === 'plan').run).toContain('--ci-plan');
-    expect(suite.needs).toEqual(['free-plan', 'reuse']);
+    expect(suite.needs).toEqual(['free-plan', 'reuse', 'docs-scope']);
     expect(suite.strategy.matrix).toBe('${{ fromJSON(needs.free-plan.outputs.matrix) }}');
     expect(suite.strategy['fail-fast']).toBe(false);
     expect(suite.strategy['max-parallel']).toBe(20);
@@ -234,11 +262,48 @@ describe('free-tests workflow wiring', () => {
       expect(retry, name).toBe(install + 1);
       for (const step of [steps[install], steps[retry]]) {
         expect(step['timeout-minutes'], name).toBe(5);
-        expect(step.run, name).toBe('npx playwright install --with-deps chromium');
+        expect(step.run.trim(), name).toBe('if [ "$SYSTEM_PACKAGES" = success ]; then npx playwright install chromium; else npx playwright install --with-deps chromium; fi');
+        expect(step.env, name).toEqual({ SYSTEM_PACKAGES: '${{ steps.apt_offline.outcome }}' });
       }
       expect(steps[install]['continue-on-error'], name).toBe(true);
-      const failOpen = name === 'free-suite' ? [steps[install], steps.find((step: any) => step.name === 'Upload shard JUnit reports')] : [steps[install]];
+      const offline = steps.find((step: any) => step.id === 'apt_offline');
+      const failOpen = [offline, steps[install], steps.find((step: any) => step.name === (name === 'free-suite' ? 'Upload shard JUnit reports' : "Upload the quick tier's JUnit reports"))];
       expect(steps.filter((step: any) => step['continue-on-error']), name).toEqual(failOpen);
+    }
+  });
+
+  test('system packages are cached per runner image and Playwright version, and apt waits for a killed attempt\'s lock (2026-11-19, run 44485949701)', () => {
+    const jobs = (Bun.YAML.parse(source) as any).jobs;
+    for (const name of ['free-suite', 'quick-bun-default']) {
+      const steps = jobs[name].steps;
+      const at = (pred: (step: any) => boolean) => steps.findIndex(pred);
+      const config = at((step: any) => step.run?.includes('/etc/apt/apt.conf.d/90gstack-ci'));
+      const base = at((step: any) => step.id === 'apt_base');
+      const restore = at((step: any) => step.id === 'apt_cache');
+      const offline = at((step: any) => step.id === 'apt_offline');
+      const install = at((step: any) => step.id === 'playwright_install');
+      const xvfb = at((step: any) => step.name === 'Install Xvfb + X11 utilities + gate tools');
+      const keep = at((step: any) => step.id === 'apt_keep');
+      const save = keep + 1;
+      expect(steps[config].run, name).toContain('DPkg::Lock::Timeout "240";');
+      expect(steps[config].run, name).toContain('APT::Keep-Downloaded-Packages "true";');
+      expect(steps[base].run, name).toContain("dpkg-query -W -f='${binary:Package}=${Version}\\n' | sha256sum");
+      expect(steps[restore].uses, name).toStartWith('actions/cache/restore@');
+      expect(steps[base].env, name).toEqual({ PLAYWRIGHT_VERSION: '${{ steps.playwright.outputs.version }}' });
+      expect(steps[base].run, name).toContain('echo "cache_key=linux-apt-debs-$(');
+      expect(steps[base].run, name).toContain(')-playwright-$PLAYWRIGHT_VERSION" >> "$GITHUB_OUTPUT"');
+      expect(steps[restore].with, name).toEqual({ path: '~/.cache/gstack-apt-debs', key: '${{ steps.apt_base.outputs.cache_key }}' });
+      expect(steps[offline].if, name).toBe("steps.apt_cache.outputs.cache-hit == 'true'");
+      expect(steps[offline].run, name).toBe('sudo dpkg -i "$HOME"/.cache/gstack-apt-debs/*.deb');
+      expect(steps[keep].if, name).toBe("steps.apt_cache.outputs.cache-hit != 'true'");
+      expect(steps[keep].run, name).toContain('cp /var/cache/apt/archives/*.deb ~/.cache/gstack-apt-debs/');
+      expect(steps[save].uses, name).toStartWith('actions/cache/save@');
+      expect(steps[save].if, name).toBe("steps.apt_keep.outputs.save == 'true'");
+      expect(steps[save].with, name).toEqual({ path: '~/.cache/gstack-apt-debs', key: '${{ steps.apt_cache.outputs.cache-primary-key }}' });
+      expect([config, base, restore, offline, install], name).toEqual([config, base, restore, offline, install].sort((a, b) => a - b));
+      expect(config, name).toBeGreaterThan(-1);
+      expect(xvfb, name).toBeGreaterThan(install);
+      expect(keep, name).toBe(xvfb + 1);
     }
   });
 
@@ -256,7 +321,7 @@ describe('free-tests workflow wiring', () => {
     const workflow = Bun.YAML.parse(source) as any;
     const planner = workflow.jobs['free-plan'];
     const plan = planner.steps.find((step: any) => step.id === 'plan');
-    expect(workflow.env.FREE_SUITE_RUNNER).toMatch(/^ubicloud-standard-(2|4|8)$/);
+    expect(workflow.env.FREE_SUITE_RUNNER).toMatch(/^ubicloud-standard-(2|4|8|16)$/);
     expect(workflow.env.FREE_SUITE_SHARDS).toMatch(/^[1-9][0-9]?$/);
     expect(planner.outputs.runner).toBe('${{ steps.plan.outputs.runner }}');
     expect(workflow.jobs['free-suite']['runs-on']).toBe('${{ needs.free-plan.outputs.runner }}');

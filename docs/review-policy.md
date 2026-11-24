@@ -91,25 +91,30 @@ incomplete coverage, which blocks until the reviewer is rerun.
    classifies with `--range-base`. Only a blocking finding in that range or in
    the diff is `fix`; every below-floor finding is a `note`.
 3. **Two rounds is the cap** (R51): a full pass, a scoped pass
-   ([below](#scoped-pass)) or a fix-check is a round. After round 2 the run
+   ([below](#scoped-pass)) or a fix-check is a round of this table. The counters
+   (`review_loop.rounds`, `PR_REVIEW_HISTORY: rounds=`) count passes only: a
+   fix-check reads only a round's fixes, and R51 counts a re-check of only what
+   changed as no round, so it shows as `fix_checks=`. After round 2 the run
    finishes with its open notes listed in the PR body and receipt (an owner-ruled
    note is closed and listed: [ruled notes](ship-policy.md#ruled-notes)), or stops for
-   the owner when a blocking finding is open, or was fixed in round 2 and is
-   unverified, or a round-2 fix edited a gate-class path, naming it (path,
-   severity, problem). The cap limits fix rounds, not Step 11's voices: on gate
+   the owner when a blocking finding is open, naming it (path, severity,
+   problem); a round-2 fix, blocking, gate-class or below the floor, first gets
+   the read-only full review described below. The cap limits fix rounds, not Step 11's voices: on gate
    class a stop waits for Step 11's adversarial, outside and targeted voices
    (`NEXT: voices`), so gate code never reaches the owner's "ship with open
-   notes" without them (GST-967). A third round is the owner's
-   grant of one scoped fix-check (recorded in `review_loop_exception`), never the
-   loop's: once `gstack-approvals add` records the grant (its ask or scope
-   naming `review_loop_grant` and the stop head's sha),
-   `gstack-review-plan --grant <approval id> --range-base <round 2's PASS_HEAD>`
-   plans that fix-check in place of the stop after a round-2 full pass, or after
-   a round-2 fix-check that was the run's only one (`--fix-checks 1`, GEVA-223),
+   notes" without them (GST-967). A fix in round 2 gets one read-only full
+   review, never a fix-check (GST-3562 A). For one release, a grant recorded in
+   `review_loop_exception` (its ask or scope naming `review_loop_grant` and the
+   stop head's sha) still answers one row: `gstack-review-plan --grant <approval
+   id> --range-base <round 2's PASS_HEAD>` plans one more fix-check after a
+   round-2 fix-check that was the run's only one (`--fix-checks 1`, GEVA-223),
    with a fixed blocking finding or a gate-class edit, and refuses any other row,
    including a grant for a stop head before `--range-base` (an earlier /ship).
    A fix-check never earns another, so the grant cannot repeat, and a stop after
    the granted fix-check still goes to the owner. The cap approves nothing.
+   This cap counts rounds inside one run. Across heads and runs the PR's own
+   count applies ([rounds per pull request](#rounds-per-pull-request)), and an
+   extra round there is the lane's or Captain's grant, never an owner ask.
    Edits that /ship Step 16 later finds after the review bound are a new stop: a
    new grant at a stop head after the last fix-check's commit, passed as
    `gstack-review-plan --post-review --last fix-check --range-base <that commit>
@@ -128,6 +133,199 @@ incomplete coverage, which blocks until the reviewer is rerun.
    symlink or gitlink file in that range, or a commit the gate scan tags there
    (a `[skip ci]` message), still stops.
 
+<a id="rounds-per-pull-request"></a>
+### Rounds per pull request (R51, GST-2673)
+
+The two-round cap is per pull request, counted across every head, every `/ship`
+run and every reader. Each run used to start its own count, so a PR pushed five
+times could be reviewed ten times. The count now lives where every host can read
+it: the PR body, which already keeps each run's `review_loop` in the receipt and
+the `gstack-receipt-runs` block.
+
+The PR's last review before merge is a full review of its final head. A scoped
+re-check that reads only what changed since the last reviewed head is advice
+only: it never carries a receipt and is not one of the two rounds. In the replay
+behind this rule ([prereg](evals/pr-round-count-prereg.md)), a diff-only re-check
+caught 22 of 24 planted faults but none of 8 real faults that full rounds had
+caught on another crew's PRs.
+
+1. **Count.** `gstack-ship-receipt history --pr <n>` adds up the rounds the body
+   records (full and scoped passes; a fix-check is no round and shows as
+   `fix_checks=`; a run listed twice counts once) and prints `PR_REVIEW_HISTORY:`, the flag line `PR_REVIEW_FLAGS:
+   --prior-rounds <rounds> --prior-full <full rounds>` and `PR_REVIEW_ROUTE:`.
+   `/ship` Step 1 prints all three. A re-check that carried a receipt before
+   this rule adds no round. The count fails open when the history can't be
+   read (no `gh`, an unreadable body): Step 1 prints `PR_REVIEW_FLAGS:
+   --prior-rounds 0` and `PR_REVIEW_ROUTE: first (history unavailable: …)`, so
+   the plan counts this run's rounds only (`lib/ship-preflight.ts`). Every
+   run still reviews its head in full; what's lost is the cap on earlier
+   runs, so check the PR body by hand when that line shows. A `/ship` body
+   post keeps the live `gstack-receipt-runs` block (`lib/gstack-post.ts`), so
+   earlier runs and started stubs stay countable. Any runs block the posted
+   body brings in its own Agent notes is dropped first, so only the live
+   history is counted.
+2. **Runs that stop count too.** After each Step 9 pass, `gstack-ship-receipt
+   stub --pr <n> --run <id> --review-loop <summary>` writes a `status: started`
+   entry, so a run that stops before its receipt still counts. The run's receipt
+   write (same `--run`) replaces its stub; `--void` marks a stub that reviewed
+   nothing.
+3. **Route.** A head whose own added and removed lines match the reviewed head's
+   byte for byte (a base merge, tests, release metadata) keeps its receipt through
+   carry, as before. Any other new head runs `/ship` Steps 2-16, and
+   `PR_REVIEW_ROUTE:` names the review it gets: `first` on a PR with no full
+   round, `final` after one (a fresh full review of this head, the PR's last
+   before merge), and `read-only` after two. Carry may still print `RECHECK:
+   advisory … packet=<file>`: one reader may read that packet for advice, but
+   its verdict never rebinds the receipt, and `carry --recheck` is refused
+   ([scoped re-check](troubleshooting.md#receipt-carry-recheck)). A receipt an
+   older gstack carried through a re-check (its `carry.reason` names `scoped
+   re-check by`) carries no further, not even through a base merge or a stamp,
+   and `gstack-ship-queue` won't bind it (`QUEUE_RECEIPT_STALE`): the code that
+   hop covered never got a full review, so the head runs `/ship` until a fresh
+   full review replaces that receipt.
+4. **Stop rule.** `gstack-review-plan --prior-full <n>` adds the PR's earlier
+   full rounds to this run's full passes; fix-checks stay the in-run table's
+   call, and `--prior-rounds` is printed as `pr_rounds=`. The per-PR cap counts
+   full passes only, by design (`lib/review-depth.ts` `prCapped`): earlier runs'
+   scoped passes show in `pr_rounds=` but don't count against it, fix-checks
+   show in neither,
+   because each run's own fix round is the in-run table's call. A full pass past two
+   stops with `PR_ROUND_CAP` and says how to record the stop and its grant
+   (item 6); a fix at the cap gets one read-only full review of the final head
+   (GST-3562 A), and a fix after that review stops for the lane's Captain. The stop is the lane's or Captain's call, never an owner ask
+   ([troubleshooting](troubleshooting.md#pr-round-cap)).
+5. **Read-only final review.** A PR that already had two full rounds and whose
+   own code changed since still gets one full review of its final head. It has
+   no fix round: below-floor findings ship as notes, and a blocker (open or
+   fixed) or a gate-class edit stops with `PR_ROUND_CAP` for the lane's Captain
+   to decide: ship with the note, park, or keep the fix and run /ship again for
+   one more read-only full review of the final head. A below-floor fix applied
+   after that review also stops for the Captain (GST-3562 A). The count does not
+   reopen.
+6. **Round grants.** Two kinds, each recorded with `gstack-approvals round-grant
+   --pr <n> --head <sha> --reason <why> --by <lane or Captain>`, and each spent
+   by the one run that claims it.
+   - **`--kind fix-check`, after a stop** (GST-2968). When a review stops,
+     `/ship` runs `gstack-ship-receipt stop`, which writes a stop record into
+     the PR body's runs block: the run, and the commit and tree the stopped review
+     read. It writes one only when that review finished, read one committed tree
+     from start to end on a clean checkout, and that commit is HEAD or under it
+     (`STOP_UNBOUND` otherwise). The grant names that stop's head, its run
+     (`--stop-run`) and the findings its fix round is for (`--findings`). It
+     buys the stopped review's fix round: one scoped fix-check of the PR's own
+     change since the stop's head (a base merge in between is not part of it), in
+     the same run or a new one on another machine, never a new full review.
+     Step 1's `PR_REVIEW_FLAGS:` adds `--round-grant <id> --stop <head>` and the
+     route is `fix-check`. It answers only the newest stop record, and nothing
+     once another run reviewed after that stop, HEAD no longer contains the stop's
+     head, or another run claimed it (`PR_REVIEW_GRANT: not applied (why)`).
+     A fix-check found nothing to read (an empty, reverted or base-only change)
+     plans no fix-check. The fix-check never earns another: a blocker there
+     stops with `PR_ROUND_CAP` again.
+   - **`--kind extra-round`, before review.** One round past the cap, with its fix
+     round, at a head no review has stopped at: instead of the read-only review.
+     Step 1's `PR_REVIEW_FLAGS:` adds `--round-grant <id>` when the grant names
+     HEAD, or a head HEAD only merges the base into with the PR's own added and
+     removed lines byte-identical and in the same places (preflight merges the base
+     first); the plan raises that run's cap by one round, keeps the round's fix
+     round, and keeps the grant after the fix round's commits move HEAD past it.
+     An extra-round grant never answers a stop.
+   A run whose flags name a grant runs `gstack-ship-receipt claim` before its
+   first dispatch, which writes a grant record into the runs block; a grant
+   another run claimed, or a fix-check grant a counted fix-check already read
+   under (one carrying no grant and logged after it included), is refused (`GRANT_SPENT`), a
+   voided run's claim still
+   spends it, and stop and grant records are never trimmed from the block. When
+   the run record cannot save the claim, claim fails and the run starts no
+   reviewers; rerun claim with the same `--run` once the record is writable, since
+   a new run id reads `GRANT_SPENT`.
+   gstack never grants itself a round: `--by` naming gstack (one of the names
+   gstack writes for itself, `gstack` or `gstack no-stop default (K1)`, matched
+   whole and case-insensitively, so "gstack-evals Captain" or "GStack Minder" can
+   grant) and a grant from inside an open `/ship` run are refused, and `add`
+   refuses the scope. A stopped run (state `stopped` in its run record,
+   [what ends a run](ship-policy.md#what-ends-a-run)) may record the fix-check grant
+   for its own stop, once per run; any other grant on that checkout, a second fix
+   round included, is the lane's relay of its Captain's grant: `--owner-ref <thread
+   code>:<message id or timestamp> --words <their exact words>`, the same relay
+   `gstack-approvals rule` takes, which the row keeps as `relayed:<ref>` (#4531). `--by` is otherwise the caller's own text, recorded and
+   not checked: a lane that records a grant (or a ruling) from another checkout
+   under its Captain's name can't be told apart from the Captain doing it, so the
+   Captain's check of the receipt's `review_round_grants` and the PR body's lines
+   is the control. The receipt lists grants under `review_round_grants`.
+
+<a id="what-closes-a-finding"></a>
+### What closes a finding (GST-3260)
+
+A fix-check that a grant bought and that read the fix clean closes exactly the
+findings the grant names, with no owner ruling. `gstack-ship-receipt write`
+checks it from records gstack's tools wrote, never from the `--review-loop`
+file (`lib/fix-check-clearing.ts`): the grant answers the newest stop record
+for this PR; the PR body's first claim of it is this run's; exactly one
+`review-fix-check` row carries it, and `gstack-review-log` stamped that row from
+the claim (`fix_check_base`, `run`, `grant`, `pr`) with the digest of the hunks
+its reader was given, which cover every path the stop-to-fix diff changes, and
+the ledger ids, fingerprints and `a-…` approval ids its fix list named; the row read the stop's head to the receipt head (or a
+head that only merges the base in) on one committed tree, with nothing open at
+any severity; and the stop, the claim and the row's start were recorded in that
+order. Each grant id the fix list named closes the one open blocker carrying
+that id; a grant id the fix list left out closes nothing, and a fingerprint
+shared by two blockers closes neither. Anything less closes nothing, and write
+says why on a `FIX_CHECK_CLEAR:` line. The receipt records `cleared_by_grant`,
+and the Agent notes section gets one `Closed by grant …` line. A finding whose
+fix commit carries its `Review-Finding:` trailer also closes once a later full
+round that finished and converged, bound to its committed tree and with that
+commit inside its range (a pass 1's `range_base: null` is the whole PR), left
+nothing open at all, by its status, its findings file or an inline finding
+(`cleared_by_trailer`, #4597). A security finding's raw `path:line:category`
+fingerprint, with or without its line, never closes by grant or trailer, so no
+closure line puts its location in the PR body, and a fix-check row whose
+dispatch ledger can't be read closes nothing. finish counts the same
+stamped row, anchored on the grant's stop rather than the newest reviewed tree
+(#4612).
+
+<a id="one-grant-path"></a>
+**One grant path after a ruling at the cap (GST-3546).** Every fix-check grant is
+the same grant, whichever row records it:
+
+- **Either row works.** A `gstack-approvals round-grant --kind fix-check` row and
+  an owner's `review_loop_grant <head>` approval row are both fix-check grants
+  for `gstack-review-plan --grant`, `gstack-ship-receipt claim` and write. The
+  older row names no PR, so it binds to the PR whose run claims it.
+- **A grant needs no stop record.** `round-grant --kind fix-check` with no
+  `--stop-run` and no `--findings` buys one scoped fix-check of the change since
+  `--head`, the reviewed head. Use it for a post-review edit (a Step 14.5 docs
+  audit edit that #4708's one-reader packet doesn't take) or a ruling at the cap
+  whose run recorded no stop (`STOP_UNBOUND`). The run's own claim stands in for
+  the stop record: the grant, the claim and the fix-check's start must be
+  recorded in that order.
+- **What it closes.** A grant that names findings closes those, as above. A
+  grant with no findings list closes each open blocker the fix list given to
+  its clean fix-check names. A blocker that no ruling, grant or fix list covers
+  still refuses `RECEIPT_BLOCKER_OPEN`, so the Captain's ruling at the cap needs
+  no hand-written per-finding rows, and nothing is closed that no reader read.
+- **gstack builds the packet.** Once a run has claimed a grant, `gstack-review-plan
+  --fix-check-prompt` and the pass program build the reader's hunks from `git diff
+  <the grant's head> HEAD` themselves (`FIX_CHECK_HUNKS:` says when a `--hunks`
+  file differed and was not used), so the hunks record always covers the whole
+  fix range.
+- **A grant spends only on a counted fix-check.** A malformed row
+  (`converged:false`, or a claimed row whose hunks or tree don't bind) leaves the
+  grant unspent: the same run logs a correct row. A counted read that found
+  issues spends it like a clean one, so a grant still buys one fix round, and
+  write reads the first counted row only.
+- **Only the lane or its Captain grants.** A row whose ask or scope mentions
+  `review_loop_grant`, in any spelling or scope, recorded with `gstack-approvals
+  add` inside this checkout's open /ship run is refused unless it relays their
+  message with `--owner-ref` and `--words`, as `round-grant` already required.
+- **One read per grant.** Receipt write keeps every distinct read stamped with
+  the grant (a copied row counts once) and takes the first that counts; a read
+  whose dispatch ledger collected a finding counts as long as the row records
+  that finding, open or not.
+- **Long reasons fit.** A `--reason` longer than the approval record's
+  300-character ask is cut there with an ellipsis; `--words` (the reason by
+  default) keeps every word.
+
 <a id="transitions"></a>
 ### Transitions
 
@@ -138,23 +336,28 @@ incomplete coverage, which blocks until the reviewer is rerun.
 |---|---|
 | none | full pass 1 on the whole diff |
 | a full pass with no edits | done |
+| a full pass (`--last full`) with no fix flag, when the PR has its own unreviewed runtime commits since `--range-base` | stop: `review_required_no_readers` (exit 3), not done; see [troubleshooting](troubleshooting.md#review-required-no-readers) |
 | a full pass that fixed a blocking finding, below the cap, on a diff below full depth with a fix range of at most 150 runtime lines | scoped pass on the range |
 | a full pass that fixed a blocking finding, below the cap (full depth, a larger range, or a range or depth it could not read) | full pass on the range |
 | a full pass whose fix touched a gate-class path, below the cap | full pass on the range |
-| a full pass that fixed only below-floor findings | one fix-check (round 2) |
+| a full pass that fixed only below-floor findings | full pass on the range (round 2; GST-3562 A plans no new fix-check) |
 | a light pass 1 whose below-floor fixes change no runtime lines | done |
-| round 2 (a full pass or a fix-check) that fixed a blocking finding or edited a gate-class path | stop: name it for the owner, who may grant one scoped fix-check |
-| round 2 (a full pass or a fix-check) that fixed only below-floor findings | done: notes in the PR body |
+| round 2 that fixed anything, blocking or below the floor | one read-only full review of the final head, with no fix round (R51) |
+| round 2 on a light diff whose below-floor fixes change no runtime lines | done: notes in the PR body |
+| a fix after that read-only review | stop: the lane's Captain rules it a note, or the fix goes to a new /ship run's read-only full review |
 | a full pass that leaves a blocking finding open (fixed or not) | stop: name it for the owner |
-| a fix-check that found nothing blocking | done |
-| a fix-check that found a blocking finding | stop: name it for the owner |
+| a fix-check (granted before GST-3562) that found nothing blocking | done |
+| a fix-check (granted before GST-3562) that found a blocking finding | stop: name it for the owner |
 | a stop (any row above) on gate class before Step 11's voices ran | Step 11's voices (adversarial, outside, targeted), then ask again with `--adversarial-ran` |
-| a round-2 full pass that stops for a fixed blocking finding or a gate-class edit, with the owner's recorded grant (`--grant <approval id>`) | one scoped fix-check (round 3), after Step 11 on gate class |
+| the stop after a fix-check (granted before GST-3562) that was the run's only one, with the owner's recorded grant (`--grant <approval id>`) | one more scoped fix-check, after Step 11 on gate class, until a later release removes it; a grant after a round-2 full pass buys nothing, because the read-only full review replaces it |
 | a round-2 fix-check that stops the same way, with the owner's recorded grant and `--fix-checks 1` | one scoped fix-check (round 3), after Step 11 on gate class |
 | `--post-review` after a fix-check whose later edits are only release stamps and docs (`docsChangeSince`) | done, or the one targeted reader when a docs claim on a targeted-class diff needs it |
 | `--post-review` after a fix-check (edits after the review bound), with a new recorded grant at a stop head after the last fix-check's commit | one scoped fix-check, the next link of the fix-check chain, after Step 11 on gate class |
 | a fix-check that stops in the loop, with a new recorded grant naming its own commit (`--range-base`, the stop it answers), after any number of fix-checks | one scoped fix-check, the next link of the fix-check chain, after Step 11 on gate class |
 
+GST-3562 A retires the fix-check: `nextStep` plans none, and the rows that name
+one serve grants recorded before it, for one release. Its 3,932,160-case replay
+against main's table is `test/fixtures/review-pins/replays/GST-3562-A.json`.
 A **fix-check** is one reviewer reading the touched hunks, the fix list, the
 test results and the callers of every changed symbol, at full effort. It is
 logged as a `review-fix-check` row, so it never counts as a pass. No army, no
@@ -194,7 +397,7 @@ applies no edits is its exit too.
 <a id="no-stop"></a>
 ### No-stop defaults (K1)
 
-Five routine stops don't wait for a Captain. /ship and /autoplan record each one
+Four routine stops don't wait for a Captain. /ship and /autoplan record each one
 as `{class, reason, evidence}` in the receipt's `no_stop` field and keep going.
 `gstack-no-stop record` (`lib/no-stop.ts`) checks each case before it records it.
 When a case doesn't qualify, it prints `NO_STOP: refused` and exits 3, and that
@@ -205,7 +408,6 @@ stop goes to the owner as before. Every other stop still stops.
 | `scoped-fix-check` | Round 2 stops for a fix whose range since round 2's `PASS_HEAD` is docs class only, or only raises timeout values. `--range-base` must be the commit the newest review-log pass row read. One per branch: the ledger keeps every record, so a later /ship on the branch stops for the owner. | It records the standing grant in the approval record (`by: gstack no-stop default (K1)`) and prints `GRANT:`. `gstack-review-plan --grant` plans the one scoped fix-check. A blocking finding there goes to the owner. |
 | `test-timeout-fix` | Every changed line is in a test file and only raises a timeout value: the value of a timeout key (`timeout: 5_000`, `setDefaultTimeout(5_000)`, `--timeout=5000`) or bun's and jest's trailing per-test argument, only on the line that opens the test call itself (`test('…', () => {…}, 30_000);`, likewise `it(` and `describe(`). A multi-line test's closing `}, 30_000);` does not qualify and stops for the owner. A line with `expect`, `assert` or a comparison never qualifies. | The gate scan's relaxation finding takes the printed `GATE_DISPOSITION: kept` reason instead of `open`. |
 | `pregate-flake-rerun` | One rerun of a failed pregate case at the same tree (CREW rule 16). One per branch. | Green counts as flaky. Red again is a real failure. |
-| `stamp-only-carry` | A refused carry, where the receipt head merged into the base (base side on conflict) differs from HEAD only in a version stamp: `VERSION`, the `"version"` line of `package.json`, `CHANGELOG.md`, the agents digest or `changelog.d/` fragments. | Take the carry's `RECHECK:` route instead of running Steps 2–16 again. |
 | `autoplan-regate` | An edit to the plan file made after the owner's answer, or after the revise that took their changes, while the reviewed plan itself is unchanged. The edit only adds lines, all inside the plan's `## ELI5` section (an added `## ELI5` heading opens one), and no added line holds a number or a word for spend, cost, budget, price, cap, credits, limit, max, arm, model, judge, verdict, threshold, bar, trial, sample, stop rule, paid or eval. A removed or reworded line, or a line added anywhere else, goes to the owner. The carry exports the reviewed plan, so the added explanation is never built. | `gstack-autoplan` carries the owner's words (`reason=no-stop autoplan-regate: …`) and writes `<run>/no-stop.json`. `gstack-no-stop import` adds it to the branch's ledger. |
 
 The ledger is one JSON array per branch under the checkout's git directory
@@ -237,11 +439,11 @@ Under the opt-in `review.panel risk` (and `review.platform on` under any panel):
 
 | Diff | Pass 1 | After fixes (never more than 2 rounds) |
 |---|---|---|
-| Risk class: gate class, an R51 class (money, auth, secret, security, data), `eval` (scorer, judge and grader paths) or `policy` (`review.risk_paths`) | The full-depth plan as printed: the batched specialist, Red Team, native adversarial, outside voice and the targeted reader | A fixed blocker re-runs the printed plan on the fixed head as round 2; below-floor fixes get one fix-check |
-| Non-risk code | One native adversarial reader (`DISPATCH: adversarial-native single`) at the lane's reasoning, on `review.reader_model` (`lane` by default), carrying the code checklists and the Red Team checklist; it also carries the targeted brief when the diff has a targeted class | A fixed blocker or a gate-class edit gets one fix-check on the touched hunks; below-floor fixes ship as notes |
-| Docs | The core read; the outside voice only when the diff publishes numbers | One fix-check after a fixed blocker |
-| Tests, or code with no runtime lines (only registered outputs) | One batched reader on the class's checklists (Testing for tests, which leaves docs and registered outputs out of its diff); the outside voice only when the diff publishes numbers | One fix-check after a fixed blocker |
-| Docs or tests with no numeric, results or prereg claims, under `review.platform on`, with capy-ai[bot]'s review on the PR at HEAD | No reader: `NEXT: platform` and a planned `SKIP:` for every reader, the core read included | none |
+| Risk class: gate class, an R51 class (money, auth, secret, security, data), `eval` (scorer, judge and grader paths) or `policy` (`review.risk_paths`) | The full-depth plan as printed: the batched specialist, Red Team, native adversarial, outside voice and the targeted reader | Any fix re-runs the printed plan on the fixed range as round 2 (GST-3562 A); a fix in round 2 gets one read-only full review |
+| Non-risk code | One native adversarial reader (`DISPATCH: adversarial-native single`) at the lane's reasoning, on `review.reader_model` (`lane` by default), carrying the code checklists and the Red Team checklist; it also carries the targeted brief when the diff has a targeted class | A fixed blocker, a gate-class edit or a below-floor fix that changes runtime lines gets the one reader's full pass on the range as round 2, adding the outside voice when the fix changed a published number (GST-3562 A); below-floor fixes with no runtime lines ship as notes |
+| Docs | The core read; the outside voice only when the diff publishes numbers | A full pass on the range after a fixed blocker, with the Red Team reader at full effort on the whole fix range, the reader main's fix-check was (GST-3562 A) |
+| Tests, or code with no runtime lines (only registered outputs) | One batched reader on the class's checklists (Testing for tests, which leaves docs and registered outputs out of its diff); the outside voice only when the diff publishes numbers | A full pass on the range after a fixed blocker: the batched reader plus the Red Team reader at full effort on the whole fix range (GST-3562 A) |
+| Docs or tests with no numeric, results or prereg claims, under `review.platform on`, with capy-ai[bot]'s review on the PR at HEAD | No reader: `NEXT: platform` and a planned `SKIP:` for every reader, the core read included; first review only (GST-3562 A) | The class's row above: a later round never takes the platform skip |
 
 `review.panel all`, the default, keeps today's panel and loop on every class. `risk` is
 opt-in because its one-reader shape has not passed its no-loss replay: build C's replay
@@ -298,15 +500,29 @@ function but a same-file `url(#id)`, which closes `@import`, `image-set()`,
 `href` a same-file `#` reference or an inline raster image, no event handler and no
 entity declaration, and no DOCTYPE but a bare `<!DOCTYPE svg>` or W3C's own SVG DTD, read after character references are decoded. A `<style>` element's text is read as written. Any `&` in it keeps the SVG code, its comments are read as CSS, an opening tag it cannot read as quoted `name="value"` pairs keeps the SVG code, and only ASCII whitespace may come before the `>` of either tag, so no character-reference `</style>`, comment that only an HTML parser ends early, quoted `>` or Unicode space can hide CSS. A non-ASCII character in an element or attribute name, such as a `gé:` prefix, keeps the SVG code too (GST-940); anything else, a
 script or `foreignObject` included, keeps it code. More than
-2,000 data paths keep every one code; a `git grep` failure is `consumer_scan_failed`
+2,000 data paths keep every one code (`GSTACK_REVIEW_CONSUMER_SCAN_CAP` raises the count, a whole
+number; an empty, zero, negative or non-numeric value keeps 2,000), and the plan then prints a
+`CONSUMER_SCAN: skipped:` line naming both ways out: raise the cap or move the data into its own PR.
+The cap is read from the environment, not recorded in the receipt, so a raised cap must also be set
+wherever depth is recomputed (`gstack-ship-receipt carry` and the merge queue); without it they read
+2,000, find a deeper depth than the receipt's and refuse it (`RECEIPT_CARRY_REFUSED`).
+The cap counts files before `review_exclude_paths` applies, because the exclusion's own name scan reads
+the depth this scan decides, and it changes only depth: excluded files still stay out of the readers' diffs; a `git grep` failure is `consumer_scan_failed`
 and fails the depth closed. The scan first lists the files that contain a candidate's
 extension and then searches only those, docs files left out, so a large data tree
-costs one cheap pass. Each scan gets one 120-second deadline, set in milliseconds with
+costs one cheap pass. That extension pass runs once per scan at each commit and in the working
+tree; the files it keeps go into a scratch index, `git grep -l` lists the ones that hold a
+name, and the scan picks each such file's matches itself the way `git grep -o` does
+(earliest start, longest name there, then on from its end), so its results are
+byte-identical to the -o grep. git's own -o retries every name after each match and took
+220 s on one 16 MB trials file with 80 names (HARN-98, harness-evals #551); on that PR's
+304,000-file tree the whole scan now takes about 40 s on a 4-core machine, where it used to
+run past its deadline. Each scan gets one 120-second deadline, set in milliseconds with
 `GSTACK_CONSUMER_SCAN_TIMEOUT_MS`; a scan that runs past it, or whose matches pass
 256 MB, is also `consumer_scan_failed`, and its detail says what stopped it and names
 the deadline. One scan fits a minute inside the 180 seconds /ship gives
 `gstack-review-plan`; a plan that also scans a fix range runs two scans, and if they
-pass that limit the plan, run by itself or under `gstack-review-dispatch pass`, stops with
+pass that limit the plan, run by itself or under `gstack-review-dispatch pass` or `render`, stops with
 [`REVIEW_PLAN_STOPPED`](troubleshooting.md#review-plan-stopped) before any reader
 runs (`GSTACK_REVIEW_PLAN_TIMEOUT_MS` sets the limit in milliseconds). Only `classifyDiff` applies the rule (`lib/review-collect.ts`
 finds the consumers, `gstack-ship-preflight`'s `RUNTIME_LINES` reads the same
@@ -314,9 +530,41 @@ function); every path-only caller (the receipt's gate-scan decision, the Step 16
 post-review route, /autoplan's docs-only scope) keeps data files code. A numeric claim
 in a data file still schedules the outside voice.
 
+<a id="data-rows"></a>
+**Data rows are never runtime lines.** A JSONL, NDJSON, CSV or TSV file that code
+names keeps its class (code), so its readers still read it, but its lines never count
+as runtime lines, and neither do a JSON file's under a docs, wiki, results or reports
+directory or a [preregistration](#preregistrations) path: a results PR's trial rows
+are not code (harness-evals#432 counted 17,773 runtime lines at its head, 147 of them
+code). A JSON file code names anywhere else keeps counting, because it can be config
+a guard reads (harness-evals' `scripts/public-safety/allow.json`), and so do config
+files (the list above), agent prose, gate paths, executables and binary files.
+
+<a id="preregistrations"></a>
+**Preregistrations are write-ups (R114).** A preregistration that adds no scoring
+or guard code gets the write-up review: one reviewer, one round. Detection is by
+path, because that is how gstack-evals and harness-evals lay preregistrations out
+(`wiki/plans/<date>-<code>-<slug>-prereg/README.md` with its `.txt`, `.tsv` and
+`.json` beside it, `docs/benchmarks/<id>/prereg-harbor.json`, `lanes/<lane>/prereg.md`)
+and their front matter has no preregistration marker (`kind: plan` also covers
+non-preregistration plans). `PREREG_PATH` matches a directory or file name with a
+`prereg` or `preregistration` segment (`-prereg/`, `prereg2.md`, `-prereg-addendum-2/`);
+a data file under it counts as docs even when code names it, so a diff of a
+preregistration's markdown, text and data plans as docs. Anything else keeps its
+current depth: code inside or beside the preregistration (a scorer, judge, grader or
+rubric is the eval risk class and plans full; a `draw.py` or `power.py` stays code at
+light), a gate path or guard edit (gate class), and data a preregistration names
+outside its own path. The exemption sits on top of the existing catches: the gate
+scan still reads the preregistration's data (a tagged hunk or a missing scan is gate
+class) and so do the risk classes, as they read any data file code names (a secret
+in it is full).
+An amendment directory named without `prereg` (gstack-evals' `-pre-run-change-<n>/`)
+keeps its current depth; name it `-prereg-amendment-<n>` to get the write-up review.
+R81 is unchanged: a preregistration still runs full CI.
+
 | Depth | When | Pass 1 dispatches |
 |---|---|---|
-| **light**, runtime 0 | docs, tests, eval write-ups, or only registered outputs | docs: the core checklist only (R81). Tests: one **batched** reader on the Testing checklist, which leaves docs and registered outputs out of its diff (R51: tests get one reviewer). Only registered outputs: one batched reader on the code checklists over the whole diff. The outside voice also reads a diff that publishes numbers |
+| **light**, runtime 0 | docs, tests, eval write-ups, [preregistrations](#preregistrations) with only their plain data, or only registered outputs | docs: the core checklist only (R81). Tests: one **batched** reader on the Testing checklist, which leaves docs and registered outputs out of its diff (R51: tests get one reviewer). Only registered outputs: one batched reader on the code checklists over the whole diff. The outside voice also reads a diff that publishes numbers |
 | **light**, runtime above 0 | code with no risk class, at any size (R51: size never raises the depth) | core, one **batched** specialist (the batched checklists below plus the Red Team prompt in one context), the native adversarial pass (kept: backtest inconclusive, GSTA-147 D5) and the outside voice on numbers |
 | **standard** | `--depth-floor standard`, or a light diff raised by a fixed blocker or a CRITICAL | one batched specialist at `medium` and the Red Team at 200 runtime lines (or on a CRITICAL or a raise); the batched reader leaves docs and registered outputs out of its diff; adversarial and outside voice read everything |
 | **full** | gate class, a [risk class](#risk-classes), or any classifier error | one batched specialist on the whole diff, the Red Team always, no hit-rate gating |
@@ -337,7 +585,7 @@ redaction call, an import of a redaction or outside-voice module, a `SECRET` or 
 constant set to a regex, since that code decides what reaches an outside model, GST-1177; `shell: true`, `exec(` and `execSync(`, `eval`, `new Function(`,
 raw HTML sinks, a shell run through argv, recursive deletes), any call to an
 outbound HTTP client (`fetch`, `http(s).get` or `.request`, axios, got, undici,
-`requests`, `httpx`, urllib, with no exemption for a literal URL), `new URL` from
+`requests`, `httpx`, urllib, Swift's `URLSession`, `URLRequest(`, `NWConnection` and Alamofire, with no exemption for a literal URL), `new URL` from
 input, redirect toggles, proxy settings and host allowlists, archive extraction
 and path traversal (`tar.x`, adm-zip, yauzl, extract-zip, `extractall`, `tar -x`,
 `unzip`, `path.join` or `resolve` on request or entry input, a `'..'` check added
@@ -350,7 +598,14 @@ rules are coarse on purpose and parse no import clause or call arguments;
 200,000-character hostile lines, its anchor followed by a long run of the
 characters it repeats included. `test/review-risk-redos.test.ts` (GST-898) holds every risk pattern, R51's `rm` and `rmSync` rules included, under 100 ms on 100,000-character hostile lines. An `rmSync(` or `rm(` call (`fs.rm`, `fs.promises.rm` or an imported `rm`) counts as security when `recursive: true` follows within 500 characters, whatever the arguments hold (a `path.join(...)` first argument or a `)` in a comment included) and also when a formatter split a new call across lines, which is read over the file's changed lines joined (GST-942; an edit to one line of an existing split call is read on its own); a call with more than 500 characters before the first `)` after it counts on its own. **data** is user data: a path naming pii, gdpr, ccpa, privacy,
 personal, account, customer, cookie, persistence, storage or database, or a line
-that drops a table or column, deletes rows or bulk-deletes records. Auth scope,
+that drops a table or column, deletes rows or bulk-deletes records. On `.swift`
+paths outside XCTest targets (a `Tests/` or `*Tests/` directory, or a
+`*Tests.swift` file), a privacy permission request (speech, microphone,
+HealthKit, calendars, location, camera, photos) is security, and a HealthKit,
+EventKit or Contacts read, an on-device file write or delete, a file protection
+class, an app group container, backup exclusion or a declared retention period is
+data; UserDefaults settings, SwiftUI views and file reads are neither, and a call
+split across lines is read over the file's changed lines joined (GST-3052). Auth scope,
 migrations and deleted code paths were already gate class. `RISK_RULES` hashes
 the patterns and `DEPTH_RULES` includes it.
 
@@ -458,9 +713,9 @@ the specialists, audits and watchers at the host default too
 - Standard reads thresholds on runtime lines, not the whole diff, so a test-heavy
   diff with few runtime lines dispatches fewer specialists.
 - R51: size never raises the depth; non-risky code is light at any size, and a risk
-  class makes it full. Two rounds is the cap, a fix-check
-  included: a blocker fixed in round 2 stops for the owner instead of earning a
-  fix-check, and a light pass 1 whose below-floor fixes change no runtime lines is done.
+  class makes it full. Two rounds is the cap: a fix made in round 2 gets one
+  read-only full review of the whole PR diff with no fix round (GST-3562 A), and a
+  light pass whose below-floor fixes change no runtime lines is done.
 - A JSON, CSV, TSV or raster data file no code names is docs, not runtime (GSTA-167
   part 4a). A binary image no code names is no longer a `binary_code_path` error
   that forces full depth; one that code names still is.
@@ -539,6 +794,7 @@ Over the last 100 non-release commits on main (8663c3d2..8be7f213), money hit
 which hit 43 of 100; those paths already get full depth, so the gate class was
 narrowed to the gate scan's tagged hunks.
 
+<a id="targeted-only-read-after-the-loop"></a>
 ### Targeted-only read after the loop (GST-1598)
 
 A docs claim added after the review loop finished, such as a changelog
@@ -601,7 +857,9 @@ targeted reader) reads the same selection: its `DIFF_CMD:` with one
 same items, and the `DIFF_KEEP:` command for the kept files under those
 patterns. A kept file whose only reason is a secret line reaches pass readers as
 an excerpt of its matched lines in context instead ([secret-line
-excerpts](ship-policy.md#secret-line-excerpts)). The outside voice's embedded diff is that selection. Each brief says
+excerpts](ship-policy.md#secret-line-excerpts)), and so does an allowlisted data
+file kept only for single-line gate tags ([gate-tagged data
+excerpts](ship-policy.md#gate-tagged-data-excerpts)). The outside voice's embedded diff is that selection. Each brief says
 how many files and bytes were left out and that the reader must not report on
 their absence. Excluded paths count as docs for the depth and never trigger the
 numeric-claim scan or a targeted class; kept files keep their own class.
@@ -640,7 +898,11 @@ The rule is enforced per stage. Before a stage's readers start, the pass program
 runs `gstack-review-dispatch sweep --phase start`, an inventory of git
 repositories and files of 100 MB or more under the workspace, home and the temp
 dir (bounded at depth 6, 200,000 entries and 20 seconds; past a bound the sweep
-is `partial`, a note). After the stage's last reader is collected,
+is `partial`, a note). On Capy it never walks `~/.capy/drive` (the mounted
+drives), and under `~/.capy/drive-engine` it ignores only the drive sync
+engine's own database files (`state.db` and its `-wal`, `-shm` and `-journal`
+files), which grow on their own and once crossed 100 MB mid-stage. Everything
+else there, `~/.capy/work` and every other path are walked. After the stage's last reader is collected,
 `--phase end` diffs against it. A new repository with a network remote, or a
 new big file, is a violation. Every reader of that stage is quarantined (reply
 under `<out>/quarantine/`, findings out of `merged.jsonl`, never shown to the
@@ -666,6 +928,12 @@ repository whose every network-looking remote resolves to a local path through
 marker on a sweep root itself is not honored, insteadOf that sends a local path
 to the network still counts, and a clone made inside a live fixture root goes
 unseen, as does one whose reader writes the marker or an insteadOf line itself.
+The checkout's own build output is not a fetch either: a new big native executable
+(ELF, Mach-O or PE) inside the checkout, at a path its committed, unmodified root
+`.gitignore` names exactly with no glob (`bin/gstack-cso-core`), prints
+`FETCH_IGNORED: … reason=build-output`. A big file under an ignored directory or a
+glob, a non-executable at that path, or a path only an uncommitted `.gitignore`
+edit names still counts as a download.
 A `Bun.spawn` child given no `env` keeps the temp dir its test process started
 with, so its fixtures land outside the marked root and still count.
 
@@ -686,9 +954,11 @@ puts in the receipt:
 | `review_loop.passes` | full review passes this ship ran (1 or 2; up to 3 under `review_scope: diff-plus-blocking` or `all`) |
 | `review_loop.blocking_found` | every blocker found (GST-951): the rows' blocking findings (classified, or an unclassified CRITICAL), plus each ledger CRITICAL (as collected or judged) that no row finding from the same reviewer at the same path:line accounts for (each row finding pairs with one per ledger), so an adversarial, outside-voice or not-yet-classified blocker counts and one whose newest classification is below the floor does not. An unreadable ledger, merged file or judged set, or a judged set changed since `judge`, is `REVIEW_SCOPE_LEDGER`, never a count |
 | `review_loop.unrecorded` | blockers found that no row gives a disposition (fixed, deferred, noted, skipped, a gate answer); absent when 0 |
+| `review_loop.open` | blockers a row still holds as `open` at its newest action, gate findings aside (GST-3075), each its ledger id or fingerprint (or `{ id, fingerprint }`); Step 11's `adversarial-review` row counts here like a pass's row but is never a pass or a round. Only a later row's action clears one, or a [granted fix-check or a trailer-carrying fix](#what-closes-a-finding) (`cleared_by_grant`, `cleared_by_trailer`), and while any is left with no owner ruling, `gstack-ship-receipt write` refuses with [`RECEIPT_BLOCKER_OPEN`](troubleshooting.md#receipt-blocker-open); absent when 0 |
 | `review_loop.unbound` | what could not bind (GST-1168), each printed as `REVIEW_SCOPE_UNBOUND: <what>: <why>`: a row with no start token and no readable time, a `pN` ledger with no review row of pass N (a fix-check ledger in a `pN` directory is not a pass ledger, GST-1775), a row finding's `ledger_id` no ledger collected, a `Review-Finding` trailer naming nothing; absent when 0 |
 | `review_loop.ledgers_read` | dispatch ledgers the count read; absent under `--no-ledger` |
 | `REVIEW_SCOPE_VOIDED:` (stderr, not a receipt field) | an abandoned pass (GBEV-3): a `pN` ledger never judged that no row names, replaced by a later `pM` ledger (M > N) that was judged or is named. Its findings are left out of every count above instead of counting as unbound and unrecorded. A fix-check ledger and the last pass are never voided |
+| `REVIEW_ROWS_MISSING:` (stderr, not a receipt field) | dispatch ledgers of this run hold reader output that no review-log row of the run records (HARN-109): with no `via: ship` row since `--since`, every pass ledger; otherwise a `pN` ledger with no `review` row of pass N, or more fix-check ledgers than `review-fix-check` rows. Step 9.4's persistence never ran for those readers, so a stop, a fix-check grant or finish cannot bind them; log each pass and fix-check with `gstack-review-log --start`/`--finish`, and never hand-run a reader |
 
 Findings bind by id first (GST-1168). A row finding that came from a dispatched reader carries `ledger_id` (`<pass dir>/<merged.jsonl id>`, such as `p2/adversarial-native#3`) and pairs with that ledger entry whatever its path:line says, so a native finding with no path:line, or a row logged after its fix moved the line, still pairs. Each fix commit names what it fixed in a `Review-Finding: <ledger_id or fingerprint> reader=<raised_by>` trailer, and a trailer counts the finding as fixed. A late defer re-logs its finding under the same id, so it counts once. Rows that record their head dedupe by kind, pass, head and finding ids, so a logger command run twice counts once. Rows and findings without an id keep the path:line pairing above. The native reader's own verdict line ("all FIXABLE, and none blocks", with no file:line, list mark, lead label or Severity/Blocks field) collects at FIXABLE, not CRITICAL; the findings it summarizes collect on their own lines.
 | `review_loop.deferred` | blocking findings in unchanged code, kept on the PR under `## Deferred findings` (a Step 11 late defer, logged as a `review-late-defer` row so it never displaces the newest `review` pass, counts here and is not a pass) |
@@ -696,7 +966,7 @@ Findings bind by id first (GST-1168). A row finding that came from a dispatched 
 | `review_loop.fixed` | findings fixed in this PR |
 | `review_loop.scope` | the `review_scope` the loop ran under |
 | `review_loop.fix_checks` | fix-checks this ship ran (never passes): the larger of the `review-fix-check` rows and the ledgers holding a fix-check reader's review. When fix-checks ran without their rows, a blocker no row disposes counts as fixed once a later fix-check ledger followed it (decision 3.5 runs one only after the fixes) |
-| `review_loop.rounds` | passes plus fix-checks (R51 caps it at 2; the queue's `REVIEW_DEPTH:` line prints it) |
+| `review_loop.rounds` | full and scoped passes; a fix-check is no round under R51, so `fix_checks` counts it apart (the queue's `REVIEW_DEPTH:` line prints it) |
 | `review_loop.dispatches` | reviewer dispatches by role: `specialist`, `red-team`, `adversarial-native`, `outside-voice`, `fix-check`, `targeted` |
 | `review_loop.est_input_tokens` | prompt plus diff bytes the dispatches read, divided by 4: a relative estimate for comparing runs, not a bill |
 | `review_targeted` | the [targeted pass](#targeted-pass-on-money-gate-auth-and-secret-code): the `classes` it covered, `rules`, `brief_sha`, the receipt's own `product_patch_id`, `status` (`done` only with its brief sent verbatim and its output collected on a committed diff, else `failed`; `write` refuses a record when a change after its read commit carries a targeted class or the read commit is not an ancestor, or when its product patch differs and the change is more than release stamps and plain docs (no binary file and no numeric, results, prereg, eval, money, security, secret or auth claim; GST-1195, GST-1689), and refuses to write without a record when the head needs a class), `findings` and `raised_by`; a carry keeps it while the product patch is unchanged |
@@ -743,7 +1013,10 @@ fix-check read after a base merge also edited it (GST-1195), routes as
 `fix_checked=` in `ROUTE:` and is listed on a
 `FIX_CHECK: reviewed` line, a gate-edited test included. The line names the
 grant whose stop head is newest in that range, the fix-check's own when several
-grants fall inside it (GST-1610). Authored docs keep the
+grants fall inside it (GST-1610). A `fix_checked` path the Step 14.5 audit
+hashed also doesn't stale that audit at stage 3: `DOCS: fresh` counts it as
+`fix_checked=<n>` in its carried list, since a clean fix-check read its current
+bytes and the path is unchanged since that read (GST-3560). Authored docs keep the
 stage 2.2 recheck, and a path the branch edited after the fix-check still routes by the
 rules above. Any other row prints
 `FIX_CHECK: not counted (<reason>)` and changes nothing. `gstack-review-log`
@@ -802,6 +1075,24 @@ receipt carried across a base merge or a test-only fix
 counters, because the reviewed product diff is unchanged or its only
 difference passed a scoped review.
 
+<a id="docs-audit-edits-to-reviewed-docs"></a>
+### Docs-audit edits to reviewed docs (GST-3532)
+
+The Step 14.5 docs audit runs after the review, so it can correct a line in a
+doc the review read for its own content: a gate path, a doc with gate tags,
+agent prose or a doc with a secret line, which `review_exclude_paths` keeps in
+the review. When that edit changes the selection, receipt write refuses with
+`RECEIPT_DOCS_AUDIT_READ` instead of asking for another review round, which the
+round cap may forbid (gbrain#10059 had to waive its receipt). The refusal writes
+a packet with the audit's change to those docs, at most 20 changed lines each,
+and the targeted brief. One scoped reader reads it. Like the bounded read
+above, that read is not a review round under R51 and needs no grant. Its clean
+record (`head`, `paths`, `reviewer`, `verdict`, `packet_sha256`) goes back
+to write with `--docs-audit-read`, and the receipt records it as
+`docs_audit_read`. A finding, a record for another head or packet, and a
+larger edit still refuse; a finding goes to the lane's Captain
+([troubleshooting](troubleshooting.md#receipt-docs-audit-read)).
+
 ## The scope knob
 
 `.gstack/ship-policy.json` `review_scope` ([ship-policy.md#review-scope](ship-policy.md#review-scope)):
@@ -859,8 +1150,8 @@ and a later reader agree on what was flagged:
 <a id="porting-a-contributors-work"></a>
 ## Crediting a contributor's lines
 
-Outside PRs are rewritten from main rather than ported
-([CONTRIBUTING.md](../CONTRIBUTING.md#how-a-contributors-pr-lands)). When a rewrite
+Outside PRs, other than docs-only PRs for people, are rewritten from main rather than
+ported ([CONTRIBUTING.md](../CONTRIBUTING.md#how-a-contributors-pr-lands)). When a rewrite
 carries a contributor's lines over unchanged, the commit that carries them credits them.
 Pass the contributor's PR commits as the range, fetched as a ref and never checked out
 (`git fetch origin +pull/<n>/head:refs/contrib/<n>`, then `origin/<base>..refs/contrib/<n>`;
@@ -952,7 +1243,9 @@ ones, and the arm lost blockers. `bin/gstack-review-dispatch` closes both ends:
    reverted that. A reply that says `NO FINDINGS` keeps only its structured findings (GST-2122). Those are JSON objects
    (malformed JSON included), lead labels, label headings, numbered finding headings, `Severity` fields, `Blocks: yes`,
    the native voice's FIXABLE or INVESTIGATE tag, and anything naming a file:line, which still collect at their label.
-   Its other prose collects nothing. Outside such a reply prose collects as described above. A denial that a change
+   Only a field, lead label, heading or JSON anchors there: a file:line in prose, a list item or the FIXABLE or
+   INVESTIGATE tag may be the reader confirming code (GST-2972), so under a valid verdict that declares fewer blockers such a row is a summary candidate (below) and still
+   blocks until lead judgment lowers it with a reason. Its other prose collects nothing. Outside such a reply prose collects as described above. A denial that a change
    introduced a severity ("No fix introduced a CRITICAL defect") is a no-defect clause too, and a line led by a bold,
    unlabelled lead ("**1. Coverage:** …", "- **Callers:** …") is read for those clauses after its lead. Each prose finding's line also
    records the Severity and Blocks its own text states as `stated`, beside the collected label and never in its place;
@@ -962,11 +1255,52 @@ ones, and the arm lost blockers. `bin/gstack-review-dispatch` closes both ends:
    field `Blocks: no` (colon required, and no `Blocks: yes`) is not counted as a blocker by the ledger count, nor by the
    review-log count or classify when the finding carries `stated` (GST-1031); lead judgment that raises such a line above
    its label counts it again.
+   A capitalized HIGH, MEDIUM or LOW that names something in the code rather than rating a finding ("the HIGH branch",
+   "the redact-doc HIGH and scanner-failure branches", "the MEDIUM and LOW tiers": after "the" and at most one qualifier,
+   before a noun that is not a word for a finding or its rating) is a name, not a label (GSTA-711). A prose line with no
+   `Severity` field whose every label is such a name collects at INFORMATIONAL, so the reviewer's own fields decide.
+   CRITICAL never counts as a name, so "the HIGH and CRITICAL write paths" still collects at CRITICAL, and `Blocks: yes`
+   still raises the line.
    A phantom finding costs a fold; a lost one costs the gate.
    A reply with no finding counts as a review only with the clean marker its own brief asks for: `NO FINDINGS` alone on a
    line for the specialists, the batched specialist, the targeted reader, the Red Team and fix-check, the `Recommendation:`
    line for the outside voice, either for the native adversarial voice. Without one (a refusal, an empty reply, a reader
    that never saw the diff) collect records `review: false`, prints `COLLECT_NOT_REVIEWED` and exits 1.
+<a id="verdict-line"></a>
+3a. **The verdict line (GST-2495).** Every blocking reader's brief (specialists, the batched specialist, the
+   targeted reader, the Red Team, fix-check, the native adversarial voice and the outside voice; audit readers
+   are not asked) tells it to put one line in its reply:
+
+   ```
+   REVIEW_VERDICT: blocking=<n>[ at=<path>:<line>,<path>:<line>...]
+   ```
+
+   `<n>` is how many findings in the reply block (0 to 99), and `at=` may name up to `<n>` of their locations.
+   `render` records `verdict: 1` on a brief that asked for the line, and `collect` checks a reply only when its
+   rendered brief asked, so a ledger written before this change replays exactly as it did. A well-formed line never
+   collects as a finding; a line that only starts with `REVIEW_VERDICT` stays for the parser. A line inside a code fence is ignored; a line repeated byte for byte counts once, and
+   two different lines are malformed. Collect still parses every finding as described in step 3, then compares:
+
+   | Reply | What collect does |
+   |---|---|
+   | No line | Findings as parsed. `COLLECT_VERDICT: reader=<r> declared=missing parsed=<k>`. |
+   | Malformed line (bad count, bad `at=`, more locations than `<n>`, two different lines) | Findings as parsed. `declared=malformed`, with the reason in `why=`. |
+   | `blocking=<n>` equals the blocking rows parsed | Findings as parsed. `agrees=yes`. |
+   | `<n>` is more than parsed | Every parsed row stays, and collect adds CRITICAL rows (ids `<reader>#v1`, `#v2`…): one per `at=` location that no parsed blocking row names, then one more row for the declared blockers left over. The added rows count toward what blocks like any other. |
+   | `<n>` is less than parsed | Nothing is lowered automatically. Each blocking row with no list item, heading, field, lead label or JSON (a file:line in prose is not an anchor, nor, in a reply that says `NO FINDINGS`, is a list item or the FIXABLE or INVESTIGATE tag, GST-2972), and no `Blocks: yes` (a row that blocks only because a sentence uses the word CRITICAL or P0, or because the native voice's FIXABLE raises it) is marked `summary_candidate`, so lead judgment may lower it with a written reason, which `judge` records as `dismissed`. Anchored rows keep blocking. |
+
+   A valid line never lowers a row by itself. FOUN-298's native "nothing blocks … all FIXABLE" sentence with
+   `blocking=0` still collects as CRITICAL, as a summary candidate the lead lowers with a reason. An automatic relabel
+   was tried and removed (gstack#4353): beside a denial line such as "No other CRITICAL issues.", it let a real
+   unanchored FIXABLE blocker drop to FIXABLE while the count still agreed. A reader that undercounts a real blocker
+   therefore loses nothing without a written reason. The same holds for a reader's scope list (GST-3201): when the valid line declares
+   `blocking=0`, a single-line list item with no structure (no ` | ` table cell, Severity or Blocks field, or file:line) and no
+   severity label other than one naming findings as a kind ("a HIGH finding still refused", "P0 or P1 findings") keeps its own
+   label and is marked a summary candidate, so the lead lowers it with a reason; "Two P0 findings remain unfixed" has the same shape and still blocks until judged. `verify` re-parses each output the way its
+   render asked, prints `VERIFY_VERDICT: agree=<a> asked=<n>` and one `VERDICT <reader> AGREES|DISAGREES|MISSING|MALFORMED`
+   row per checked reply. These are informational: a disagreeing count has already added or marked its rows, so
+   they never make a ledger dirty. When collect prints `agrees=no` or `declared=malformed`, read the reply, then judge the
+   added rows and summary candidates as usual.
 4. Lead judgment writes `judged.jsonl`; `judge` refuses a set that drops a merged
    finding, lowers its severity, folds it into a less severe duplicate, or adds or
    promotes one without a reason (`JUDGMENT_REJECTED`). A merged file missing any id
@@ -1028,6 +1362,9 @@ ones, and the arm lost blockers. `bin/gstack-review-dispatch` closes both ends:
    machine starts in the machine's working directory, so it is told to `cd` there on every
    command, to give every file tool an absolute path under it, and to start its reply with
    the `REVIEWED_TREE: <HEAD^{tree}> <toplevel>` line the step's command outputs there. The
+   paragraph also tells the reader never to stop or signal a process it did not start (no
+   `pkill`, `killall` or kill by name, pattern or foreign pid), because other runs share the
+   machine (`PROCESS_RULE`, GST-3360). The
    step comes first because a reader following a findings-only format skipped the request
    when it only closed the brief (GST-897). The section's render sits between the two,
    byte for byte. `collect` and `mark --state collected`
@@ -1037,17 +1374,20 @@ ones, and the arm lost blockers. `bin/gstack-review-dispatch` closes both ends:
    outside voice's tree failure is recorded `unavailable` only when its reply holds no finding. The line catches a reader that
    worked elsewhere by accident; it is not proof of reading, since diff text can predict it. A `printed:` label
    before the line (plain, bold or inside its backticks) is still read, and its tree and toplevel are still compared
-   exactly (GST-776). Capy cannot start a subagent in a chosen directory, so before a stage takes a start token or sends
-   its first reader, the Capy pass program compares the checkout with the one shared readers start in (the thread's
-   working directory) and stops when that is another checkout or cannot be read: run /ship in the thread's own checkout.
-   A start directory outside any checkout, such as a multi-repo workspace root, holds no tree to review by mistake and
-   dispatches. Step 11's voices take the `adversarial-review` start
+   exactly (GST-776). Capy cannot start a subagent in a chosen directory, so shared readers start in the thread's working
+   directory, which may be another checkout, such as a project whose default checkout is a different repository. That is
+   allowed: the workspace step's `cd` and the `REVIEWED_TREE` check above cover it (GST-3145). Before a stage takes a
+   start token or sends its first reader, the Capy pass program checks that the shipped checkout can be reached from
+   the directory readers start in, and stops, with nothing taken or dispatched, when it cannot or when readers start in
+   any other checkout that holds the pass's diff base commit, such as another worktree or a clone of the same history:
+   there a command run without its `cd` reads that checkout's diff with no error. A checkout without the diff base
+   fails on that command instead, so it dispatches. Step 11's voices take the `adversarial-review` start
    token by default, and a `logStart` list without it stops before anything runs. Decision 3.5's fix-check pass turns a
    `review` start into `review-fix-check`, so its row is never a pass (GST-1031).
 
 ## Where this is enforced
 
-- `lib/review-brief.ts`, `lib/review-ledger.ts`, `lib/review-pass.ts`, `lib/capy-review-pass.js`, `bin/gstack-review-dispatch`: [verbatim dispatch](#verbatim-dispatch) (`test/review-dispatch.test.ts`, `test/review-pass.test.ts`).
+- `lib/review-brief.ts`, `lib/review-ledger.ts`, `lib/review-pass.ts`, `lib/capy-review-pass.js`, `bin/gstack-review-dispatch`: [verbatim dispatch](#verbatim-dispatch) (`test/review-dispatch.test.ts`, `test/review-pass*.test.ts`).
 - `lib/ship-parts.ts`, `bin/gstack-ship-parts`: the section text each /ship phase uses, returned once per run inside the phase program before it; `next --resend` sends an unreceived batch again (`test/ship-parts.test.ts`).
 
 - `scripts/resolvers/review-army.ts`: the floor and `NO FINDINGS` in every specialist and Red Team prompt (rendered into `review/sections/review-army.md` and `ship/sections/review-army.md`), and the lead judgment's "On record" line that turns a [ruled class](#rulings-below-the-floor) into a note; in `/ship` every specialist and Red Team prompt it renders carries its diff base as a literal sha the parent writes in (`DIFF_BASE=<diff-base>`: the merge base on pass 1, `RANGE_BASE` from pass 2 on) beside its plan's `DIFF_CMD` excludes, because a reviewer is its own process and never sees the parent's shell variables; the fan-out batches above.

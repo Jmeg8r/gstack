@@ -18,10 +18,10 @@ name: Windows Free Tests
 # the curated files, one shard per Windows job, and an aggregate that requires
 # every strict result and exact coverage. The plan and the verify step are
 # static (file contents and the git revision), so they run on Linux. Packing
-# reads Windows-measured durations (scripts/free-test-durations-windows.json):
-# Windows-only files such as the native cookie job cost minutes there and
-# nothing on Linux. Refresh it with a `record_durations` dispatch and commit
-# the artifact.
+# reads Windows-measured durations (scripts/free-test-durations-windows.json),
+# with a file's Linux time when the Windows seed lacks it: Windows-only files
+# such as the native cookie job cost minutes there and nothing on Linux.
+# Refresh it with a `record_durations` dispatch and commit the artifact.
 #
 # Native browser qualification campaigns (Windows cookie extraction, launch
 # diagnostics) are dispatch-only in native-qualification.yml.
@@ -110,10 +110,10 @@ jobs:
           bun-version: 1.4.2
       - id: plan
         name: Curate and balance the Windows-safe free suite
-        # Six shards: ~85 s of Linux-measured work each, ~2.5 min on a
-        # 4-vCPU Windows runner, so the lane lands near 4 min with setup.
+        # At least eight shards, more when needed so no shard plans past 720 s,
+        # 80% of its 15-minute job (GST-3440); in-shard time ran at 0.6-0.9x
+        # recorded, plus about 70 s of job setup.
         env:
-          GSTACK_FREE_TEST_DURATIONS: scripts/free-test-durations-windows.json
           JOBS_OVERRIDE: ${{ inputs.windows_jobs }}
         run: |
           set -euo pipefail
@@ -125,7 +125,7 @@ jobs:
           if [ "$jobs" != "$WINDOWS_FREE_JOBS" ]; then
             echo "- Sub-shard experiment: $jobs sub-shards per Windows shard (default $WINDOWS_FREE_JOBS); not a PR Windows Free Tests result" >> "$GITHUB_STEP_SUMMARY"
           fi
-          matrix=$(bun run scripts/test-free-shards.ts --windows-only --ci-plan "$RUNNER_TEMP/windows-plan.json" --shards 6 --shard-jobs "$jobs")
+          matrix=$(bun run scripts/test-free-shards.ts --windows-only --ci-plan "$RUNNER_TEMP/windows-plan.json" --shards 8 --shard-jobs "$jobs" --shard-budget-seconds 720)
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -309,7 +309,7 @@ jobs:
   windows-record-durations:
     if: ${{ inputs.record_durations }}
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -333,12 +333,18 @@ jobs:
       # Records into this checkout's default seed path: GSTACK_FREE_TEST_DURATIONS
       # would leak into every timed test, and seed-reading tests would then read
       # the half-written recording instead of their fixtures.
+      # Two workers, not the four a windows-latest runner offers: at four, files
+      # that pass in the nightly run failed under the recording load (assertion and
+      # JSON-parse errors) and the whole recording outran its 30-minute job (runs
+      # 43802987074 and 44830554276); at two it timed all 921 files cleanly in 38
+      # minutes (44830546810).
       - name: Time every Windows-safe file alone
         id: record
         shell: bash
         env:
           TEMP: ${{ runner.temp }}
           TMP: ${{ runner.temp }}
+          GSTACK_FREE_JOBS: '2'
         run: |
           set -o pipefail
           bun run test:windows --record-durations --wall-timeout 1200 2>&1 | tee "$RUNNER_TEMP/record.log"

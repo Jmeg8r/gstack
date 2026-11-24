@@ -12,6 +12,8 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { resultLine } from './result-codes';
+import { thisRunOwner } from './ship-run-record';
+import { spawnSync } from './spawn-sync';
 import {
   BudgetError, DEFAULT_TAIL, SUBAGENT_DEFAULT_CAP, DELEGATE_SEGMENT_CALL, DELEGATE_START_CALL, MAX_CHAIN_DEPTH, METER_CONTRACTS, SEGMENTS, SHIP_STEPS,
   aboveFloor, admits, applyCredits, applyReading, budgetError, creditsUsed, parseCredits, budgetLine, keepsSmallRun, labelScope, ledgerFileFor, loadCalibration, measureSettled, mintRunId, mutateLedger, newEpoch,
@@ -21,11 +23,14 @@ import {
 } from './ship-budget';
 import { callLogFile, countLoggedCalls, loggedCallsLine, readCallLog } from './ship-call-log';
 import { callsLine, countCalls } from './ship-calls';
+import { callsSince, timeStop } from './ship-clock';
 import { claudeConfigDir, loadMeterState, newMeterState, nonceSessions, readClaudeUsage, saveMeterState, sessionJournals } from './claude-usage';
 
 export type Opts = Record<string, string | true>;
 export interface Outcome { stdout: string[]; exit: number }
 export interface Ctx { env: NodeJS.ProcessEnv; cwd: string }
+
+const toplevel = (cwd: string) => { const r = spawnSync('git', ['rev-parse', '--show-toplevel'], { cwd, encoding: 'utf8', timeout: 10_000 }); return r.status === 0 ? r.stdout.trim() : ''; };
 
 export function parseArgs(argv: string[], values: string[], flags: string[] = []): Opts {
   const out: Opts = {};
@@ -250,7 +255,7 @@ export function cmdStart(argv: string[], ctx: Ctx): Outcome {
   const record = str(o, 'record');
   if (!record) throw usageError('start needs --record <invocation record path>');
   const rawCap = str(o, 'token-cap') ?? ctx.env.GSTACK_SHIP_TOKEN_CAP;
-  const defaultCap = rawCap === undefined && mode === 'observe' && from === 'task' && tokensOpt(o, 'reading') !== undefined;
+  const defaultCap = rawCap === undefined && mode === 'observe' && (from === 'task' || from === 'own' || (from === undefined && scope !== 'tree')) && tokensOpt(o, 'reading') !== undefined;
   const cap = defaultCap ? SUBAGENT_DEFAULT_CAP : rawCap === undefined || rawCap === 'none' ? null : parseTokens(rawCap, '--token-cap');
   const callFloor = tokensOpt(o, 'call-floor');
   const delegate = str(o, 'delegate') ?? 'auto';
@@ -269,6 +274,7 @@ export function cmdStart(argv: string[], ctx: Ctx): Outcome {
   }
   const run = mintRunId();
   const dir = runDirFor(ctx.env, run);
+  const owner = thisRunOwner(), checkout = toplevel(ctx.cwd);
   const cal = loadCalibration(str(o, 'calibration'));
   const contract = METER_CONTRACTS[meter];
   const paths = reviewPaths(ctx.cwd, ctx.env);
@@ -282,6 +288,7 @@ export function cmdStart(argv: string[], ctx: Ctx): Outcome {
     marker: paths.marker, review_log: paths.reviewLog, ...(str(o, 'calibration') ? { calibration: path.resolve(str(o, 'calibration')!) } : {}),
     ...(callFloor !== undefined ? { call_floor: callFloor } : {}), ...(mode === 'observe' ? { mode } : {}),
     ...(scope === 'tree' || parentCounter ? { meter_scope: 'tree' as const } : {}),
+    ...(checkout ? { checkout } : {}), ...(owner ? { owner } : {}),
   };
   if (meter === 'capy' && tokensOpt(o, 'reading') === undefined) throw budgetError('BUDGET_READING_MISSING', 'start --meter capy');
   if (meter === 'capy') l.meter.baseline = tokensOpt(o, 'reading')!;
@@ -290,7 +297,7 @@ export function cmdStart(argv: string[], ctx: Ctx): Outcome {
   const out = decide(l, '0.9', { kind: 'step', step: '1' }, call, true);
   writeLedger(l, ctx.env);
   pointMarker(l.marker, l);
-  const note = defaultCap ? [`BUDGET_DEFAULT_CAP: ${SUBAGENT_DEFAULT_CAP / 1e6}M (a /ship subagent metering its own task row; --token-cap <n> or none to change it)`] : [];
+  const note = defaultCap ? [`BUDGET_DEFAULT_CAP: ${SUBAGENT_DEFAULT_CAP / 1e6}M (a /ship run metering its own counter; --token-cap <n> or none to change it)`] : [];
   return labelScope(l, { stdout: [`BUDGET_RUN: id=${run} ledger=${l.file}`, ...note, ...out.stdout], exit: out.exit });
 }
 
@@ -380,14 +387,15 @@ export function cmdClose(argv: string[], ctx: Ctx): Outcome {
   });
 }
 
-const noteText = (n: Note) => `${n.step}${n.label ? `:${n.label}` : ''} used=${n.used}${n.credits === undefined ? '' : ` credits=${n.credits}`}`
+const noteText = (n: Note) => `${n.step}${n.label ? `:${n.label}` : ''} used=${n.used}${n.credits === undefined ? '' : ` credits=${n.credits}`}${n.calls === undefined ? '' : ` calls=${n.calls}`}`
   + (n.readers ? ` readers=${n.readers.n} readers_tokens=${n.readers.tokens}${n.readers.credits === undefined ? '' : ` readers_credits=${n.readers.credits}`}` : '');
 
 /**
  * note: record one program's readings (tokens and credits) and, when --dispatched-at
  * brackets them, the readers it dispatched; stop only once used + unknown pass the cap.
  * It reserves, admits and delegates nothing: ship/DRIVER.md's observe runs end every
- * program with it instead of a check at each boundary.
+ * program with it instead of a check at each boundary. It records the calls since the previous
+ * note (lib/ship-clock.ts), and in observe mode past 100 minutes it prints STOP: past 100 minutes.
  */
 export function cmdNote(argv: string[], ctx: Ctx): Outcome {
   const o = parseArgs(argv, ['run', 'record', 'step', 'label', 'reading', 'credits', 'dispatched-at', 'dispatched-credits', 'readers']);
@@ -406,9 +414,14 @@ export function cmdNote(argv: string[], ctx: Ctx): Outcome {
     const credits = creditsUsed(l);
     const readers = dispatched && l.meter.last !== null ? { n: dispatched.readers ?? 1, tokens: l.meter.last - dispatched.at,
       ...(before !== undefined && l.credits ? { credits: Math.round((l.credits.last - before) * 100) / 100 } : {}) } : undefined;
-    const n: Note = { step, ...(label ? { label } : {}), at: new Date().toISOString(), used: tally(l).used, ...(credits === null ? {} : { credits }), ...(readers ? { readers } : {}) };
+    const at = new Date().toISOString();
+    const prev = l.notes?.at(-1)?.at;
+    const calls = callsSince(ctx.env, prev ?? l.created_at, at, prev === undefined);
+    const n: Note = { step, ...(label ? { label } : {}), at, used: tally(l).used, ...(credits === null ? {} : { credits }), ...(readers ? { readers } : {}), ...(calls === null ? {} : { calls }) };
     (l.notes ??= []).push(n);
-    return observed(l, step, label ?? step, null, `NOTE: ${noteText(n)}`);
+    const out = observed(l, step, label ?? step, null, `NOTE: ${noteText(n)}`);
+    const stop = out.exit === 0 ? timeStop(l, ctx.cwd, step, ctx.env) : null;
+    return stop ? { stdout: [out.stdout[0]!, ...stop], exit: 3 } : out;
   });
 }
 
@@ -480,8 +493,9 @@ export function cmdResume(argv: string[], ctx: Ctx): Outcome {
     }
     const was = l.stopped;
     delete l.stopped;
+    if (was?.reason === 'past_100_minutes') l.clock_from = new Date().toISOString();
     pointMarker(l.marker, l);
-    return [`BUDGET_RUN: id=${l.run} ledger=${l.file}`, `RESUMED: from=${was ? `Step ${was.step} (${was.reason})` : 'running'}`, budgetLine(l, { call: null, next: was?.next ?? '-', projected: 0, verdict: 'continue' })];
+    return [`BUDGET_RUN: id=${l.run} ledger=${l.file}`, `RESUMED: from=${was ? `Step ${was.step} (${was.reason})` : 'running'}`, ...(was?.reason === 'past_100_minutes' ? [`CLOCK: restarted at ${l.clock_from} (the 100-minute limit counts from here)`] : []), budgetLine(l, { call: null, next: was?.next ?? '-', projected: 0, verdict: 'continue' })];
   });
   return { stdout: [...lines, ...out], exit: 0 };
 }

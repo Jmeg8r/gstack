@@ -143,7 +143,7 @@ ISSUE_NUMBER=$(echo "$ISSUE_URL" | sed -E 's|.*/issues/([0-9]+)$|\1|')
 echo "Filed: $ISSUE_URL (ISSUE_NUMBER: $ISSUE_NUMBER)"
 [ -s "$APPROACH_FILE" ] && ~/.claude/skills/gstack/bin/gstack-decision-log "$(jq -cn --arg n "$ISSUE_NUMBER" --rawfile t "$TITLE_FILE" --rawfile a "$APPROACH_FILE" \
   '{decision: ("Spec filed #" + $n + ": " + ($t | rtrimstr("\n"))), rationale: ($a | rtrimstr("\n")), scope: "issue", issue: $n, source: "skill", confidence: 7}')" 2>/dev/null || true
-rm -f "$APPROACH_FILE"
+rm "$APPROACH_FILE" 2>/dev/null || :
 ```
 
 Exit 1 (HIGH): do NOT file; rotate and redact at source, no skip. Exit 2 (MEDIUM): ask
@@ -204,7 +204,7 @@ ARCHIVE_PATH="$ARCHIVE_DIR/$ARCHIVE_NAME"
   printf '\n'
   cat "$REDACT_FILE"
 } > "$ARCHIVE_PATH.tmp"
-mv "$ARCHIVE_PATH.tmp" "$ARCHIVE_PATH" && rm -f "$TITLE_FILE"
+mv "$ARCHIVE_PATH.tmp" "$ARCHIVE_PATH" && rm "$TITLE_FILE"
 echo "Archived: $ARCHIVE_PATH (SLUG_TITLE: $SLUG_TITLE)"
 ```
 
@@ -309,7 +309,8 @@ echo "Follow with: cd $SPAWN_PATH && claude --resume"
 ```
 
 Update archive frontmatter with `spec_worktree_path: $SPAWN_PATH` and
-`spec_executed: true` (atomic re-write).
+`spec_executed: true` (atomic re-write). When the worktree was created, also set
+`spec_branch: $SPAWN_BRANCH`: /ship matches the archive by the branch it ships from.
 
 **Stash restore safety (when B path was chosen):** Do NOT auto-restore inline
 — the spawned agent may take hours. Instead print: "Stash preserved as
