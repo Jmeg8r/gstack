@@ -14,6 +14,7 @@ const STRESS_CALLS = 20_000;
 const ALTERNATING_CALLS = 5_000;
 const HELPER_GIT_CALLS = 2_000;
 const LOOP_TIMEOUT_MS = 60_000;
+const GIT_INIT_TIMEOUT_MS = 10_000;
 
 const roots: string[] = [];
 afterAll(() => {
@@ -80,7 +81,7 @@ describe('CSO executable resolution keeps the hard-link name it was given', () =
       home = path.join(root, 'home');
     fs.mkdirSync(repo);
     fs.mkdirSync(home);
-    const init = spawnSync(executable('git'), ['init', '-q', repo], { env: childEnvironment(home), encoding: 'utf8' });
+    const init = spawnSync(executable('git'), ['init', '-q', repo], { env: childEnvironment(home), encoding: 'utf8', timeout: GIT_INIT_TIMEOUT_MS });
     expect(init.status).toBe(0);
     const failures = new Map<string, number>();
     for (let i = 0; i < HELPER_GIT_CALLS; i++) {
